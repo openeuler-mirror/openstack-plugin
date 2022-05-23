@@ -2831,6 +2831,7 @@ class LibvirtConfigGuest(LibvirtConfigObject):
         self.idmaps = []
         self.perf_events = []
         self.launch_security = None
+    	self.partition = None
 
     def _format_basic_props(self, root):
         root.append(self._text_node("uuid", self.uuid))
@@ -2858,6 +2859,9 @@ class LibvirtConfigGuest(LibvirtConfigObject):
             for m in self.metadata:
                 metadata.append(m.format_dom())
             root.append(metadata)
+
+        if self.partition is not None:
+            root.append(self._text_node("partition", self.partition))
 
     def _format_os(self, root):
         os = etree.Element("os")

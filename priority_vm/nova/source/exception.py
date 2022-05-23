@@ -1879,6 +1879,9 @@ class ImageCPUPinningForbidden(Forbidden):
     msg_fmt = _("Image property 'hw_cpu_policy' is not permitted to override "
                 "CPU pinning policy set against the flavor")
 
+class HintsPriorityForbidden(Forbidden):
+    msg_fmt = _("scheduler hint 'priority' is not permitted to override "
+                "CPU priority set against the flavor")
 
 class ImageCPUThreadPolicyForbidden(Forbidden):
     msg_fmt = _("Image property 'hw_cpu_thread_policy' is not permitted to "
@@ -2113,6 +2116,11 @@ class InvalidEmulatorThreadsPolicy(Invalid):
 
 class InvalidCPUAllocationPolicy(Invalid):
     msg_fmt = _("CPU policy requested from '%(source)s' is invalid, "
+                "given: '%(requested)s', available: '%(available)s'.")
+
+
+class InvalidCPUAllocationPriority(Invalid):
+    msg_fmt = _("CPU priority requested from '%(source)s' is invalid, "
                 "given: '%(requested)s', available: '%(available)s'.")
 
 

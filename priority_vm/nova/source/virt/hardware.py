@@ -1480,6 +1480,61 @@ def get_cpu_policy_constraint(
     return cpu_policy
 
 
+def _get_flavor_priority(
+    key: str,
+    flavor: 'objects.Flavor',
+    default: ty.Any = None,
+    prefix: str = 'hw',
+) -> ty.Any:
+    """Extract both flavor- and image-based variants of metadata."""
+    flavor_key = ':'.join([prefix, key])
+
+    flavor_value = flavor.get('extra_specs', {}).get(flavor_key, None)
+
+    return flavor_value
+
+def get_cpu_priority_constraint(
+    flavor: 'objects.Flavor',
+    priority: str,
+) -> ty.Optional[str]:
+    """Validate and return the requested CPU priority.
+
+    :param flavor: ``nova.objects.Flavor`` instance
+    :param priority: priority string
+    :raises: exception.HintsPriorityForbidden if priority is defined on both
+        api and flavor and these priorities conflict.
+    :raises: exception.InvalidCPUAllocationPriority if priority is defined with
+        invalid value in api or flavor.
+    :returns: The CPU priority requested.
+    """
+    flavor_priority = _get_flavor_priority(
+        'cpu_priority', flavor)
+
+    if flavor_priority and (flavor_priority not in fields.CPUAllocationPriority.ALL):
+        raise exception.InvalidCPUAllocationPriority(
+            source='flavor extra specs',
+            requested=flavor_priority,
+            available=str(fields.CPUAllocationPriority.ALL))
+    if priority and (priority not in fields.CPUAllocationPriority.ALL):
+        raise exception.InvalidCPUAllocationPriority(
+            source='scheduler hints',
+            requested=priority,
+            available=str(fields.CPUAllocationPriority.ALL))
+
+    if flavor_priority == fields.CPUAllocationPriority.HIGH:
+        cpu_priority = flavor_priority
+    elif flavor_priority == fields.CPUAllocationPriority.LOW:
+        if priority == fields.CPUAllocationPriority.HIGH:
+            raise exception.HintsPriorityForbidden()
+        cpu_priority = flavor_priority
+    elif priority:
+        cpu_priority = priority
+    else:
+        cpu_priority = None
+
+    return cpu_priority
+
+
 # NOTE(stephenfin): This must be public as it's used elsewhere
 def get_cpu_thread_policy_constraint(
     flavor: 'objects.Flavor',
@@ -1955,11 +2010,12 @@ def get_secure_boot_constraint(
     return policy
 
 
-def numa_get_constraints(flavor, image_meta):
+def numa_get_constraints(flavor, image_meta, priority):
     """Return topology related to input request.
 
     :param flavor: a flavor object to read extra specs from
     :param image_meta: nova.objects.ImageMeta object instance
+    :param priority: a priority string
 
     :raises: exception.InvalidNUMANodesNumber if the number of NUMA
              nodes is less than 1 or not an integer
@@ -2016,11 +2072,19 @@ def numa_get_constraints(flavor, image_meta):
     realtime_cpus = get_realtime_cpu_constraint(flavor, image_meta)
     dedicated_cpus = get_dedicated_cpu_constraint(flavor)
     emu_threads_policy = get_emulator_thread_policy_constraint(flavor)
+    cpu_priority = get_cpu_priority_constraint(flavor, priority)
+
 
     # handle explicit VCPU/PCPU resource requests and the HW_CPU_HYPERTHREADING
     # trait
 
     requested_vcpus, requested_pcpus = _get_vcpu_pcpu_resources(flavor)
+
+    if cpu_priority:
+        if cpu_priority == fields.CPUAllocationPriority.HIGH:
+            cpu_policy = fields.CPUAllocationPolicy.DEDICATED
+        else:
+            cpu_policy = fields.CPUAllocationPolicy.SHARED
 
     if cpu_policy and (requested_vcpus or requested_pcpus):
         raise exception.InvalidRequest(

@@ -275,6 +275,13 @@ class CPUAllocationPolicy(BaseNovaEnum):
 
     ALL = (DEDICATED, SHARED, MIXED)
 
+class CPUAllocationPriority(BaseNovaEnum):
+
+    HIGH = "high"
+    LOW = "low"
+
+    ALL = (HIGH, LOW)
+
 
 class CPUThreadAllocationPolicy(BaseNovaEnum):
 
@@ -1203,6 +1210,9 @@ class ConfigDrivePolicyField(BaseEnumField):
 
 class CPUAllocationPolicyField(BaseEnumField):
     AUTO_TYPE = CPUAllocationPolicy()
+
+class CPUAllocationPriorityField(BaseEnumField):
+    AUTO_TYPE = CPUAllocationPriority()
 
 
 class CPUThreadAllocationPolicyField(BaseEnumField):

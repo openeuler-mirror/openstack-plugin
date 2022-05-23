@@ -64,6 +64,9 @@ class ComputeNode(base.NovaPersistentObject, base.NovaObject):
         'memory_mb': fields.IntegerField(),
         'local_gb': fields.IntegerField(),
         'vcpus_used': fields.IntegerField(),
+        'priority': fields.BooleanField(default=False),
+    	'high_vcpus_used': fields.IntegerField(),
+        'low_vcpus_used': fields.IntegerField(),
         'memory_mb_used': fields.IntegerField(),
         'local_gb_used': fields.IntegerField(),
         'hypervisor_type': fields.StringField(),
@@ -387,7 +390,7 @@ class ComputeNode(base.NovaPersistentObject, base.NovaObject):
         # do not exactly match.
         # TODO(pmurray): the resources dict should be formalized.
         keys = ["vcpus", "memory_mb", "local_gb", "cpu_info",
-                "vcpus_used", "memory_mb_used", "local_gb_used",
+                "vcpus_used", "priority", "high_vcpus_used", "low_vcpus_used", "memory_mb_used", "local_gb_used",
                 "numa_topology", "hypervisor_type",
                 "hypervisor_version", "hypervisor_hostname",
                 "disk_available_least", "host_ip", "uuid"]

@@ -1084,7 +1084,8 @@ class API:
                     boot_meta.get('properties', {})))
 
         image_meta = _get_image_meta_obj(boot_meta)
-        numa_topology = hardware.numa_get_constraints(flavor, image_meta)
+
+        numa_topology = hardware.numa_get_constraints(flavor, image_meta, priority)
 
         system_metadata = {}
 
@@ -1580,6 +1581,18 @@ class API:
 
         return objects.InstanceGroup.get_by_uuid(context, group_hint)
 
+    def _get_requested_priority(self, filter_properties):
+        if (not filter_properties or
+                not filter_properties.get('scheduler_hints')):
+            return
+
+        priority = filter_properties.get('scheduler_hints').get('priority')
+        if not priority:
+            return
+
+        return priority
+
+
     def _create_instance(self, context, flavor,
                image_href, kernel_id, ramdisk_id,
                min_count, max_count,
@@ -1627,11 +1640,13 @@ class API:
         self._check_auto_disk_config(image=boot_meta,
                                      auto_disk_config=auto_disk_config)
 
+        priority = self._get_requested_priority(filter_properties)
+
         (
             base_options, max_net_count, key_pair, security_groups,
             network_metadata,
         ) = self._validate_and_build_base_options(
-            context, flavor, boot_meta, image_href, image_id,
+            context, flavor, priority, boot_meta, image_href, image_id,
             kernel_id, ramdisk_id, display_name, display_description,
             hostname, key_name, key_data, security_groups, availability_zone,
             user_data, metadata, access_ip_v4, access_ip_v6,
