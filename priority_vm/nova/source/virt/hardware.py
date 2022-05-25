@@ -1075,6 +1075,59 @@ def _numa_fit_instance_cell(
                       {'usage': ram_usage, 'limit': ram_limit})
             return None
 
+    if instance_cell.cpu_priority == fields.CPUPriorityPolicy.HIGH:
+        LOG.debug('Instance has requested high priority CPUs')
+        required_cpus = len(instance_cell.pcpuset) + cpuset_reserved
+        if required_cpus > host_cell.avail_pcpus:
+            LOG.debug('Not enough available CPUs to schedule instance. '
+                      'Oversubscription is not possible with high priority '
+                      'instances. Required: %(required)d (%(vcpus)d + '
+                      '%(num_cpu_reserved)d), actual: %(actual)d',
+                      {'required': required_cpus,
+                       'vcpus': len(instance_cell.pcpuset),
+                       'actual': host_cell.avail_pcpus,
+                       'num_cpu_reserved': cpuset_reserved})
+            return None
+        if instance_cell.memory > host_cell.avail_memory:
+            LOG.debug('Not enough available memory to schedule instance. '
+                      'Oversubscription is not possible with high priority '
+                      'instances. Required: %(required)s, available: '
+                      '%(available)s, total: %(total)s. ',
+                      {'required': instance_cell.memory,
+                       'available': host_cell.avail_memory,
+                       'total': host_cell.memory})
+            return None
+
+        # Try to pack the instance cell onto cores
+        instance_cell = _pack_instance_onto_cores(
+            host_cell, instance_cell, num_cpu_reserved=cpuset_reserved,
+        )
+        if not instance_cell:
+            LOG.debug('Failed to map instance cell CPUs to host cell CPUs')
+            return None
+
+    if instance_cell.cpu_priority == fields.CPUPriorityPolicy.LOW:
+        LOG.debug('Instance has requested low priority CPUs, considering '
+                  'limitations on usable CPU and memory.')
+        cpu_usage = host_cell.cpu_usage + len(host_cell.pinned_cpus)
+        cpu_limit = len(host_cell.cpuset) * limits.cpu_allocation_ratio - len(
+            host_cell.pcpuset)
+        if cpu_usage > cpu_limit:
+            LOG.debug('Host cell has limitations on low priority CPUs. There '
+                      'are not enough free CPUs to schedule this instance. '
+                      'Usage: %(usage)d, limit: %(limit)d',
+                      {'usage': cpu_usage, 'limit': cpu_limit})
+            return None
+
+        ram_usage = host_cell.memory_usage + instance_cell.memory
+        ram_limit = host_cell.memory * limits.ram_allocation_ratio
+        if ram_usage > ram_limit:
+            LOG.debug('Host cell has limitations on usable memory. There is '
+                      'not enough free memory to schedule this instance. '
+                      'Usage: %(usage)d, limit: %(limit)d',
+                      {'usage': ram_usage, 'limit': ram_limit})
+            return None
+
     instance_cell.id = host_cell.id
     return instance_cell
 

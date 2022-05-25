@@ -36,12 +36,15 @@ class InstanceNUMACell(base.NovaEphemeralObject,
     # Version 1.4: Add cpuset_reserved field
     # Version 1.5: Add pcpuset field
     # Version 1.6: Add 'mixed' to cpu_policy field
-    VERSION = '1.6'
+    # Version 1.7: Add cpu_priority field
+    VERSION = '1.7'
 
     def obj_make_compatible(self, primitive, target_version):
         super(InstanceNUMACell, self).obj_make_compatible(primitive,
                                                           target_version)
         target_version = versionutils.convert_version_to_tuple(target_version)
+        if target_version < (1, 7):
+            primitive.pop('cpu_priority', None)
         # Instance with a 'mixed' CPU policy could not provide a backward
         # compatibility.
         if target_version < (1, 6):
@@ -88,6 +91,8 @@ class InstanceNUMACell(base.NovaEphemeralObject,
         'cpu_policy': obj_fields.CPUAllocationPolicyField(nullable=True,
                                                           default=None),
         'cpu_thread_policy': obj_fields.CPUThreadAllocationPolicyField(
+            nullable=True, default=None),
+        'cpu_priority': obj_fields.CPUPriorityPolicyField(
             nullable=True, default=None),
     }
 

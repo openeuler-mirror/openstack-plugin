@@ -314,6 +314,12 @@ class CPUEmulatorThreadsPolicy(BaseNovaEnum):
     ALL = (SHARE, ISOLATE)
 
 
+class CPUPriorityPolicy(BaseNovaEnum):
+    HIGH = "high"
+    LOW = "low"
+
+    ALL = (HIGH, LOW)
+
 class CPUMode(BaseNovaEnum):
 
     CUSTOM = 'custom'
@@ -1217,6 +1223,10 @@ class CPUAllocationPriorityField(BaseEnumField):
 
 class CPUThreadAllocationPolicyField(BaseEnumField):
     AUTO_TYPE = CPUThreadAllocationPolicy()
+
+
+class CPUPriorityPolicyField(BaseEnumField):
+    AUTO_TYPE = CPUPriorityPolicy()
 
 
 class CPUEmulatorThreadsPolicyField(BaseEnumField):
