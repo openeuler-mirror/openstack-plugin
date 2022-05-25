@@ -138,6 +138,9 @@ _hints = {
             'type': 'string',
             'pattern': '^/[0-9a-f.:]+$'
         },
+        'priority': {
+            'type': 'string', 'enum': ['high', 'low'],
+        },
     },
     # NOTE: As this Mail:
     # http://lists.openstack.org/pipermail/openstack-dev/2015-June/067996.html
