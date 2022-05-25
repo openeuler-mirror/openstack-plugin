@@ -47,7 +47,7 @@ LOG = logging.getLogger(__name__)
 _INSTANCE_OPTIONAL_JOINED_FIELDS = ['metadata', 'system_metadata',
                                     'info_cache', 'security_groups',
                                     'pci_devices', 'tags', 'services',
-                                    'fault']
+                                    'fault', 'priority']
 # These are fields that are optional but don't translate to db columns
 _INSTANCE_OPTIONAL_NON_COLUMN_FIELDS = ['flavor', 'old_flavor',
                                         'new_flavor', 'ec2_ids']
@@ -114,7 +114,8 @@ class Instance(base.NovaPersistentObject, base.NovaObject,
     # Version 2.5: Added hard_delete kwarg in destroy
     # Version 2.6: Added hidden
     # Version 2.7: Added resources
-    VERSION = '2.7'
+    # Version 2.8: Added priority
+    VERSION = '2.8'
 
     fields = {
         'id': fields.IntegerField(),
@@ -223,6 +224,8 @@ class Instance(base.NovaPersistentObject, base.NovaObject,
         'trusted_certs': fields.ObjectField('TrustedCerts', nullable=True),
         'hidden': fields.BooleanField(default=False),
         'resources': fields.ObjectField('ResourceList', nullable=True),
+
+        'priority': fields.StringField(nullable=True),
         }
 
     obj_extra_fields = ['name']
@@ -230,6 +233,8 @@ class Instance(base.NovaPersistentObject, base.NovaObject,
     def obj_make_compatible(self, primitive, target_version):
         super(Instance, self).obj_make_compatible(primitive, target_version)
         target_version = versionutils.convert_version_to_tuple(target_version)
+        if target_version < (2, 8) and 'priority' in primitive:
+            del primitive['priority']
         if target_version < (2, 7) and 'resources' in primitive:
             del primitive['resources']
         if target_version < (2, 6) and 'hidden' in primitive:

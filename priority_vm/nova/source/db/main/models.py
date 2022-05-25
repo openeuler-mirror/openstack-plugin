@@ -194,6 +194,9 @@ class ComputeNode(BASE, NovaBase, models.SoftDeleteMixin):
     memory_mb = sa.Column(sa.Integer, nullable=False)
     local_gb = sa.Column(sa.Integer, nullable=False)
     vcpus_used = sa.Column(sa.Integer, nullable=False)
+    priority = sa.Column(sa.Boolean, default=False)
+    high_vcpus_used = sa.Column(sa.Integer, nullable=True)
+    low_vcpus_used = sa.Column(sa.Integer, nullable=True)
     memory_mb_used = sa.Column(sa.Integer, nullable=False)
     local_gb_used = sa.Column(sa.Integer, nullable=False)
     hypervisor_type = sa.Column(types.MediumText(), nullable=False)
@@ -419,6 +422,10 @@ class Instance(BASE, NovaBase, models.SoftDeleteMixin):
     cleaned = sa.Column(sa.Integer, default=0)
 
     hidden = sa.Column(sa.Boolean, default=False)
+
+    # Identifies the high or low priority of the Instance.
+    # If this property is not set, the current instance is a common instance.
+    priority = sa.Column(sa.String(255))
 
 
 class InstanceInfoCache(BASE, NovaBase, models.SoftDeleteMixin):

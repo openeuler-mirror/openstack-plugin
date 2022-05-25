@@ -52,7 +52,8 @@ class ComputeNode(base.NovaPersistentObject, base.NovaObject):
     # Version 1.17: Added mapped
     # Version 1.18: Added get_by_uuid().
     # Version 1.19: Added get_by_nodename().
-    VERSION = '1.19'
+    # Version 1.20：Added priority, high_vcpus_used and low_vcpus_used
+    VERSION = '1.20'
 
     fields = {
         'id': fields.IntegerField(read_only=True),
@@ -99,6 +100,13 @@ class ComputeNode(base.NovaPersistentObject, base.NovaObject):
     def obj_make_compatible(self, primitive, target_version):
         super(ComputeNode, self).obj_make_compatible(primitive, target_version)
         target_version = versionutils.convert_version_to_tuple(target_version)
+        if target_version < (1, 20):
+            if 'priority' in primitive:
+                del primitive['priority']
+            if 'high_vcpus_used' in primitive:
+                del primitive['high_vcpus_used']
+            if 'low_vcpus_used' in primitive:
+                del primitive['low_vcpus_used']
         if target_version < (1, 17):
             if 'mapped' in primitive:
                 del primitive['mapped']

@@ -1036,7 +1036,7 @@ class API:
                     self._check_vnic_remote_managed_min_version(context)
 
     def _validate_and_build_base_options(
-        self, context, flavor, boot_meta, image_href, image_id, kernel_id,
+        self, context, flavor, priority, boot_meta, image_href, image_id, kernel_id,
         ramdisk_id, display_name, display_description, hostname, key_name,
         key_data, security_groups, availability_zone, user_data, metadata,
         access_ip_v4, access_ip_v6, requested_networks, config_drive,
@@ -1158,6 +1158,7 @@ class API:
             'system_metadata': system_metadata,
             'port_resource_requests': port_resource_requests,
             'request_level_params': req_lvl_params,
+            'priority': priority,
         }
 
         options_from_image = self._inherit_properties_from_image(
