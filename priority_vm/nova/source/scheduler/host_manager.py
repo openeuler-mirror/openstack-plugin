@@ -32,6 +32,7 @@ from nova import objects
 from nova.pci import stats as pci_stats
 from nova.scheduler import filters
 from nova.scheduler import weights
+from nova.scheduler import scheduler_utils
 from nova import utils
 from nova.virt import hardware
 
@@ -117,6 +118,9 @@ class HostState(object):
         self.vcpus_used = 0
         self.pci_stats = None
         self.numa_topology = None
+        # priority cpu resource
+        self.high_vcpus_used = 0
+        self.low_vcpus_used = 0
 
         # Additional host information from the compute node stats:
         self.num_instances = 0
@@ -218,6 +222,8 @@ class HostState(object):
         self.free_disk_mb = free_disk_mb
         self.vcpus_total = compute.vcpus
         self.vcpus_used = compute.vcpus_used
+        self.high_vcpus_used = compute.high_vcpus_used
+        self.low_vcpus_used = compute.low_vcpus_used
         self.updated = compute.updated_at
         # the ComputeNode.numa_topology field is a StringField so deserialize
         self.numa_topology = objects.NUMATopology.obj_from_db_obj(
@@ -281,6 +287,12 @@ class HostState(object):
         self.free_ram_mb -= ram_mb
         self.free_disk_mb -= disk_mb
         self.vcpus_used += vcpus
+
+        priority = scheduler_utils.get_instance_priority(spec_obj)
+        if priority and priority == 'high':
+            self.high_vcpus_used += vcpus
+        elif priority and priority == 'low':
+            self.low_vcpus_used += vcpus
 
         # Track number of instances on host
         self.num_instances += 1

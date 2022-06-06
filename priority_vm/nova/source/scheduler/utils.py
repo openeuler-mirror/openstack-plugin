@@ -1466,3 +1466,15 @@ def get_aggregates_for_routed_subnet(
                 'Failed to find aggregate related to segment %s' % segment_id)
         return agg_info.aggregates
     return []
+
+
+def get_instance_priority(spec_obj):
+    """Get instance priority flag from request spec object.
+
+    :param spec_obj: Request spec object
+    :return: The priority string from flavor or scheduler_hints
+    """
+    hints_priority = spec_obj.scheduler_hints.get('priority')
+    flavor_priority = spec_obj.flavor.get('extra_specs',{}).get(
+                                                            'hw:cpu_priority')
+    return hints_priority or flavor_priority

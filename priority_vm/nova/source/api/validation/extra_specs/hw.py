@@ -145,6 +145,27 @@ cpu_policy_validators = [
             'pattern': r'\^?\d+((-\d+)?(,\^?\d+(-\d+)?)?)*',
         },
     ),
+    base.ExtraSpecValidator(
+        name='hw:cpu_priority',
+        description=(
+            'The CPU priority policy of creating instance '
+            'If ``high``, the cpu of instance will be mapped to host and '
+            ' the number of high priority instance\'s cpus is equal to '
+            'cpu_dedicated_set cpus'
+            'If ``low``, the cpu of instance will not be mapped and the '
+            'number of low priority instance\'s cpus is equal to '
+            '(cpu_dedicated_set + cpu_shared_set) * cpu_allocation_ratio - '
+            'cpu_dedicated_set cpus'
+        ),
+        value={
+            'type': str,
+            'description': 'The CPU priority policy',
+            'enum': [
+                'low',
+                'high',
+            ],
+        },
+    ),
 ]
 
 hugepage_validators = [
