@@ -5753,7 +5753,7 @@ class LibvirtDriver(driver.ComputeDriver):
                     cell_pairs.append((guest_config_cell, host_cell))
         return cell_pairs
 
-    def _get_pin_cpuset(self, vcpu, inst_cell, host_cell):
+    def _get_pin_cpuset(self, vcpu, inst_cell, host_cell, priority):
         """Returns the config object of LibvirtConfigGuestCPUTuneVCPUPin.
 
         Prepares vcpupin config for the guest with the following caveats:
@@ -5761,6 +5761,8 @@ class LibvirtDriver(driver.ComputeDriver):
             a) If the specified instance vCPU is intended to be pinned, we pin
                it to the previously selected host CPU.
             b) Otherwise we float over the whole host NUMA node
+               When the instance has low priority and cpu_priority_mix_enable
+               is true, it also floats over the dedicated_cpu_set.
         """
         pin_cpuset = vconfig.LibvirtConfigGuestCPUTuneVCPUPin()
         pin_cpuset.id = vcpu
@@ -5773,12 +5775,14 @@ class LibvirtDriver(driver.ComputeDriver):
             pin_cpuset.cpuset = set([inst_cell.cpu_pinning[vcpu]])
         else:
             pin_cpuset.cpuset = host_cell.cpuset
+            if CONF.compute.cpu_priority_mix_enable and priority == 'low':
+                pin_cpuset.cpuset |= host_cell.pcpuset
 
         return pin_cpuset
 
     def _get_emulatorpin_cpuset(self, vcpu, object_numa_cell, vcpus_rt,
                                 emulator_threads_policy,
-                                pin_cpuset):
+                                pin_cpuset, priority):
         """Returns a set of cpu_ids to add to the cpuset for emulator threads
            with the following caveats:
 
@@ -5787,6 +5791,8 @@ class LibvirtDriver(driver.ComputeDriver):
             b) If emulator threads policy is shared and CONF.cpu_shared_set is
                defined, we pin emulator threads on the set of pCPUs defined by
                CONF.cpu_shared_set
+               If the instance has low priority and cpu_priority_mix_enable is
+               true, CONF.cpu_dedicated_set is also included.
             c) Otherwise;
                 c1) If realtime IS NOT enabled, the emulator threads are
                     allowed to float cross all the pCPUs associated with
@@ -5798,6 +5804,7 @@ class LibvirtDriver(driver.ComputeDriver):
         """
         emulatorpin_cpuset = set([])
         shared_ids = hardware.get_cpu_shared_set()
+        dedicated_ids = hardware.get_cpu_dedicated_set()
 
         if emulator_threads_policy == fields.CPUEmulatorThreadsPolicy.ISOLATE:
             if object_numa_cell.cpuset_reserved:
@@ -5814,6 +5821,9 @@ class LibvirtDriver(driver.ComputeDriver):
                        {'online': sorted(online_pcpus),
                         'req': sorted(shared_ids)})
                 raise exception.Invalid(msg)
+            if (CONF.compute.cpu_priority_mix_enable and priority == 'low' and
+                dedicated_ids):
+                cpuset |= dedicated_ids & online_pcpus
             emulatorpin_cpuset = cpuset
         elif not vcpus_rt or vcpu not in vcpus_rt:
             emulatorpin_cpuset = pin_cpuset.cpuset
@@ -5926,12 +5936,12 @@ class LibvirtDriver(driver.ComputeDriver):
             object_numa_cell = instance_numa_topology.cells[guest_node_id]
             for cpu in guest_config_cell.cpus:
                 pin_cpuset = self._get_pin_cpuset(cpu, object_numa_cell,
-                                                  host_cell)
+                                                  host_cell, priority)
                 guest_cpu_tune.vcpupin.append(pin_cpuset)
 
                 emu_pin_cpuset = self._get_emulatorpin_cpuset(
                     cpu, object_numa_cell, vcpus_rt,
-                    emulator_threads_policy, pin_cpuset)
+                    emulator_threads_policy, pin_cpuset, priority)
                 guest_cpu_tune.emulatorpin.cpuset.update(emu_pin_cpuset)
 
         # TODO(berrange) When the guest has >1 NUMA node, it will
