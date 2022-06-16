@@ -2,3 +2,7 @@ stdio_handler = "file"
 
 user = "nova"
 group = "nova"
+
+{% if ansible_architecture == 'aarch64' and kolla_base_distro in ['openeuler'] %}
+nvram = ["/usr/share/AAVMF/AAVMF_CODE.fd:/usr/share/AAVMF/AAVMF_VARS.fd", "/usr/share/edk2/aarch64/QEMU_EFI-pflash.raw:/usr/share/edk2/aarch64/vars-template-pflash.raw"]
+{% endif %}

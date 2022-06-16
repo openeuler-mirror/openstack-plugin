@@ -19,7 +19,7 @@ from oslo_config import types
 from kolla.version import version_info as version
 
 
-BASE_OS_DISTRO = ['centos', 'rhel', 'ubuntu', 'oraclelinux', 'debian']
+BASE_OS_DISTRO = ['centos', 'rhel', 'ubuntu', 'oraclelinux', 'debian', 'openeuler']
 BASE_ARCH = ['x86_64', 'ppc64le', 'aarch64']
 DEFAULT_BASE_TAGS = {
     'centos': '7',
@@ -27,6 +27,7 @@ DEFAULT_BASE_TAGS = {
     'oraclelinux': '7-slim',
     'debian': 'stretch-backports',
     'ubuntu': '18.04',
+    'openeuler': '20.03-lts-sp2'
 }
 DISTRO_RELEASE = {
     'centos': '7',
@@ -34,6 +35,7 @@ DISTRO_RELEASE = {
     'oraclelinux': '7',
     'debian': 'stretch-backports',
     'ubuntu': '18.04',
+    'openeuler': '20'
 }
 
 # This is noarch repository so we will use it on all architectures

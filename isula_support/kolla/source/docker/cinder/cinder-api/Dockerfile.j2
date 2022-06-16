@@ -6,13 +6,22 @@ LABEL maintainer="{{ maintainer }}" name="{{ image_name }}" build-date="{{ build
 {% import "macros.j2" as macros with context %}
 
 {% if install_type == 'binary' %}
-    {% if base_distro in ['centos', 'oraclelinux', 'rhel'] %}
-        {% set cinder_api_packages = [
-                'httpd',
-                'mod_ssl',
-                'mod_wsgi',
-                'python-keystone'
-        ] %}
+    {% if base_distro in ['centos', 'oraclelinux', 'rhel', 'openeuler'] %}
+        {% if base_distro in ['centos', 'oraclelinux', 'rhel'] %}
+            {% set cinder_api_packages = [
+                    'httpd',
+                    'mod_ssl',
+                    'mod_wsgi',
+                    'python-keystone'
+            ] %}
+        {% elif base_distro in ['openeuler'] %}
+            {% set cinder_api_packages = [
+                    'httpd',
+                    'mod_ssl',
+                    'mod_wsgi',
+                    'python2-keystone'
+            ] %}
+        {% endif %}
 {{ macros.install_packages(cinder_api_packages | customizable("packages")) }}
 RUN mkdir -p /var/www/cgi-bin/cinder \
     && cp -a /usr/bin/cinder-wsgi /var/www/cgi-bin/cinder/cinder-wsgi \

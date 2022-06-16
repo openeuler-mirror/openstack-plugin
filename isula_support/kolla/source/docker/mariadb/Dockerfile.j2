@@ -34,6 +34,22 @@ LABEL maintainer="{{ maintainer }}" name="{{ image_name }}" build-date="{{ build
             'percona-xtrabackup'
         ] %}
     {% endif %}
+
+{% elif base_distro == 'openeuler' %}
+    {% set mariadb_packages = [
+        'expect',
+        'galera',
+        'hostname',
+        'mariadb-server-galera',
+        'pv',
+        'rsync',
+        'tar',
+        'mariadb',
+        'mariadb-server',
+        'MySQL-python',
+        'python2-PyMySQL'
+    ] %}
+
 {% endif %}
 
 {{ macros.install_packages(mariadb_packages | customizable("packages")) }}

@@ -8,7 +8,7 @@ LABEL maintainer="{{ maintainer }}" name="{{ image_name }}" build-date="{{ build
 {{ macros.configure_user(name='rabbitmq') }}
 
 {% block rabbitmq_install %}
-{% if base_distro in ['centos', 'oraclelinux', 'rhel'] %}
+{% if base_distro in ['centos', 'oraclelinux', 'rhel', 'openeuler'] %}
     {% set rabbitmq_packages = [
         'erlang-hipe',
         'hostname',
@@ -50,12 +50,19 @@ LABEL maintainer="{{ maintainer }}" name="{{ image_name }}" build-date="{{ build
 
 {% block rabbitmq_install_plugins %}
 
+{% if base_distro == 'openeuler' %}
+RUN rabbitmq-plugins list | grep rabbitmq_management &>/dev/null \
+    && rabbitmq-plugins enable rabbitmq_management \
+    && ln -s `rpm -ql rabbitmq-server | grep cuttlefish` /usr/lib/rabbitmq/bin/cuttlefish \
+    && rm -f /etc/rabbitmq/rabbitmq.config
+{% else %}
 RUN rm -rf /var/lib/rabbitmq/* \
     && ln -s /usr/lib/rabbitmq/lib/rabbitmq_server-3.6.* /usr/lib/rabbitmq/lib/rabbitmq_server-3.6 \
     && curl -o /usr/lib/rabbitmq/lib/rabbitmq_server-3.6/plugins/rabbitmq_clusterer-3.6.x-667f92b0.ez https://www.rabbitmq.com/community-plugins/v3.6.x/rabbitmq_clusterer-3.6.x-667f92b0.ez \
     && /usr/lib/rabbitmq/bin/rabbitmq-plugins enable --offline \
        rabbitmq_management \
        rabbitmq_clusterer
+{% endif %}
 
 {% endblock %}
 

@@ -29,6 +29,19 @@ LABEL maintainer="{{ maintainer }}" name="{{ image_name }}" build-date="{{ build
             'python2-openvswitch',
             'python2-oslo-vmware'
         ] %}
+    {% elif base_distro in ['openeuler'] %}
+
+        {% set neutron_base_packages = [
+            'keepalived',
+            'net-tools',
+            'radvd',
+            'openstack-neutron',
+            'openstack-neutron-ml2',
+            'openvswitch',
+            'python2-networking-baremetal',
+            'python2-openvswitch',
+            'python2-oslo-vmware'
+        ] %}
 
     {% elif base_distro in ['debian'] %}
 

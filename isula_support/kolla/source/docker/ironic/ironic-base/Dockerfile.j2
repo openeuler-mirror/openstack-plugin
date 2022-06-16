@@ -8,7 +8,7 @@ LABEL maintainer="{{ maintainer }}" name="{{ image_name }}" build-date="{{ build
 {{ macros.configure_user(name='ironic') }}
 
 {% if install_type == 'binary' %}
-    {% if base_distro in ['centos', 'oraclelinux', 'rhel'] %}
+    {% if base_distro in ['centos', 'oraclelinux', 'rhel', 'openeuler'] %}
         {% set ironic_base_packages = ['openstack-ironic-common'] %}
     {% elif base_distro in ['debian', 'ubuntu'] %}
         {% set ironic_base_packages = ['ironic-common'] %}

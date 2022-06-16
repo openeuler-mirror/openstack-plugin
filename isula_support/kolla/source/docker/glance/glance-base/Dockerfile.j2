@@ -15,6 +15,13 @@ LABEL maintainer="{{ maintainer }}" name="{{ image_name }}" build-date="{{ build
             'python-rados',
             'python-rbd'
         ] %}
+    {% elif base_distro in ['openeuler'] %}
+        {% set glance_base_packages = [
+            'openstack-glance',
+            'python2-oslo-vmware',
+            'python-rados',
+            'python-rbd'
+        ] %}
     {% elif base_distro in ['debian', 'ubuntu'] %}
         {% set glance_base_packages = [
             'glance',

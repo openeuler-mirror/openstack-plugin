@@ -12,6 +12,12 @@ LABEL maintainer="{{ maintainer }}" name="{{ image_name }}" build-date="{{ build
         'targetcli'
     ] %}
 
+{% elif base_distro in ['openeuler'] %}
+    {% set iscsid_packages = [
+        'iscsi-initiator-utils',
+        'python2-rtslib-fb',
+    ] %}
+
 {% elif base_distro in ['debian', 'ubuntu'] %}
     {% set iscsid_packages = [
         'open-iscsi',

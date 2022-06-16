@@ -15,6 +15,14 @@ LABEL maintainer="{{ maintainer }}" name="{{ image_name }}" build-date="{{ build
         'tcpdump'
     ] %}
 
+{% elif base_distro in ['openeuler'] %}
+    {% set openvswitch_base_packages = [
+        'openvswitch',
+        'python2-openvswitch',
+        'python2-netifaces',
+        'tcpdump'
+    ] %}
+
 {% elif base_distro in ['debian', 'ubuntu'] %}
     {% set openvswitch_base_packages = [
         'openvswitch-switch',
