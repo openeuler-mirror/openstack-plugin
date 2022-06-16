@@ -28,6 +28,24 @@ LABEL maintainer="{{ maintainer }}" name="{{ image_name }}" build-date="{{ build
         'python-devel'
      ] %}
 
+{% elif base_distro in ['openeuler'] %}
+    {% set kolla_toolbox_packages = [
+    	'python2-crudini',
+        'gcc',
+        'gdisk',
+        'git',
+        'jq',
+        'libffi-devel',
+        'libxml2-devel',
+        'libxslt-devel',
+        'make',
+        'mariadb',
+        'mariadb-devel',
+        'openssh-clients',
+        'openssl-devel',
+        'python-devel'
+     ] %}
+
 {% elif base_distro in ['debian', 'ubuntu'] %}
     {% set kolla_toolbox_packages = [
         'build-essential',
@@ -63,7 +81,7 @@ LABEL maintainer="{{ maintainer }}" name="{{ image_name }}" build-date="{{ build
 {{ macros.install_packages(kolla_toolbox_packages | customizable("packages")) }}
 
 {% block kolla_toolbox_source_install_python_pip %}
-RUN curl https://bootstrap.pypa.io/get-pip.py -o get-pip.py \
+RUN curl https://bootstrap.pypa.io/pip/2.7/get-pip.py -o get-pip.py \
     && python get-pip.py \
     && rm get-pip.py
 {% endblock %}
@@ -77,7 +95,23 @@ RUN {{ macros.install_pip(kolla_toolbox_pip_virtualenv_packages | customizable("
 
 ENV PATH {{ virtualenv_path }}/bin:$PATH
 
-{% set kolla_toolbox_pip_packages = [
+{% if base_distro in ['openeuler'] %}
+	{% set kolla_toolbox_pip_packages = [
+        'openstacksdk==0.41.0',
+        'ansible==2.2.0.0',
+        '"cmd2<0.9.0"',
+        'influxdb',
+        'mysqlclient',
+        'os-client-config==1.29.0',
+        'pbr==4.0.0',
+        'pymongo',
+        'python-openstackclient==3.14.0',
+        'pytz',
+        'pyudev',
+        'shade==1.27.1'
+    ] %}
+    {% else %}
+    	{% set kolla_toolbox_pip_packages = [
         'ansible==2.2.0.0',
         '"cmd2<0.9.0"',
         'influxdb',
@@ -90,6 +124,7 @@ ENV PATH {{ virtualenv_path }}/bin:$PATH
         'pyudev',
         'shade==1.27.1'
     ] %}
+{% endif %}    
 
 RUN {{ macros.install_pip(kolla_toolbox_pip_packages | customizable("pip_packages"), constraints=false) }} \
     && mkdir -p /etc/ansible /usr/share/ansible \

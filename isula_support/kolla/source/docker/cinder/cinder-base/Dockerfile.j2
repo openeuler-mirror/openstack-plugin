@@ -17,6 +17,15 @@ LABEL maintainer="{{ maintainer }}" name="{{ image_name }}" build-date="{{ build
                 'python-automaton',
                 'python-oslo-vmware'
         ] %}
+    {% elif base_distro == 'openeuler' %}
+        {% set cinder_base_packages = [
+                'ceph-common',
+                'lvm2',
+                'cryptsetup',
+                'openstack-cinder',
+                'python2-automaton',
+                'python2-oslo-vmware'
+        ] %}
     {% elif base_distro in ['debian', 'ubuntu'] %}
         {% set cinder_base_packages = [
                 'ceph-common',

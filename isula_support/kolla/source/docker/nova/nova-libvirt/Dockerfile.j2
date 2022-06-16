@@ -7,22 +7,40 @@ LABEL maintainer="{{ maintainer }}" name="{{ image_name }}" build-date="{{ build
 
 {{ macros.configure_user(name='nova', groups='qemu') }}
 
-{% if base_distro in ['centos', 'oraclelinux', 'rhel'] %}
+{% if base_distro in ['centos', 'oraclelinux', 'rhel', 'openeuler'] %}
+    {% if base_distro in ['centos', 'oraclelinux', 'rhel'] %}
+        {% set nova_libvirt_packages = [
+            'ceph-common',
+            'cyrus-sasl-scram',
+            'libguestfs',
+            'libvirt-client',
+            'libvirt-daemon',
+            'libvirt-daemon-config-nwfilter',
+            'libvirt-daemon-driver-lxc',
+            'libvirt-daemon-driver-nwfilter',
+            'openvswitch',
+        ] %}
+    {% elif base_distro == 'openeuler' %}
+        {% set nova_libvirt_packages = [
+            'ceph-common',
+            'cyrus-sasl-scram',
+            'libguestfs',
+            'libvirt-client',
+            'libvirt-daemon',
+            'libvirt-daemon-config-nwfilter',
+            'libvirt-daemon-driver-nwfilter',
+            'openvswitch',
+            'qemu-block-rbd',
+        ] %}
+    {% endif %}
 
-    {% set nova_libvirt_packages = [
-        'ceph-common',
-        'cyrus-sasl-scram',
-        'libguestfs',
-        'libvirt-client',
-        'libvirt-daemon',
-        'libvirt-daemon-config-nwfilter',
-        'libvirt-daemon-driver-lxc',
-        'libvirt-daemon-driver-nwfilter',
-        'openvswitch',
-    ] %}
     {% if base_distro in ['centos', 'oraclelinux'] %}
         {% set nova_libvirt_packages = nova_libvirt_packages + [
             'qemu-kvm-ev'
+        ] %}
+    {% elif base_distro == 'openeuler' %}
+        {% set nova_libvirt_packages = nova_libvirt_packages + [
+            'qemu'
         ] %}
     {% else %}
         {% set nova_libvirt_packages = nova_libvirt_packages + [
@@ -30,14 +48,26 @@ LABEL maintainer="{{ maintainer }}" name="{{ image_name }}" build-date="{{ build
         ] %}
     {% endif %}
 
-    {% if base_arch == 'x86_64' %}
-        {% set nova_libvirt_packages = nova_libvirt_packages + [
-            'OVMF'
-        ] %}
-    {% elif base_arch == 'aarch64' %}
-        {% set nova_libvirt_packages = nova_libvirt_packages + [
-            'AAVMF'
-        ] %}
+    {% if base_distro in ['centos', 'oraclelinux', 'rhel'] %}
+        {% if base_arch == 'x86_64' %}
+            {% set nova_libvirt_packages = nova_libvirt_packages + [
+                'OVMF'
+            ] %}
+        {% elif base_arch == 'aarch64' %}
+            {% set nova_libvirt_packages = nova_libvirt_packages + [
+                'AAVMF'
+            ] %}
+        {% endif %}
+    {% elif base_distro == 'openeuler' %}
+        {% if base_arch == 'x86_64' %}
+            {% set nova_libvirt_packages = nova_libvirt_packages + [
+                'edk2-ovmf'
+            ] %}
+        {% elif base_arch == 'aarch64' %}
+            {% set nova_libvirt_packages = nova_libvirt_packages + [
+                'edk2-aarch64'
+            ] %}
+        {% endif %}
     {% endif %}
 
 {% elif base_distro in ['debian', 'ubuntu'] %}
@@ -91,6 +121,18 @@ RUN rm -f /etc/libvirt/qemu/networks/default.xml /etc/libvirt/qemu/networks/auto
 RUN ln -sf /usr/share/OVMF/OVMF_CODE.secboot.fd /usr/share/OVMF/OVMF_CODE.fd
     {% endif %}
 
+{% endif %}
+
+{% if base_distro in ['openeuler'] %}
+    {% if base_arch == 'x86_64' %}
+RUN mkdir -p /usr/share/OVMF \
+    && ln -s /usr/share/edk2/ovmf/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE.fd \
+    && ln -s /usr/share/edk2/ovmf/OVMF_VARS.fd /usr/share/OVMF/OVMF_VARS.fd
+    {% elif base_arch == 'aarch64' %}
+RUN mkdir -p /usr/share/AAVMF \
+    && ln -s /usr/share/edk2/aarch64/QEMU_EFI-pflash.raw /usr/share/AAVMF/AAVMF_CODE.fd \
+    && ln -s /usr/share/edk2/aarch64/vars-template-pflash.raw /usr/share/AAVMF/AAVMF_VARS.fd 
+    {% endif %}
 {% endif %}
 
 COPY extend_start.sh /usr/local/bin/kolla_extend_start

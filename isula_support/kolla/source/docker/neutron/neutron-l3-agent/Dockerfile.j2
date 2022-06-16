@@ -11,6 +11,10 @@ LABEL maintainer="{{ maintainer }}" name="{{ image_name }}" build-date="{{ build
             'openstack-neutron-vpn-agent',
             'libreswan'
        ] %}
+    {% elif base_distro in ['openeuler'] %}
+       {% set neutron_l3_agent_packages = [
+            'libreswan'
+       ] %}
 
 # TODO(chenxing) Currently, there is no Ubuntu vpnaas package for Queens release.
     {% elif base_distro in ['debian', 'ubuntu'] %}

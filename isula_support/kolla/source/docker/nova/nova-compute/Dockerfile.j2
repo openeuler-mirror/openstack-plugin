@@ -29,6 +29,28 @@ LABEL maintainer="{{ maintainer }}" name="{{ image_name }}" build-date="{{ build
 
 {{ macros.install_packages(nova_compute_packages | customizable("packages")) }}
 
+    {% elif base_distro in ['openeuler'] %}
+        {% set nova_compute_packages = [
+            'ceph-common',
+            'device-mapper-multipath',
+            'e2fsprogs',
+            'genisoimage',
+            'iscsi-initiator-utils',
+            'nfs-utils',
+            'nvme-cli',
+            'openstack-nova-compute',
+            'openvswitch',
+            'parted',
+            'python2-libguestfs',
+            'python2-oslo-vmware',
+            'python2-rtslib-fb',
+            'sysfsutils',
+            'xfsprogs',
+            'qemu-block-rbd'
+        ] %}
+
+{{ macros.install_packages(nova_compute_packages | customizable("packages")) }}
+
     {% elif base_distro in ['debian', 'ubuntu'] %}
 
         # ironic as workaround https://bugs.launchpad.net/packstack/+bug/1430388

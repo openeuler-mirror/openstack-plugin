@@ -1,4 +1,4 @@
-{% set haproxy_cmd='/usr/sbin/haproxy -W -db' if kolla_base_distro in ['ubuntu']  else '/usr/sbin/haproxy-systemd-wrapper' %}
+{% set haproxy_cmd='/usr/sbin/haproxy -W -db' if kolla_base_distro in ['ubuntu', 'openeuler']  else '/usr/sbin/haproxy-systemd-wrapper' %}
 {
     "command": "{{ haproxy_cmd }} -f /etc/haproxy/haproxy.cfg -p /run/haproxy.pid",
     "config_files": [

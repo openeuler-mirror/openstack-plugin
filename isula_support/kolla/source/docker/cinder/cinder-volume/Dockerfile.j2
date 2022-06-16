@@ -5,15 +5,25 @@ LABEL maintainer="{{ maintainer }}" name="{{ image_name }}" build-date="{{ build
 
 {% import "macros.j2" as macros with context %}
 
-{% if base_distro in ['centos', 'oraclelinux', 'rhel'] %}
-    {% set cinder_volume_packages = [
-            'nfs-utils',
-            'nvmetcli',
-            'python-rtslib',
-            'scsi-target-utils',
-            'sysfsutils',
-            'targetcli'
-    ] %}
+{% if base_distro in ['centos', 'oraclelinux', 'rhel', 'openeuler'] %}
+    {% if base_distro in ['centos', 'oraclelinux', 'rhel'] %}
+        {% set cinder_volume_packages = [
+                'nfs-utils',
+                'nvmetcli',
+                'python-rtslib',
+                'scsi-target-utils',
+                'sysfsutils',
+                'targetcli'
+        ] %}
+    {% elif base_distro in ['openeuler'] %}
+        {% set cinder_volume_packages = [
+                'nfs-utils',
+                'nvmetcli',
+                'python2-rtslib-fb',
+                'scsi-target-utils',
+                'sysfsutils',
+        ] %}
+    {% endif %}
 {{ macros.install_packages(cinder_volume_packages | customizable("packages")) }}
 
 {% block cinder_volume_redhat_setup %}
