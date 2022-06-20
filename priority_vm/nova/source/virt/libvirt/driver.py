@@ -6990,7 +6990,7 @@ class LibvirtDriver(driver.ComputeDriver):
     def _get_priority(self, instance):
 
         priority_flavor_value = instance.flavor.get('extra_specs', {}).get('hw:cpu_priority', None)
-        priority_hints_value = instance.scheduler_hints.get('priority', None)
+        priority_hints_value = instance.priority
 
         if priority_flavor_value == 'high':
             priority = priority_flavor_value
@@ -7172,7 +7172,7 @@ class LibvirtDriver(driver.ComputeDriver):
 
     def _get_partition(self, instance):
         priority_flavor_value = instance.flavor.get('extra_specs', {}).get('hw:cpu_priority', None)
-        priority_hints_value = instance.scheduler_hints.get('priority', None)
+        priority_hints_value = instance.priority
 
         if priority_flavor_value == 'high':
             partition = priority_flavor_value
