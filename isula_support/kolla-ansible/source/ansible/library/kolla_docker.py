@@ -1,5 +1,6 @@
+"""
 #!/usr/bin/env python
-
+"""
 # Copyright 2015 Sam Yaple
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -224,7 +225,9 @@ import shlex
 import traceback
 
 import docker
-
+import runtime
+from oslo_config import cfg
+from oslo.config import types
 
 def get_docker_client():
     return docker.APIClient
@@ -232,7 +235,8 @@ def get_docker_client():
 
 class DockerWorker(object):
 
-    def __init__(self, module):
+    def __init__(self, module, conf):
+        self.conf = conf
         self.module = module
         self.params = self.module.params
         self.changed = False
@@ -247,7 +251,8 @@ class DockerWorker(object):
             'timeout': self.params.get('client_timeout'),
         }
 
-        self.dc = get_docker_client()(**options)
+        # self.dc = get_docker_client()(**options)
+        self.dc = runtime.RuntimeAdapter(self.conf.base_runtime)
 
     def generate_tls(self):
         tls = {'verify': self.params.get('tls_verify')}
@@ -263,8 +268,8 @@ class DockerWorker(object):
             if tls_cacert:
                 self.check_file(tls_cacert)
                 tls['verify'] = tls_cacert
-
-        return docker.tls.TLSConfig(**tls)
+        if self.conf.base_runtime == 'docker':
+            return docker.tls.TLSConfig(**tls)
 
     def check_file(self, path):
         if not os.path.isfile(path):
@@ -521,15 +526,25 @@ class DockerWorker(object):
 
         image = self.dc.images(name=full_image, quiet=True)
         return image[0] if len(image) == 1 else None
-
+    
+    #DONE
     def pull_image(self):
         if self.params.get('auth_username'):
-            self.dc.login(
-                username=self.params.get('auth_username'),
-                password=self.params.get('auth_password'),
-                registry=self.params.get('auth_registry'),
-                email=self.params.get('auth_email')
-            )
+
+            if self.conf.base_runtime == 'docker':
+                self.dc.login(
+                    username=self.params.get('auth_username'),
+                    password=self.params.get('auth_password'),
+                    registry=self.params.get('auth_registry'),
+                    email=self.params.get('auth_email')
+                )
+            else:
+                self.dc.login(
+                    username=self.params.get('auth_username'),
+                    password=self.params.get('auth_password'),
+                    server=self.params.get('auth_registry')
+                )
+            
 
         image, tag = self.parse_image()
         old_image_id = self.get_image_id()
@@ -558,6 +573,7 @@ class DockerWorker(object):
         new_image_id = self.get_image_id()
         self.changed = old_image_id != new_image_id
 
+    #DONE
     def remove_container(self):
         if self.check_container():
             self.changed = True
@@ -565,14 +581,23 @@ class DockerWorker(object):
             # filesystem and raise error.  But the container info is
             # disappeared already. If this happens, assume the container is
             # removed.
-            try:
-                self.dc.remove_container(
-                    container=self.params.get('name'),
-                    force=True
-                )
-            except docker.errors.APIError:
-                if self.check_container():
-                    raise
+            if self.conf.base_runtime == 'docker':
+                try:
+                    self.dc.client.remove_container(
+                        container=self.params.get('name'),
+                        force=True
+                    )
+                except docker.errors.APIError:
+                    if self.check_container():
+                        raise
+            else:
+                try:
+                    self.dc.isulad_client.delete_container(
+                        container_id=self.params.get('name'),
+                        force=True
+                    )
+                except runtime.InitException:
+                    self.logger.exception('Remove container failed')
 
     def generate_volumes(self):
         volumes = self.params.get('volumes')
@@ -643,7 +668,7 @@ class DockerWorker(object):
         if binds:
             options['binds'] = binds
 
-        return self.dc.create_host_config(**options)
+        return self.dc.client.create_host_config(**options)
 
     def _inject_env_var(self, environment_info):
         newenv = {
@@ -670,35 +695,55 @@ class DockerWorker(object):
             'tty': self.params.get('tty'),
         }
 
+    # DONE
     def create_container(self):
-        self.changed = True
-        options = self.build_container_options()
-        self.dc.create_container(**options)
+        if self.conf.base_runtime == 'docker':
+            self.changed = True
+            options = self.build_container_options()
+            self.dc.client.create_container(**options)
+        else:
+            self.changed = True
+            options = self.build_container_options()
+            self.dc.isulad_client.create_container(container_id=options['name'],container_image=options['image'])
 
+    # Not sure, DONE
     def recreate_or_restart_container(self):
-        self.changed = True
-        container = self.check_container()
-        # get config_strategy from env
-        environment = self.params.get('environment')
-        config_strategy = environment.get('KOLLA_CONFIG_STRATEGY')
+        if self.conf.base_runtime == 'docker':
+            self.changed = True
+            container = self.check_container()
+            # get config_strategy from env
+            environment = self.params.get('environment')
+            config_strategy = environment.get('KOLLA_CONFIG_STRATEGY')
 
-        if not container:
-            self.start_container()
-            return
-        # If config_strategy is COPY_ONCE or container's parameters are
-        # changed, try to start a new one.
-        if config_strategy == 'COPY_ONCE' or self.check_container_differs():
-            # NOTE(mgoddard): Pull the image if necessary before stopping the
-            # container, otherwise a failure to pull the image will leave the
-            # container stopped.
-            if not self.check_image():
-                self.pull_image()
-            self.stop_container()
-            self.remove_container()
-            self.start_container()
-        elif config_strategy == 'COPY_ALWAYS':
-            self.restart_container()
+            if not container:
+                self.start_container()
+                return
+            # If config_strategy is COPY_ONCE or container's parameters are
+            # changed, try to start a new one.
+            if config_strategy == 'COPY_ONCE' or self.check_container_differs():
+                # NOTE(mgoddard): Pull the image if necessary before stopping the
+                # container, otherwise a failure to pull the image will leave the
+                # container stopped.
+                if not self.check_image():
+                    self.pull_image()
+                self.stop_container()
+                self.remove_container()
+                self.start_container()
+            elif config_strategy == 'COPY_ALWAYS':
+                self.restart_container()
+        else:
+            self.changed = True
+            container = self.check_container()
+            # get config_strategy from env
+            environment = self.params.get('environment')
+            config_strategy = environment.get('KOLLA_CONFIG_STRATEGY')
 
+            if not container:
+                self.start_container()
+                return
+            self.dc.isulad_client.restart_container(container_id=self.params.get('name'))
+            
+    # DONE
     def start_container(self):
         if not self.check_image():
             self.pull_image()
@@ -712,34 +757,36 @@ class DockerWorker(object):
         if not container:
             self.create_container()
             container = self.check_container()
+        if self.conf.base_runtime == 'docker':
+            if not container['Status'].startswith('Up '):
+                self.changed = True
+                self.dc.client.start(container=self.params.get('name'))
 
-        if not container['Status'].startswith('Up '):
-            self.changed = True
-            self.dc.start(container=self.params.get('name'))
-
-        # We do not want to detach so we wait around for container to exit
-        if not self.params.get('detach'):
-            rc = self.dc.wait(self.params.get('name'))
-            # NOTE(jeffrey4l): since python docker package 3.0, wait return a
-            # dict all the time.
-            if isinstance(rc, dict):
-                rc = rc['StatusCode']
-            # Include container's return code, standard output and error in the
-            # result.
-            self.result['rc'] = rc
-            self.result['stdout'] = self.dc.logs(self.params.get('name'),
-                                                 stdout=True, stderr=False)
-            self.result['stderr'] = self.dc.logs(self.params.get('name'),
-                                                 stdout=False, stderr=True)
-            if self.params.get('remove_on_exit'):
-                self.stop_container()
-                self.remove_container()
-            if rc != 0:
-                self.module.fail_json(
-                    changed=True,
-                    msg="Container exited with non-zero return code %s" % rc,
-                    **self.result
-                )
+            # We do not want to detach so we wait around for container to exit
+            if not self.params.get('detach'):
+                rc = self.dc.client.wait(self.params.get('name'))
+                # NOTE(jeffrey4l): since python docker package 3.0, wait return a
+                # dict all the time.
+                if isinstance(rc, dict):
+                    rc = rc['StatusCode']
+                # Include container's return code, standard output and error in the
+                # result.
+                self.result['rc'] = rc
+                self.result['stdout'] = self.dc.client.logs(self.params.get('name'),
+                                                    stdout=True, stderr=False)
+                self.result['stderr'] = self.dc.client.logs(self.params.get('name'),
+                                                    stdout=False, stderr=True)
+                if self.params.get('remove_on_exit'):
+                    self.stop_container()
+                    self.remove_container()
+                if rc != 0:
+                    self.module.fail_json(
+                        changed=True,
+                        msg="Container exited with non-zero return code %s" % rc,
+                        **self.result
+                    )
+            else:
+                self.dc.isulad_client.start_container(container_id=self.params.get('name'))
 
     def get_container_env(self):
         name = self.params.get('name')
@@ -765,19 +812,29 @@ class DockerWorker(object):
         else:
             self.module.exit_json(**info['State'])
 
+    #DONE
     def stop_container(self):
         name = self.params.get('name')
         graceful_timeout = self.params.get('graceful_timeout')
         if not graceful_timeout:
             graceful_timeout = 10
-        container = self.check_container()
-        if not container:
-            self.module.fail_json(
-                msg="No such container: {} to stop".format(name))
-        elif not container['Status'].startswith('Exited '):
-            self.changed = True
-            self.dc.stop(name, timeout=graceful_timeout)
+        
+        if self.conf.base_runtime == 'docker':
+            container = self.check_container()
+            if not container:
+                self.module.fail_json(
+                    msg="No such container: {} to stop".format(name))
+            elif not container['Status'].startswith('Exited '):
+                self.changed = True
+                self.dc.client.stop(name, timeout=graceful_timeout)
+        else:
+            try:
+                self.dc.isulad_client.stop_container(container_id=name, timeout=graceful_timeout)
+            except runtime.InitException:
+                    self.logger.exception('Stop container failed')
+            
 
+    #DONE
     def restart_container(self):
         name = self.params.get('name')
         graceful_timeout = self.params.get('graceful_timeout')
@@ -789,28 +846,40 @@ class DockerWorker(object):
                 msg="No such container: {}".format(name))
         else:
             self.changed = True
-            self.dc.stop(name, timeout=graceful_timeout)
-            self.dc.start(name)
+            if self.conf.base_runtime == 'docker':
+                self.dc.client.stop(name, timeout=graceful_timeout)
+                self.dc.client.start(name)
+            else:
+                self.dc.isulad_client.stop_container(container_id=name, timeout=graceful_timeout)
+                self.dc.isulad_client.start_container()
 
     def create_volume(self):
         if not self.check_volume():
             self.changed = True
-            self.dc.create_volume(name=self.params.get('name'), driver='local')
+            self.dc.client.create_volume(name=self.params.get('name'), driver='local')
 
+    # DONE
     def remove_volume(self):
         if self.check_volume():
             self.changed = True
-            try:
-                self.dc.remove_volume(name=self.params.get('name'))
-            except docker.errors.APIError as e:
-                if e.response.status_code == 409:
-                    self.module.fail_json(
-                        failed=True,
-                        msg="Volume named '{}' is currently in-use".format(
-                            self.params.get('name')
+            if self.conf.base_runtime == 'docker':
+                try:
+                    self.dc.client.remove_volume(name=self.params.get('name'))
+                except docker.errors.APIError as e:
+                    if e.response.status_code == 409:
+                        self.module.fail_json(
+                            failed=True,
+                            msg="Volume named '{}' is currently in-use".format(
+                                self.params.get('name')
+                            )
                         )
-                    )
-                raise
+                    raise
+            else:
+                try:
+                    self.dc.isulad_client.remove_volume(name=self.params.get('name'))
+                except runtime.InitException:
+                    msg="Remove volume '{}' failed".format(self.params.get('name'))
+                    self.logger.exception(msg)
 
 
 def generate_module():
@@ -913,10 +982,15 @@ def generate_module():
 
 def main():
     module = generate_module()
-
+    opts = [cfg.StrOpt('base-runtime', default='docker',
+               choices=['docker', 'isula'],
+               help='The base container runtime. Default is docker')]
+    # conf = cfg.CONF  
+    conf = cfg.ConfigOpts()
+    conf.register_opts(opts)  
     dw = None
     try:
-        dw = DockerWorker(module)
+        dw = DockerWorker(module, conf)
         # TODO(inc0): We keep it bool to have ansible deal with consistent
         # types. If we ever add method that will have to return some
         # meaningful data, we need to refactor all methods to return dicts.
