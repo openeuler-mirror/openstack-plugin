@@ -47,7 +47,7 @@ LOG = logging.getLogger(__name__)
 _INSTANCE_OPTIONAL_JOINED_FIELDS = ['metadata', 'system_metadata',
                                     'info_cache', 'security_groups',
                                     'pci_devices', 'tags', 'services',
-                                    'fault', 'priority']
+                                    'fault']
 # These are fields that are optional but don't translate to db columns
 _INSTANCE_OPTIONAL_NON_COLUMN_FIELDS = ['flavor', 'old_flavor',
                                         'new_flavor', 'ec2_ids']

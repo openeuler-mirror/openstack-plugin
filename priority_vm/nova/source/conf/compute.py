@@ -306,6 +306,14 @@ Related options:
   agent disabled. When used with libvirt the instance mode should be
   configured as HVM.
  """),
+    cfg.BoolOpt('cpu_priority_mix_enable',
+        default=False,
+        help="""
+Enable cpu priority feature on the compute node.
+
+If enabled, The VM contains `priority` propertiry can be allocated to the
+compute node.
+"""),
 ]
 
 resource_tracker_opts = [
