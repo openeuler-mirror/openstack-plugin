@@ -28,6 +28,14 @@ class PriorityFilter(filters.BaseHostFilter):
         cpu_ratio = host_state.cpu_allocation_ratio
         requested_topology = spec_obj.numa_topology
         host_topology = host_state.numa_topology
+        pci_requests = spec_obj.pci_requests
+
+        network_metadata = None
+        if 'network_metadata' in spec_obj:
+            network_metadata = spec_obj.network_metadata
+
+        if pci_requests:
+            pci_requests = pci_requests.requests
 
         flavor_priority = spec_obj.flavor.extra_specs.get(
             'hw:cpu_priority')
