@@ -23,6 +23,8 @@ LOG = logging.getLogger(__name__)
 class PriorityFilter(filters.BaseHostFilter):
 
     def host_passes(self, host_state, spec_obj):
+        if not host_state.priority:
+            return False
         spec_obj = spec_obj.obj_clone()
         ram_ratio = host_state.ram_allocation_ratio
         cpu_ratio = host_state.cpu_allocation_ratio
@@ -74,4 +76,3 @@ class PriorityFilter(filters.BaseHostFilter):
             return False
         else:
             return True
-        

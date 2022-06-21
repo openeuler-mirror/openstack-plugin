@@ -1304,14 +1304,20 @@ class ResourceTracker(object):
         cn.local_gb_used += sign * usage.get('swap', 0) / 1024
         cn.vcpus_used += sign * vcpus_usage
 
-        priority = self._get_priority(self, instance)
+        priority = self._get_priority(instance)
 
         if priority == 'high':
-            cn.high_vcpus_used += sign * vcpus_usage
+            if not cn.high_vcpus_used:
+                cn.high_vcpus_used = sign * vcpus_usage
+            else:
+                cn.high_vcpus_used += sign * vcpus_usage
         if priority == 'low':
-            cn.low_vcpus_used += sign * vcpus_usage
-        
-	# free ram and disk may be negative, depending on policy:
+            if not cn.low_vcpus_used:
+                cn.low_vcpus_used = sign * vcpus_usage
+            else:
+                cn.low_vcpus_used += sign * vcpus_usage
+
+        # free ram and disk may be negative, depending on policy:
         cn.free_ram_mb = cn.memory_mb - cn.memory_mb_used
         cn.free_disk_gb = cn.local_gb - cn.local_gb_used
 

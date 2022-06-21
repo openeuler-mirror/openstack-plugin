@@ -5863,10 +5863,8 @@ class LibvirtDriver(driver.ComputeDriver):
         if CONF.vcpu_pin_set or CONF.compute.cpu_shared_set:
             shared_cpus = self._get_vcpu_available()
 
-        if priority == 'high':
-            dedicated_cpus = None
-            if CONF.compute.cpu_dedicated_set:
-                dedicated_cpus = self._get_pcpu_available()
+        if shared_cpus and priority == 'low' and CONF.compute.cpu_dedicated_set:
+            dedicated_cpus = self._get_pcpu_available()
             shared_cpus |= dedicated_cpus
 
         topology = self._get_host_numa_topology()
@@ -6858,7 +6856,7 @@ class LibvirtDriver(driver.ComputeDriver):
         guest.memory = flavor.memory_mb * units.Ki
         guest.vcpus = flavor.vcpus
 
-        priority = self._get_priority(self, instance)
+        priority = self._get_priority(instance)
 
         guest_numa_config = self._get_guest_numa_config(
             instance.numa_topology, flavor, image_meta, priority)

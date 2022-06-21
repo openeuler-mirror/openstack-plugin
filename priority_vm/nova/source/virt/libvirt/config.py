@@ -2831,7 +2831,7 @@ class LibvirtConfigGuest(LibvirtConfigObject):
         self.idmaps = []
         self.perf_events = []
         self.launch_security = None
-    	self.partition = None
+        self.partition = None
 
     def _format_basic_props(self, root):
         root.append(self._text_node("uuid", self.uuid))

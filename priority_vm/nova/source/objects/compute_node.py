@@ -65,8 +65,8 @@ class ComputeNode(base.NovaPersistentObject, base.NovaObject):
         'local_gb': fields.IntegerField(),
         'vcpus_used': fields.IntegerField(),
         'priority': fields.BooleanField(default=False),
-    	'high_vcpus_used': fields.IntegerField(),
-        'low_vcpus_used': fields.IntegerField(),
+        'high_vcpus_used': fields.IntegerField(nullable=True),
+        'low_vcpus_used': fields.IntegerField(nullable=True),
         'memory_mb_used': fields.IntegerField(),
         'local_gb_used': fields.IntegerField(),
         'hypervisor_type': fields.StringField(),
@@ -226,6 +226,8 @@ class ComputeNode(base.NovaPersistentObject, base.NovaObject):
                 online_updates[key] = value
             elif key == 'mapped':
                 value = 0 if value is None else value
+            elif key == 'priority':
+                value = False if value is None else value
 
             setattr(compute, key, value)
 

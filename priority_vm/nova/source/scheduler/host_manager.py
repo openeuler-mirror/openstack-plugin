@@ -32,7 +32,7 @@ from nova import objects
 from nova.pci import stats as pci_stats
 from nova.scheduler import filters
 from nova.scheduler import weights
-from nova.scheduler import scheduler_utils
+from nova.scheduler import utils as scheduler_utils
 from nova import utils
 from nova.virt import hardware
 
@@ -157,6 +157,9 @@ class HostState(object):
 
         self.updated = None
 
+        # cpu priority
+        self.priority = None
+
     def update(self, compute=None, service=None, aggregates=None,
             inst_dict=None):
         """Update all information about a host."""
@@ -264,6 +267,9 @@ class HostState(object):
 
         # update failed_builds counter reported by the compute
         self.failed_builds = int(self.stats.get('failed_builds', 0))
+
+        # update cpu priority by the compute
+        self.priority=compute.priority
 
     def consume_from_request(self, spec_obj):
         """Incrementally update host state from a RequestSpec object."""
