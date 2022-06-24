@@ -2861,7 +2861,9 @@ class LibvirtConfigGuest(LibvirtConfigObject):
             root.append(metadata)
 
         if self.partition is not None:
-            root.append(self._text_node("partition", self.partition))
+            resource = etree.Element("resource")
+            resource.append(self._text_node("partition", self.partition))
+            root.append(resource)
 
     def _format_os(self, root):
         os = etree.Element("os")
