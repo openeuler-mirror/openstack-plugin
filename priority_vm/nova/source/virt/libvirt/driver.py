@@ -7162,9 +7162,9 @@ class LibvirtDriver(driver.ComputeDriver):
         partition = self._get_partition(instance)
 
         if partition == 'high':
-            guest.partition = 'high_prio_machine.slice'
+            guest.partition = '/high_prio_machine'
         elif partition == 'low':
-            guest.partition = 'low_prio_machine.slice'
+            guest.partition = '/low_prio_machine'
         else:
             guest.partition = None
 
