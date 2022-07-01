@@ -29,10 +29,5 @@ depends_on = None
 
 
 def upgrade():
-    with op.batch_alter_table('compute_nodes', schema=None) as batch_op:
-        batch_op.add_column(sa.Column('priority', sa.Boolean(), nullable=True))
-        batch_op.add_column(sa.Column('high_vcpus_used', sa.Integer(), nullable=True))
-        batch_op.add_column(sa.Column('low_vcpus_used', sa.Integer(), nullable=True))
-
     with op.batch_alter_table('instances', schema=None) as batch_op:
         batch_op.add_column(sa.Column('priority', sa.String(length=255), nullable=True))

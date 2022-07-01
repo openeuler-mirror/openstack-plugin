@@ -1075,59 +1075,6 @@ def _numa_fit_instance_cell(
                       {'usage': ram_usage, 'limit': ram_limit})
             return None
 
-    if instance_cell.cpu_priority == fields.CPUPriorityPolicy.HIGH:
-        LOG.debug('Instance has requested high priority CPUs')
-        required_cpus = len(instance_cell.pcpuset) + cpuset_reserved
-        if required_cpus > host_cell.avail_pcpus:
-            LOG.debug('Not enough available CPUs to schedule instance. '
-                      'Oversubscription is not possible with high priority '
-                      'instances. Required: %(required)d (%(vcpus)d + '
-                      '%(num_cpu_reserved)d), actual: %(actual)d',
-                      {'required': required_cpus,
-                       'vcpus': len(instance_cell.pcpuset),
-                       'actual': host_cell.avail_pcpus,
-                       'num_cpu_reserved': cpuset_reserved})
-            return None
-        if instance_cell.memory > host_cell.avail_memory:
-            LOG.debug('Not enough available memory to schedule instance. '
-                      'Oversubscription is not possible with high priority '
-                      'instances. Required: %(required)s, available: '
-                      '%(available)s, total: %(total)s. ',
-                      {'required': instance_cell.memory,
-                       'available': host_cell.avail_memory,
-                       'total': host_cell.memory})
-            return None
-
-        # Try to pack the instance cell onto cores
-        instance_cell = _pack_instance_onto_cores(
-            host_cell, instance_cell, num_cpu_reserved=cpuset_reserved,
-        )
-        if not instance_cell:
-            LOG.debug('Failed to map instance cell CPUs to host cell CPUs')
-            return None
-
-    if instance_cell.cpu_priority == fields.CPUPriorityPolicy.LOW:
-        LOG.debug('Instance has requested low priority CPUs, considering '
-                  'limitations on usable CPU and memory.')
-        cpu_usage = host_cell.cpu_usage + len(host_cell.pinned_cpus)
-        cpu_limit = len(host_cell.cpuset) * limits.cpu_allocation_ratio - len(
-            host_cell.pcpuset)
-        if cpu_usage > cpu_limit:
-            LOG.debug('Host cell has limitations on low priority CPUs. There '
-                      'are not enough free CPUs to schedule this instance. '
-                      'Usage: %(usage)d, limit: %(limit)d',
-                      {'usage': cpu_usage, 'limit': cpu_limit})
-            return None
-
-        ram_usage = host_cell.memory_usage + instance_cell.memory
-        ram_limit = host_cell.memory * limits.ram_allocation_ratio
-        if ram_usage > ram_limit:
-            LOG.debug('Host cell has limitations on usable memory. There is '
-                      'not enough free memory to schedule this instance. '
-                      'Usage: %(usage)d, limit: %(limit)d',
-                      {'usage': ram_usage, 'limit': ram_limit})
-            return None
-
     instance_cell.id = host_cell.id
     return instance_cell
 
@@ -1546,20 +1493,8 @@ def _get_flavor_priority(
 
     return flavor_value
 
-def get_cpu_priority_constraint(
-    flavor: 'objects.Flavor',
-    priority: str,
-) -> ty.Optional[str]:
-    """Validate and return the requested CPU priority.
 
-    :param flavor: ``nova.objects.Flavor`` instance
-    :param priority: priority string
-    :raises: exception.HintsPriorityForbidden if priority is defined on both
-        api and flavor and these priorities conflict.
-    :raises: exception.InvalidCPUAllocationPriority if priority is defined with
-        invalid value in api or flavor.
-    :returns: The CPU priority requested.
-    """
+def get_final_priority(flavor, priority):
     flavor_priority = _get_flavor_priority(
         'cpu_priority', flavor)
 
@@ -1573,19 +1508,29 @@ def get_cpu_priority_constraint(
             source='scheduler hints',
             requested=priority,
             available=str(fields.CPUAllocationPriority.ALL))
+    final_priority = priority if priority else flavor_priority
+    return final_priority
 
-    if flavor_priority == fields.CPUAllocationPriority.HIGH:
-        cpu_priority = flavor_priority
-    elif flavor_priority == fields.CPUAllocationPriority.LOW:
-        if priority == fields.CPUAllocationPriority.HIGH:
-            raise exception.HintsPriorityForbidden()
-        cpu_priority = flavor_priority
-    elif priority:
-        cpu_priority = priority
-    else:
-        cpu_priority = None
 
-    return cpu_priority
+def _check_cpu_priority_constraint(final_priority, cpu_policy):
+    """Validate and return the requested CPU priority.
+
+    :param flavor: ``nova.objects.Flavor`` instance
+    :param priority: priority string
+    :param cpu_policy: cpu_policy string
+    :raises: exception.HintsPriorityForbidden if priority is defined on both
+        api and flavor and these priorities conflict.
+    :raises: exception.InvalidCPUAllocationPriority if priority is defined with
+        invalid value in api or flavor.
+    """
+    if final_priority == fields.CPUAllocationPriority.HIGH:
+        if not cpu_policy or cpu_policy != fields.CPUAllocationPolicy.DEDICATED:
+            msg = _('cpu policy must exist and be dedicated if priority is high')
+            raise exception.InvalidRequest(msg)
+    elif final_priority == fields.CPUAllocationPriority.LOW:
+        if cpu_policy and cpu_policy != fields.CPUAllocationPolicy.SHARED:
+            msg = _('cpu policy must be empty or shared if priority is low')
+            raise exception.InvalidRequest(msg)
 
 
 # NOTE(stephenfin): This must be public as it's used elsewhere
@@ -2063,12 +2008,12 @@ def get_secure_boot_constraint(
     return policy
 
 
-def numa_get_constraints(flavor, image_meta, priority):
+def numa_get_constraints(flavor, image_meta, final_priority=None):
     """Return topology related to input request.
 
     :param flavor: a flavor object to read extra specs from
     :param image_meta: nova.objects.ImageMeta object instance
-    :param priority: a priority string
+    :param final_priority: a priority string
 
     :raises: exception.InvalidNUMANodesNumber if the number of NUMA
              nodes is less than 1 or not an integer
@@ -2125,20 +2070,10 @@ def numa_get_constraints(flavor, image_meta, priority):
     realtime_cpus = get_realtime_cpu_constraint(flavor, image_meta)
     dedicated_cpus = get_dedicated_cpu_constraint(flavor)
     emu_threads_policy = get_emulator_thread_policy_constraint(flavor)
-    cpu_priority = get_cpu_priority_constraint(flavor, priority)
-
 
     # handle explicit VCPU/PCPU resource requests and the HW_CPU_HYPERTHREADING
     # trait
-
     requested_vcpus, requested_pcpus = _get_vcpu_pcpu_resources(flavor)
-
-    if cpu_priority:
-        if cpu_priority == fields.CPUAllocationPriority.HIGH:
-            cpu_policy = fields.CPUAllocationPolicy.DEDICATED
-        else:
-            cpu_policy = fields.CPUAllocationPolicy.SHARED
-
     if cpu_policy and (requested_vcpus or requested_pcpus):
         raise exception.InvalidRequest(
             "It is not possible to use the 'resources:VCPU' or "
@@ -2189,6 +2124,9 @@ def numa_get_constraints(flavor, image_meta, priority):
         cpu_thread_policy = fields.CPUThreadAllocationPolicy.REQUIRE
 
     # sanity checks
+
+    if final_priority:
+        _check_cpu_priority_constraint(final_priority, cpu_policy)
 
     if cpu_policy in (fields.CPUAllocationPolicy.SHARED, None):
         if cpu_thread_policy:
