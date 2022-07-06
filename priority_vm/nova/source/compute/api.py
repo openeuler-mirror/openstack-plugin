@@ -1085,7 +1085,9 @@ class API:
 
         image_meta = _get_image_meta_obj(boot_meta)
 
-        numa_topology = hardware.numa_get_constraints(flavor, image_meta, priority)
+        final_priority = hardware.get_final_priority(flavor, priority)
+
+        numa_topology = hardware.numa_get_constraints(flavor, image_meta, final_priority)
 
         system_metadata = {}
 
@@ -1159,7 +1161,7 @@ class API:
             'system_metadata': system_metadata,
             'port_resource_requests': port_resource_requests,
             'request_level_params': req_lvl_params,
-            'priority': priority,
+            'priority': final_priority,
         }
 
         options_from_image = self._inherit_properties_from_image(

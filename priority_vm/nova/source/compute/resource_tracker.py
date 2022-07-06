@@ -1287,7 +1287,7 @@ class ResourceTracker(object):
         if self.pci_tracker:
             self.pci_tracker.save(context)
 
-    def _update_usage(self, usage, instance, nodename, sign=1):
+    def _update_usage(self, usage, nodename, sign=1):
         # TODO(stephenfin): We don't use the CPU, RAM and disk fields for much
         # except 'Aggregate(Core|Ram|Disk)Filter', the 'os-hypervisors' API,
         # and perhaps some out-of-tree filters. Once the in-tree stuff is
@@ -1303,19 +1303,6 @@ class ResourceTracker(object):
         cn.local_gb_used += sign * usage.get('ephemeral_gb', 0)
         cn.local_gb_used += sign * usage.get('swap', 0) / 1024
         cn.vcpus_used += sign * vcpus_usage
-
-        priority = self._get_priority(instance)
-
-        if priority == 'high':
-            if not cn.high_vcpus_used:
-                cn.high_vcpus_used = sign * vcpus_usage
-            else:
-                cn.high_vcpus_used += sign * vcpus_usage
-        if priority == 'low':
-            if not cn.low_vcpus_used:
-                cn.low_vcpus_used = sign * vcpus_usage
-            else:
-                cn.low_vcpus_used += sign * vcpus_usage
 
         # free ram and disk may be negative, depending on policy:
         cn.free_ram_mb = cn.memory_mb - cn.memory_mb_used
@@ -1338,22 +1325,6 @@ class ResourceTracker(object):
             # ...and reserialize once we save it back
             cn.numa_topology = hardware.numa_usage_from_instance_numa(
                 host_numa_topology, instance_numa_topology, free)._to_json()
-
-    def _get_priority(self, instance):
-
-        priority_flavor_value = instance.flavor.get('extra_specs', {}).get('hw:cpu_priority', None)
-        priority_hints_value = instance.priority
-
-        if priority_flavor_value == 'high':
-            priority = priority_flavor_value
-        elif priority_flavor_value == 'low':
-            if priority_hints_value == 'high':
-                raise exception.HintsPriorityForbidden()
-            priority = priority_flavor_value
-        else:
-            priority = priority_hints_value
-
-        return priority
 
     def _get_migration_context_resource(self, resource, instance,
                                         prefix='new_'):
@@ -1547,7 +1518,7 @@ class ResourceTracker(object):
                                                          instance,
                                                          sign=sign)
             # new instance, update compute node resource usage:
-            self._update_usage(self._get_usage_dict(instance, instance), instance, 
+            self._update_usage(self._get_usage_dict(instance, instance),
                                nodename, sign=sign)
 
         # Stop tracking removed instances in the is_bfv cache. This needs to

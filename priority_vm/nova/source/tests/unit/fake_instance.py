@@ -78,8 +78,7 @@ def fake_db_instance(**updates):
                   'resources': None,
                  },
         'tags': [],
-        'services': [],
-        'priority': None
+        'services': []
         }
 
     for name, field in objects.Instance.fields.items():

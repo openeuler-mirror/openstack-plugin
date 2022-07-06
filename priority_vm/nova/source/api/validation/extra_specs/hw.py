@@ -154,8 +154,8 @@ cpu_policy_validators = [
             'cpu_dedicated_set cpus'
             'If ``low``, the cpu of instance will not be mapped and the '
             'number of low priority instance\'s cpus is equal to '
-            '(cpu_dedicated_set + cpu_shared_set) * cpu_allocation_ratio - '
-            'cpu_dedicated_set cpus'
+            '(cpu_dedicated_set + cpu_shared_set) if cpu_priority_mix_enable '
+            'option open, otherwise equal to cpu_shared_set.'
         ),
         value={
             'type': str,

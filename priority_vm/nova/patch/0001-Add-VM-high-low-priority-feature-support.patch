@@ -1,0 +1,466 @@
+From 93ed8230bc5690882a8c7e1ff0bbb7b0b173d520 Mon Sep 17 00:00:00 2001
+From: wangxiyuan <wangxiyuan1007@gmail.com>
+Date: Mon, 4 Jul 2022 02:36:33 +0000
+Subject: [PATCH] Add VM high/low priority feature support
+
+This patch added the new VM VM high/low priority feature support
+---
+ .../api/openstack/compute/schemas/servers.py  |  3 +
+ .../source/api/validation/extra_specs/hw.py   | 21 +++++++
+ nova/compute/api.py        | 24 +++++++-
+ nova/conf/compute.py       |  8 +++
+ .../d44517dc62a1_add_priority_mix_feature.py  | 33 ++++++++++
+ nova/db/main/models.py     |  4 ++
+ nova/exception.py          |  5 ++
+ nova/objects/fields.py     | 10 +++
+ nova/objects/instance.py   |  7 ++-
+ nova/virt/hardware.py      | 61 ++++++++++++++++++-
+ .../nova/source/virt/libvirt/config.py        |  6 ++
+ .../nova/source/virt/libvirt/driver.py        | 18 +++++-
+ 12 files changed, 191 insertions(+), 9 deletions(-)
+ create mode 100644 nova/db/main/migrations/versions/d44517dc62a1_add_priority_mix_feature.py
+
+diff --git a/nova/api/openstack/compute/schemas/servers.py b/priority_vm/nova/source/api/openstack/compute/schemas/servers.py
+index 300411d..8197e8b 100644
+--- a/nova/api/openstack/compute/schemas/servers.py
++++ b/nova/api/openstack/compute/schemas/servers.py
+@@ -138,6 +138,9 @@ _hints = {
+             'type': 'string',
+             'pattern': '^/[0-9a-f.:]+$'
+         },
++        'priority': {
++            'type': 'string', 'enum': ['high', 'low'],
++        },
+     },
+     # NOTE: As this Mail:
+     # http://lists.openstack.org/pipermail/openstack-dev/2015-June/067996.html
+diff --git a/nova/api/validation/extra_specs/hw.py b/priority_vm/nova/source/api/validation/extra_specs/hw.py
+index 4aaccf6..3a3aa75 100644
+--- a/nova/api/validation/extra_specs/hw.py
++++ b/nova/api/validation/extra_specs/hw.py
+@@ -145,6 +145,27 @@ cpu_policy_validators = [
+             'pattern': r'\^?\d+((-\d+)?(,\^?\d+(-\d+)?)?)*',
+         },
+     ),
++    base.ExtraSpecValidator(
++        name='hw:cpu_priority',
++        description=(
++            'The CPU priority policy of creating instance '
++            'If ``high``, the cpu of instance will be mapped to host and '
++            ' the number of high priority instance\'s cpus is equal to '
++            'cpu_dedicated_set cpus'
++            'If ``low``, the cpu of instance will not be mapped and the '
++            'number of low priority instance\'s cpus is equal to '
++            '(cpu_dedicated_set + cpu_shared_set) if cpu_priority_mix_enable '
++            'option open, otherwise equal to cpu_shared_set.'
++        ),
++        value={
++            'type': str,
++            'description': 'The CPU priority policy',
++            'enum': [
++                'low',
++                'high',
++            ],
++        },
++    ),
+ ]
+ 
+ hugepage_validators = [
+diff --git a/nova/compute/api.py b/priority_vm/nova/source/compute/api.py
+index 43a0f66..77974f3 100644
+--- a/nova/compute/api.py
++++ b/nova/compute/api.py
+@@ -1036,7 +1036,7 @@ class API:
+                     self._check_vnic_remote_managed_min_version(context)
+ 
+     def _validate_and_build_base_options(
+-        self, context, flavor, boot_meta, image_href, image_id, kernel_id,
++        self, context, flavor, priority, boot_meta, image_href, image_id, kernel_id,
+         ramdisk_id, display_name, display_description, hostname, key_name,
+         key_data, security_groups, availability_zone, user_data, metadata,
+         access_ip_v4, access_ip_v6, requested_networks, config_drive,
+@@ -1084,7 +1084,10 @@ class API:
+                     boot_meta.get('properties', {})))
+ 
+         image_meta = _get_image_meta_obj(boot_meta)
+-        numa_topology = hardware.numa_get_constraints(flavor, image_meta)
++
++        final_priority = hardware.get_final_priority(flavor, priority)
++
++        numa_topology = hardware.numa_get_constraints(flavor, image_meta, final_priority)
+ 
+         system_metadata = {}
+ 
+@@ -1158,6 +1161,7 @@ class API:
+             'system_metadata': system_metadata,
+             'port_resource_requests': port_resource_requests,
+             'request_level_params': req_lvl_params,
++            'priority': final_priority,
+         }
+ 
+         options_from_image = self._inherit_properties_from_image(
+@@ -1579,6 +1583,18 @@ class API:
+ 
+         return objects.InstanceGroup.get_by_uuid(context, group_hint)
+ 
++    def _get_requested_priority(self, filter_properties):
++        if (not filter_properties or
++                not filter_properties.get('scheduler_hints')):
++            return
++
++        priority = filter_properties.get('scheduler_hints').get('priority')
++        if not priority:
++            return
++
++        return priority
++
++
+     def _create_instance(self, context, flavor,
+                image_href, kernel_id, ramdisk_id,
+                min_count, max_count,
+@@ -1626,11 +1642,13 @@ class API:
+         self._check_auto_disk_config(image=boot_meta,
+                                      auto_disk_config=auto_disk_config)
+ 
++        priority = self._get_requested_priority(filter_properties)
++
+         (
+             base_options, max_net_count, key_pair, security_groups,
+             network_metadata,
+         ) = self._validate_and_build_base_options(
+-            context, flavor, boot_meta, image_href, image_id,
++            context, flavor, priority, boot_meta, image_href, image_id,
+             kernel_id, ramdisk_id, display_name, display_description,
+             hostname, key_name, key_data, security_groups, availability_zone,
+             user_data, metadata, access_ip_v4, access_ip_v6,
+diff --git a/nova/conf/compute.py b/priority_vm/nova/source/conf/compute.py
+index 263d777..493e555 100644
+--- a/nova/conf/compute.py
++++ b/nova/conf/compute.py
+@@ -1024,6 +1024,14 @@ Possible values:
+ * ``True``: Packing VM's NUMA cell on most used host NUMA cell.
+ * ``False``: Spreading VM's NUMA cell on host's NUMA cells with more resources
+   available.
++"""),
++    cfg.BoolOpt('cpu_priority_mix_enable',
++        default=False,
++        help="""
++Whether allow low priority VM use dedicated cpu set.
++
++If enabled, The low priority VM can bind cpu both on dedicated and shared cpu
++set.
+ """),
+ ]
+ 
+diff --git a/nova/db/main/migrations/versions/d44517dc62a1_add_priority_mix_feature.py b/priority_vm/nova/source/db/main/migrations/versions/d44517dc62a1_add_priority_mix_feature.py
+new file mode 100644
+index 0000000..33fada9
+--- /dev/null
++++ b/nova/db/main/migrations/versions/d44517dc62a1_add_priority_mix_feature.py
+@@ -0,0 +1,33 @@
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""add priority mix feature
++
++Revision ID: d44517dc62a1
++Revises: 16f1fbcab42b
++Create Date: 2022-05-31 07:27:31.234643
++"""
++
++from alembic import op
++import sqlalchemy as sa
++
++
++# revision identifiers, used by Alembic.
++revision = 'd44517dc62a1'
++down_revision = '16f1fbcab42b'
++branch_labels = None
++depends_on = None
++
++
++def upgrade():
++    with op.batch_alter_table('instances', schema=None) as batch_op:
++        batch_op.add_column(sa.Column('priority', sa.String(length=255), nullable=True))
+diff --git a/nova/db/main/models.py b/priority_vm/nova/source/db/main/models.py
+index f2f58b2..eb5579e 100644
+--- a/nova/db/main/models.py
++++ b/nova/db/main/models.py
+@@ -420,6 +420,10 @@ class Instance(BASE, NovaBase, models.SoftDeleteMixin):
+ 
+     hidden = sa.Column(sa.Boolean, default=False)
+ 
++    # Identifies the high or low priority of the Instance.
++    # If this property is not set, the current instance is a common instance.
++    priority = sa.Column(sa.String(255))
++
+ 
+ class InstanceInfoCache(BASE, NovaBase, models.SoftDeleteMixin):
+     """Represents a cache of information about an instance
+diff --git a/nova/exception.py b/priority_vm/nova/source/exception.py
+index 4588898..0a09c34 100644
+--- a/nova/exception.py
++++ b/nova/exception.py
+@@ -2116,6 +2116,11 @@ class InvalidCPUAllocationPolicy(Invalid):
+                 "given: '%(requested)s', available: '%(available)s'.")
+ 
+ 
++class InvalidCPUAllocationPriority(Invalid):
++    msg_fmt = _("CPU priority requested from '%(source)s' is invalid, "
++                "given: '%(requested)s', available: '%(available)s'.")
++
++
+ class InvalidCPUThreadAllocationPolicy(Invalid):
+     msg_fmt = _("CPU thread policy requested from '%(source)s' is invalid, "
+                 "given: '%(requested)s', available: '%(available)s'.")
+diff --git a/nova/objects/fields.py b/priority_vm/nova/source/objects/fields.py
+index d8cb10f..e4a4787 100644
+--- a/nova/objects/fields.py
++++ b/nova/objects/fields.py
+@@ -275,6 +275,13 @@ class CPUAllocationPolicy(BaseNovaEnum):
+ 
+     ALL = (DEDICATED, SHARED, MIXED)
+ 
++class CPUAllocationPriority(BaseNovaEnum):
++
++    HIGH = "high"
++    LOW = "low"
++
++    ALL = (HIGH, LOW)
++
+ 
+ class CPUThreadAllocationPolicy(BaseNovaEnum):
+ 
+@@ -1204,6 +1211,9 @@ class ConfigDrivePolicyField(BaseEnumField):
+ class CPUAllocationPolicyField(BaseEnumField):
+     AUTO_TYPE = CPUAllocationPolicy()
+ 
++class CPUAllocationPriorityField(BaseEnumField):
++    AUTO_TYPE = CPUAllocationPriority()
++
+ 
+ class CPUThreadAllocationPolicyField(BaseEnumField):
+     AUTO_TYPE = CPUThreadAllocationPolicy()
+diff --git a/nova/objects/instance.py b/priority_vm/nova/source/objects/instance.py
+index e99762d..dedd7e2 100644
+--- a/nova/objects/instance.py
++++ b/nova/objects/instance.py
+@@ -114,7 +114,8 @@ class Instance(base.NovaPersistentObject, base.NovaObject,
+     # Version 2.5: Added hard_delete kwarg in destroy
+     # Version 2.6: Added hidden
+     # Version 2.7: Added resources
+-    VERSION = '2.7'
++    # Version 2.8: Added priority
++    VERSION = '2.8'
+ 
+     fields = {
+         'id': fields.IntegerField(),
+@@ -223,6 +224,8 @@ class Instance(base.NovaPersistentObject, base.NovaObject,
+         'trusted_certs': fields.ObjectField('TrustedCerts', nullable=True),
+         'hidden': fields.BooleanField(default=False),
+         'resources': fields.ObjectField('ResourceList', nullable=True),
++
++        'priority': fields.StringField(nullable=True),
+         }
+ 
+     obj_extra_fields = ['name']
+@@ -230,6 +233,8 @@ class Instance(base.NovaPersistentObject, base.NovaObject,
+     def obj_make_compatible(self, primitive, target_version):
+         super(Instance, self).obj_make_compatible(primitive, target_version)
+         target_version = versionutils.convert_version_to_tuple(target_version)
++        if target_version < (2, 8) and 'priority' in primitive:
++            del primitive['priority']
+         if target_version < (2, 7) and 'resources' in primitive:
+             del primitive['resources']
+         if target_version < (2, 6) and 'hidden' in primitive:
+diff --git a/nova/virt/hardware.py b/priority_vm/nova/source/virt/hardware.py
+index c4ebae1..94c25d4 100644
+--- a/nova/virt/hardware.py
++++ b/nova/virt/hardware.py
+@@ -1480,6 +1480,59 @@ def get_cpu_policy_constraint(
+     return cpu_policy
+ 
+ 
++def _get_flavor_priority(
++    key: str,
++    flavor: 'objects.Flavor',
++    default: ty.Any = None,
++    prefix: str = 'hw',
++) -> ty.Any:
++    """Extract both flavor- and image-based variants of metadata."""
++    flavor_key = ':'.join([prefix, key])
++
++    flavor_value = flavor.get('extra_specs', {}).get(flavor_key, None)
++
++    return flavor_value
++
++
++def get_final_priority(flavor, priority):
++    flavor_priority = _get_flavor_priority(
++        'cpu_priority', flavor)
++
++    if flavor_priority and (flavor_priority not in fields.CPUAllocationPriority.ALL):
++        raise exception.InvalidCPUAllocationPriority(
++            source='flavor extra specs',
++            requested=flavor_priority,
++            available=str(fields.CPUAllocationPriority.ALL))
++    if priority and (priority not in fields.CPUAllocationPriority.ALL):
++        raise exception.InvalidCPUAllocationPriority(
++            source='scheduler hints',
++            requested=priority,
++            available=str(fields.CPUAllocationPriority.ALL))
++    final_priority = priority if priority else flavor_priority
++    return final_priority
++
++
++def _check_cpu_priority_constraint(final_priority, cpu_policy):
++    """Validate and return the requested CPU priority.
++
++    :param flavor: ``nova.objects.Flavor`` instance
++    :param priority: priority string
++    :param cpu_policy: cpu_policy string
++    :raises: exception.HintsPriorityForbidden if priority is defined on both
++        api and flavor and these priorities conflict.
++    :raises: exception.InvalidCPUAllocationPriority if priority is defined with
++        invalid value in api or flavor.
++    """
++    if final_priority == fields.CPUAllocationPriority.HIGH:
++        if not cpu_policy or cpu_policy != fields.CPUAllocationPolicy.DEDICATED:
++            msg = _('cpu policy must exist and be dedicated if priority is high')
++            raise exception.InvalidRequest(msg)
++    elif final_priority == fields.CPUAllocationPriority.LOW:
++        if cpu_policy and cpu_policy != fields.CPUAllocationPolicy.SHARED:
++            msg = _('cpu policy must be empty or shared if priority is low')
++            raise exception.InvalidRequest(msg)
++
++
+ # NOTE(stephenfin): This must be public as it's used elsewhere
+ def get_cpu_thread_policy_constraint(
+     flavor: 'objects.Flavor',
+@@ -1955,11 +2008,12 @@ def get_secure_boot_constraint(
+     return policy
+ 
+ 
+-def numa_get_constraints(flavor, image_meta):
++def numa_get_constraints(flavor, image_meta, final_priority=None):
+     """Return topology related to input request.
+ 
+     :param flavor: a flavor object to read extra specs from
+     :param image_meta: nova.objects.ImageMeta object instance
++    :param final_priority: a priority string
+ 
+     :raises: exception.InvalidNUMANodesNumber if the number of NUMA
+              nodes is less than 1 or not an integer
+@@ -2019,9 +2073,7 @@ def numa_get_constraints(flavor, image_meta):
+ 
+     # handle explicit VCPU/PCPU resource requests and the HW_CPU_HYPERTHREADING
+     # trait
+-
+     requested_vcpus, requested_pcpus = _get_vcpu_pcpu_resources(flavor)
+-
+     if cpu_policy and (requested_vcpus or requested_pcpus):
+         raise exception.InvalidRequest(
+             "It is not possible to use the 'resources:VCPU' or "
+@@ -2073,6 +2125,9 @@ def numa_get_constraints(flavor, image_meta):
+ 
+     # sanity checks
+ 
++    if final_priority:
++        _check_cpu_priority_constraint(final_priority, cpu_policy)
++
+     if cpu_policy in (fields.CPUAllocationPolicy.SHARED, None):
+         if cpu_thread_policy:
+             raise exception.CPUThreadPolicyConfigurationInvalid()
+diff --git a/nova/virt/libvirt/config.py b/priority_vm/nova/source/virt/libvirt/config.py
+index 1a81be3..6967df6 100644
+--- a/nova/virt/libvirt/config.py
++++ b/nova/virt/libvirt/config.py
+@@ -2831,6 +2831,7 @@ class LibvirtConfigGuest(LibvirtConfigObject):
+         self.idmaps = []
+         self.perf_events = []
+         self.launch_security = None
++        self.partition = None
+ 
+     def _format_basic_props(self, root):
+         root.append(self._text_node("uuid", self.uuid))
+@@ -2859,6 +2860,11 @@ class LibvirtConfigGuest(LibvirtConfigObject):
+                 metadata.append(m.format_dom())
+             root.append(metadata)
+ 
++        if self.partition is not None:
++            resource = etree.Element("resource")
++            resource.append(self._text_node("partition", self.partition))
++            root.append(resource)
++
+     def _format_os(self, root):
+         os = etree.Element("os")
+ 
+diff --git a/nova/virt/libvirt/driver.py b/priority_vm/nova/source/virt/libvirt/driver.py
+index 94e7b19..f9c6b8b 100644
+--- a/nova/virt/libvirt/driver.py
++++ b/nova/virt/libvirt/driver.py
+@@ -5821,7 +5821,7 @@ class LibvirtDriver(driver.ComputeDriver):
+         return emulatorpin_cpuset
+ 
+     def _get_guest_numa_config(self, instance_numa_topology, flavor,
+-                               image_meta):
++                               image_meta, priority):
+         """Returns the config objects for the guest NUMA specs.
+ 
+         Determines the CPUs that the guest can be pinned to if the guest
+@@ -5862,6 +5862,10 @@ class LibvirtDriver(driver.ComputeDriver):
+         shared_cpus = None
+         if CONF.vcpu_pin_set or CONF.compute.cpu_shared_set:
+             shared_cpus = self._get_vcpu_available()
++        if CONF.compute.cpu_priority_mix_enable:
++            if shared_cpus and priority == 'low' and CONF.compute.cpu_dedicated_set:
++                dedicated_cpus = self._get_pcpu_available()
++                shared_cpus |= dedicated_cpus
+ 
+         topology = self._get_host_numa_topology()
+ 
+@@ -6853,7 +6857,7 @@ class LibvirtDriver(driver.ComputeDriver):
+         guest.vcpus = flavor.vcpus
+ 
+         guest_numa_config = self._get_guest_numa_config(
+-            instance.numa_topology, flavor, image_meta)
++            instance.numa_topology, flavor, image_meta, instance.priority)
+ 
+         guest.cpuset = guest_numa_config.cpuset
+         guest.cputune = guest_numa_config.cputune
+@@ -6975,6 +6979,8 @@ class LibvirtDriver(driver.ComputeDriver):
+         if vpmems:
+             self._guest_add_vpmems(guest, vpmems)
+ 
++        self._guest_add_partition(guest, instance)
++
+         return guest
+ 
+     def _get_ordered_vpmems(self, instance, flavor):
+@@ -7134,6 +7140,14 @@ class LibvirtDriver(driver.ComputeDriver):
+             else:
+                 raise exception.InvalidWatchdogAction(action=watchdog_action)
+ 
++    def _guest_add_partition(self, guest, instance):
++        if instance.priority == 'high':
++            guest.partition = '/high_prio_machine'
++        elif instance.priority == 'low':
++            guest.partition = '/low_prio_machine'
++        else:
++            guest.partition = None
++
+     def _guest_add_pci_devices(self, guest, instance):
+         if CONF.libvirt.virt_type in ('qemu', 'kvm'):
+             # Get all generic PCI devices (non-SR-IOV).
+-- 
+2.33.0
+

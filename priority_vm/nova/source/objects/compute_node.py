@@ -52,8 +52,7 @@ class ComputeNode(base.NovaPersistentObject, base.NovaObject):
     # Version 1.17: Added mapped
     # Version 1.18: Added get_by_uuid().
     # Version 1.19: Added get_by_nodename().
-    # Version 1.20：Added priority, high_vcpus_used and low_vcpus_used
-    VERSION = '1.20'
+    VERSION = '1.19'
 
     fields = {
         'id': fields.IntegerField(read_only=True),
@@ -64,9 +63,6 @@ class ComputeNode(base.NovaPersistentObject, base.NovaObject):
         'memory_mb': fields.IntegerField(),
         'local_gb': fields.IntegerField(),
         'vcpus_used': fields.IntegerField(),
-        'priority': fields.BooleanField(default=False),
-        'high_vcpus_used': fields.IntegerField(nullable=True),
-        'low_vcpus_used': fields.IntegerField(nullable=True),
         'memory_mb_used': fields.IntegerField(),
         'local_gb_used': fields.IntegerField(),
         'hypervisor_type': fields.StringField(),
@@ -103,13 +99,6 @@ class ComputeNode(base.NovaPersistentObject, base.NovaObject):
     def obj_make_compatible(self, primitive, target_version):
         super(ComputeNode, self).obj_make_compatible(primitive, target_version)
         target_version = versionutils.convert_version_to_tuple(target_version)
-        if target_version < (1, 20):
-            if 'priority' in primitive:
-                del primitive['priority']
-            if 'high_vcpus_used' in primitive:
-                del primitive['high_vcpus_used']
-            if 'low_vcpus_used' in primitive:
-                del primitive['low_vcpus_used']
         if target_version < (1, 17):
             if 'mapped' in primitive:
                 del primitive['mapped']
@@ -226,8 +215,6 @@ class ComputeNode(base.NovaPersistentObject, base.NovaObject):
                 online_updates[key] = value
             elif key == 'mapped':
                 value = 0 if value is None else value
-            elif key == 'priority':
-                value = False if value is None else value
 
             setattr(compute, key, value)
 
@@ -392,7 +379,7 @@ class ComputeNode(base.NovaPersistentObject, base.NovaObject):
         # do not exactly match.
         # TODO(pmurray): the resources dict should be formalized.
         keys = ["vcpus", "memory_mb", "local_gb", "cpu_info",
-                "vcpus_used", "priority", "high_vcpus_used", "low_vcpus_used", "memory_mb_used", "local_gb_used",
+                "vcpus_used", "memory_mb_used", "local_gb_used",
                 "numa_topology", "hypervisor_type",
                 "hypervisor_version", "hypervisor_hostname",
                 "disk_available_least", "host_ip", "uuid"]

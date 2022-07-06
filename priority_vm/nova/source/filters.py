@@ -20,7 +20,6 @@ Filter support
 from oslo_log import log as logging
 
 from nova import loadables
-from nova.objects import fields
 
 LOG = logging.getLogger(__name__)
 
@@ -59,23 +58,6 @@ class BaseFilter(object):
         else:
             return True
 
-    run_filter_for_cpu_priority_request = True
-
-    def run_filter_for_cpu_priority(self, spec_obj):
-        if self.run_filter_for_cpu_priority_request:
-            return True
-        else:
-            flavor_priority = spec_obj.flavor.extra_specs.get(
-                'hw:cpu_priority')
-            hint_priority = spec_obj.get_scheduler_hint('priority')
-            if (flavor_priority in fields.CPUPriorityPolicy.ALL
-                    or hint_priority in fields.CPUPriorityPolicy.ALL):
-                LOG.debug("%s won't run on CPU priority policy required",
-                          self.__class__.__name__)
-                return False
-            else:
-                return True
-
 
 class BaseFilterHandler(loadables.BaseLoader):
     """Base class to handle loading filter classes.
@@ -97,8 +79,6 @@ class BaseFilterHandler(loadables.BaseLoader):
         full_filter_results = []
         log_msg = "%(cls_name)s: (start: %(start)s, end: %(end)s)"
         for filter_ in filters:
-            if not filter_.run_filter_for_cpu_priority(spec_obj):
-                continue
             if filter_.run_filter_for_index(index):
                 cls_name = filter_.__class__.__name__
                 start_count = len(list_objs)

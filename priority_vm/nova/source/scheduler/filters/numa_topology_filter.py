@@ -29,8 +29,6 @@ class NUMATopologyFilter(filters.BaseHostFilter):
     # request and therefore do not need to run this filter on rebuild.
     RUN_ON_REBUILD = False
 
-    run_filter_for_cpu_priority_request = False
-
     def _satisfies_cpu_policy(self, host_state, extra_specs, image_props):
         """Check that the host_state provided satisfies any available
         CPU policy requirements.

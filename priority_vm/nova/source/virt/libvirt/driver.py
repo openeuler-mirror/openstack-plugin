@@ -5862,10 +5862,10 @@ class LibvirtDriver(driver.ComputeDriver):
         shared_cpus = None
         if CONF.vcpu_pin_set or CONF.compute.cpu_shared_set:
             shared_cpus = self._get_vcpu_available()
-
-        if shared_cpus and priority == 'low' and CONF.compute.cpu_dedicated_set:
-            dedicated_cpus = self._get_pcpu_available()
-            shared_cpus |= dedicated_cpus
+        if CONF.compute.cpu_priority_mix_enable:
+            if shared_cpus and priority == 'low' and CONF.compute.cpu_dedicated_set:
+                dedicated_cpus = self._get_pcpu_available()
+                shared_cpus |= dedicated_cpus
 
         topology = self._get_host_numa_topology()
 
@@ -6856,10 +6856,8 @@ class LibvirtDriver(driver.ComputeDriver):
         guest.memory = flavor.memory_mb * units.Ki
         guest.vcpus = flavor.vcpus
 
-        priority = self._get_priority(instance)
-
         guest_numa_config = self._get_guest_numa_config(
-            instance.numa_topology, flavor, image_meta, priority)
+            instance.numa_topology, flavor, image_meta, instance.priority)
 
         guest.cpuset = guest_numa_config.cpuset
         guest.cputune = guest_numa_config.cputune
@@ -6984,22 +6982,6 @@ class LibvirtDriver(driver.ComputeDriver):
         self._guest_add_partition(guest, instance)
 
         return guest
-
-    def _get_priority(self, instance):
-
-        priority_flavor_value = instance.flavor.get('extra_specs', {}).get('hw:cpu_priority', None)
-        priority_hints_value = instance.priority
-
-        if priority_flavor_value == 'high':
-            priority = priority_flavor_value
-        elif priority_flavor_value == 'low':
-            if priority_hints_value == 'high':
-                raise exception.HintsPriorityForbidden()
-            priority = priority_flavor_value
-        else:
-            priority = priority_hints_value
-
-        return priority
 
     def _get_ordered_vpmems(self, instance, flavor):
         resources = self._get_resources(instance)
@@ -7159,29 +7141,12 @@ class LibvirtDriver(driver.ComputeDriver):
                 raise exception.InvalidWatchdogAction(action=watchdog_action)
 
     def _guest_add_partition(self, guest, instance):
-        partition = self._get_partition(instance)
-
-        if partition == 'high':
+        if instance.priority == 'high':
             guest.partition = '/high_prio_machine'
-        elif partition == 'low':
+        elif instance.priority == 'low':
             guest.partition = '/low_prio_machine'
         else:
             guest.partition = None
-
-    def _get_partition(self, instance):
-        priority_flavor_value = instance.flavor.get('extra_specs', {}).get('hw:cpu_priority', None)
-        priority_hints_value = instance.priority
-
-        if priority_flavor_value == 'high':
-            partition = priority_flavor_value
-        elif priority_flavor_value == 'low':
-            if priority_hints_value == 'high':
-                raise exception.HintsPriorityForbidden()
-            partition = priority_flavor_value
-        else:
-            partition = priority_hints_value
-
-        return partition
 
     def _guest_add_pci_devices(self, guest, instance):
         if CONF.libvirt.virt_type in ('qemu', 'kvm'):
@@ -9291,7 +9256,6 @@ class LibvirtDriver(driver.ComputeDriver):
         # See: https://bugzilla.redhat.com/show_bug.cgi?id=1000116
         # See: https://bugs.launchpad.net/nova/+bug/1215593
         data["supported_instances"] = self._get_instance_capabilities()
-        data["priority"] = CONF.cpu_priority_mix_enable
 
         data["vcpus"] = len(self._get_vcpu_available())
         data["memory_mb"] = self._host.get_memory_mb_total()
