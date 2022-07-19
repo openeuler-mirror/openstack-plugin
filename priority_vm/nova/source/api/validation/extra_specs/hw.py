@@ -148,14 +148,13 @@ cpu_policy_validators = [
     base.ExtraSpecValidator(
         name='hw:cpu_priority',
         description=(
-            'The CPU priority policy of creating instance '
-            'If ``high``, the cpu of instance will be mapped to host and '
-            ' the number of high priority instance\'s cpus is equal to '
-            'cpu_dedicated_set cpus'
-            'If ``low``, the cpu of instance will not be mapped and the '
-            'number of low priority instance\'s cpus is equal to '
-            '(cpu_dedicated_set + cpu_shared_set) if cpu_priority_mix_enable '
-            'option open, otherwise equal to cpu_shared_set.'
+            'The CPU priority policy of creating instance. '
+            'If ``high``, the cpu of instance will be bound to the host cpu '
+            ' which provided by cpu_dedicated_set config option.'
+            'If ``low``, the cpu of instance will be bound to the the cpu    '
+            'which provided by (cpu_dedicated_set + cpu_shared_set) if '
+            'cpu_priority_mix_enable option is set, otherwise the cpu range '
+            'equals to cpu_shared_set config option only.'
         ),
         value={
             'type': str,

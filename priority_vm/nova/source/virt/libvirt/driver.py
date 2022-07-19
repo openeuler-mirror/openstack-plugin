@@ -5831,7 +5831,7 @@ class LibvirtDriver(driver.ComputeDriver):
         return emulatorpin_cpuset
 
     def _get_guest_numa_config(self, instance_numa_topology, flavor,
-                               image_meta, priority):
+                               image_meta, priority=None):
         """Returns the config objects for the guest NUMA specs.
 
         Determines the CPUs that the guest can be pinned to if the guest
