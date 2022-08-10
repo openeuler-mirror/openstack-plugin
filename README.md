@@ -4,11 +4,16 @@
 
 ## 目录结构
 
-顶层目录为`特性名称`，每个特性目录包含两个子目录`source`和`patch`， source是openstack代码，基线是上游社区指定版本，由于gitee的git仓库容量有限，移除了git历史。`patch`是该特性的git patch文件，用来制作RPM包。
+顶层目录为`项目名称`，每个目录包含两个子目录`source`和`patch`， source是openstack代码，基线是上游社区指定版本，由于gitee的git仓库容量有限，移除了git历史。`patch`是该特性的git patch文件，用来制作RPM包。
 
-## 特性说明
+## 说明
 
-### OpenStack Yoga
+### 项目基线
+
+- Nova: 25.0.0
+- OpenStack-helm: 24e98899d2066a72abaa08e1fb082e335311db2b
+
+### 特性 
 
 - 虚拟机高低优先级
     nova为[25.0.0](https://opendev.org/openstack/nova/src/tag/25.0.0)、placement为[7.0.0](https://opendev.org/openstack/placement/src/tag/7.0.0)，特性spec请阅读相关[文档](https://gitee.com/openeuler/openstack/blob/master/docs/spec/priority_vm.md)
