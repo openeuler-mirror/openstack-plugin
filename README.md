@@ -11,7 +11,8 @@
 ### 项目基线
 
 - Nova: 25.0.0
-- OpenStack-helm: 24e98899d2066a72abaa08e1fb082e335311db2b
+- OpenStack-helm: ced30abead0bddb528d0c5fb7c1627dd8f1e22ba
+- OpenStack-helm-infra: ff70971009d29a37619e8e82080663a9ab76d57b
 
 ### 特性 
 
