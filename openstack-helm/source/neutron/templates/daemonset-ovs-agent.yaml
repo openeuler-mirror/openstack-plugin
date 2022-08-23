@@ -116,8 +116,8 @@ spec:
                   name: {{ $configMapName }}
                   key: update_dpdk_bond_config
           {{- end }}
-          command:
-            - /tmp/neutron-openvswitch-agent-init.sh
+          command: ["/bin/sh","-c"]
+          args: ["chmod -R 777 /tmp/pod-shared; ls -l /tmp/pod-shared; /tmp/neutron-openvswitch-agent-init.sh"]
           volumeMounts:
             - name: pod-tmp
               mountPath: /tmp

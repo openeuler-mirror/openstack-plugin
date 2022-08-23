@@ -1,0 +1,122 @@
+From 28bf46a43f9c34a46f2800f9ac6d99094b872639 Mon Sep 17 00:00:00 2001
+From: Yinuo Deng <i@dyn.im>
+Date: Mon, 22 Aug 2022 17:55:37 +0800
+Subject: [PATCH] openEuler support for OpenStack-Helm codebase
+
+---
+ .../neutron/templates/bin/_neutron-dhcp-agent-init.sh.tpl     | 2 +-
+ .../neutron/templates/bin/_neutron-l3-agent-init.sh.tpl       | 2 +-
+ .../templates/bin/_neutron-linuxbridge-agent-init.sh.tpl      | 2 +-
+ .../neutron/templates/bin/_neutron-metadata-agent-init.sh.tpl | 2 +-
+ .../templates/bin/_neutron-openvswitch-agent-init.sh.tpl      | 2 +-
+ .../neutron/templates/bin/_neutron-sriov-agent-init.sh.tpl    | 2 +-
+ .../source/neutron/templates/daemonset-ovs-agent.yaml         | 4 ++--
+ .../source/nova/templates/bin/_nova-compute-init.sh.tpl       | 4 +++-
+ 8 files changed, 11 insertions(+), 9 deletions(-)
+
+diff --git a/openstack-helm/source/neutron/templates/bin/_neutron-dhcp-agent-init.sh.tpl b/openstack-helm/source/neutron/templates/bin/_neutron-dhcp-agent-init.sh.tpl
+index 3df3315..7a286f1 100644
+--- a/openstack-helm/source/neutron/templates/bin/_neutron-dhcp-agent-init.sh.tpl
++++ b/openstack-helm/source/neutron/templates/bin/_neutron-dhcp-agent-init.sh.tpl
+@@ -20,6 +20,6 @@ set -ex
+ mkdir -p /tmp/pod-shared
+ tee > /tmp/pod-shared/neutron-agent.ini << EOF
+ [DEFAULT]
+-host = $(hostname --fqdn)
++host = $(hostname)
+ EOF
+ {{- end }}
+diff --git a/openstack-helm/source/neutron/templates/bin/_neutron-l3-agent-init.sh.tpl b/openstack-helm/source/neutron/templates/bin/_neutron-l3-agent-init.sh.tpl
+index b9b93b2..4282bb2 100644
+--- a/openstack-helm/source/neutron/templates/bin/_neutron-l3-agent-init.sh.tpl
++++ b/openstack-helm/source/neutron/templates/bin/_neutron-l3-agent-init.sh.tpl
+@@ -20,6 +20,6 @@ set -ex
+ mkdir -p /tmp/pod-shared
+ tee > /tmp/pod-shared/neutron-agent.ini << EOF
+ [DEFAULT]
+-host = $(hostname --fqdn)
++host = $(hostname)
+ EOF
+ {{- end }}
+diff --git a/openstack-helm/source/neutron/templates/bin/_neutron-linuxbridge-agent-init.sh.tpl b/openstack-helm/source/neutron/templates/bin/_neutron-linuxbridge-agent-init.sh.tpl
+index ed95189..26bef05 100644
+--- a/openstack-helm/source/neutron/templates/bin/_neutron-linuxbridge-agent-init.sh.tpl
++++ b/openstack-helm/source/neutron/templates/bin/_neutron-linuxbridge-agent-init.sh.tpl
+@@ -61,6 +61,6 @@ EOF
+ mkdir -p /tmp/pod-shared
+ tee > /tmp/pod-shared/neutron-agent.ini << EOF
+ [DEFAULT]
+-host = $(hostname --fqdn)
++host = $(hostname)
+ EOF
+ {{- end }}
+diff --git a/openstack-helm/source/neutron/templates/bin/_neutron-metadata-agent-init.sh.tpl b/openstack-helm/source/neutron/templates/bin/_neutron-metadata-agent-init.sh.tpl
+index 5b6ce43..91f0e8b 100644
+--- a/openstack-helm/source/neutron/templates/bin/_neutron-metadata-agent-init.sh.tpl
++++ b/openstack-helm/source/neutron/templates/bin/_neutron-metadata-agent-init.sh.tpl
+@@ -22,6 +22,6 @@ chown ${NEUTRON_USER_UID} /var/lib/neutron/openstack-helm
+ mkdir -p /tmp/pod-shared
+ tee > /tmp/pod-shared/neutron-agent.ini << EOF
+ [DEFAULT]
+-host = $(hostname --fqdn)
++host = $(hostname)
+ EOF
+ {{- end }}
+diff --git a/openstack-helm/source/neutron/templates/bin/_neutron-openvswitch-agent-init.sh.tpl b/openstack-helm/source/neutron/templates/bin/_neutron-openvswitch-agent-init.sh.tpl
+index 3283e09..8bb540b 100644
+--- a/openstack-helm/source/neutron/templates/bin/_neutron-openvswitch-agent-init.sh.tpl
++++ b/openstack-helm/source/neutron/templates/bin/_neutron-openvswitch-agent-init.sh.tpl
+@@ -491,6 +491,6 @@ fi
+ mkdir -p /tmp/pod-shared
+ tee > /tmp/pod-shared/neutron-agent.ini << EOF
+ [DEFAULT]
+-host = $(hostname --fqdn)
++host = $(hostname)
+ EOF
+ {{- end }}
+diff --git a/openstack-helm/source/neutron/templates/bin/_neutron-sriov-agent-init.sh.tpl b/openstack-helm/source/neutron/templates/bin/_neutron-sriov-agent-init.sh.tpl
+index d98cfe8..5ced238 100644
+--- a/openstack-helm/source/neutron/templates/bin/_neutron-sriov-agent-init.sh.tpl
++++ b/openstack-helm/source/neutron/templates/bin/_neutron-sriov-agent-init.sh.tpl
+@@ -99,7 +99,7 @@ ethtool --set-priv-flags ${NIC_FIRST_PORT} vf-true-promisc-support ${promisc_mod
+ mkdir -p /tmp/pod-shared
+ tee > /tmp/pod-shared/neutron-agent.ini << EOF
+ [DEFAULT]
+-host = $(hostname --fqdn)
++host = $(hostname)
+ EOF
+ {{- end }}
+ 
+diff --git a/openstack-helm/source/neutron/templates/daemonset-ovs-agent.yaml b/openstack-helm/source/neutron/templates/daemonset-ovs-agent.yaml
+index 59e33f0..0f6999c 100644
+--- a/openstack-helm/source/neutron/templates/daemonset-ovs-agent.yaml
++++ b/openstack-helm/source/neutron/templates/daemonset-ovs-agent.yaml
+@@ -116,8 +116,8 @@ spec:
+                   name: {{ $configMapName }}
+                   key: update_dpdk_bond_config
+           {{- end }}
+-          command:
+-            - /tmp/neutron-openvswitch-agent-init.sh
++          command: ["/bin/sh","-c"]
++          args: ["chmod -R 777 /tmp/pod-shared; ls -l /tmp/pod-shared; /tmp/neutron-openvswitch-agent-init.sh"]
+           volumeMounts:
+             - name: pod-tmp
+               mountPath: /tmp
+diff --git a/openstack-helm/source/nova/templates/bin/_nova-compute-init.sh.tpl b/openstack-helm/source/nova/templates/bin/_nova-compute-init.sh.tpl
+index 0636b69..6e12537 100644
+--- a/openstack-helm/source/nova/templates/bin/_nova-compute-init.sh.tpl
++++ b/openstack-helm/source/nova/templates/bin/_nova-compute-init.sh.tpl
+@@ -58,6 +58,8 @@ EOF
+ {{- if and ( empty .Values.conf.nova.DEFAULT.host ) ( .Values.pod.use_fqdn.compute ) }}
+ tee > /tmp/pod-shared/nova-compute-fqdn.conf << EOF
+ [DEFAULT]
+-host = $(hostname --fqdn)
++host = $(hostname)
+ EOF
+ {{- end }}
++
++chmod 777 /tmp/pod-shared/*
+\ No newline at end of file
+-- 
+2.36.1
+

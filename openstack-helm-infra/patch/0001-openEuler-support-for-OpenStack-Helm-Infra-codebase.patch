@@ -1,0 +1,298 @@
+From e19e3e73b3ed906878c1f30e25192f7810f51361 Mon Sep 17 00:00:00 2001
+From: Yinuo Deng <i@dyn.im>
+Date: Mon, 22 Aug 2022 17:56:54 +0800
+Subject: [PATCH] openEuler support for OpenStack-Helm-Infra codebase
+
+---
+ .../deployment/common/000-install-packages.sh | 18 +++-
+ .../source/tools/gate/deploy-k8s-kubeadm.sh   | 84 +++++++++++++-----
+ .../source/tools/gate/deploy-k8s.sh           | 87 ++++++++++++-------
+ .../source/tools/gate/devel/start.sh          |  7 ++
+ 4 files changed, 138 insertions(+), 58 deletions(-)
+
+diff --git a/openstack-helm-infra/source/tools/deployment/common/000-install-packages.sh b/openstack-helm-infra/source/tools/deployment/common/000-install-packages.sh
+index 90118f9..f244d30 100755
+--- a/openstack-helm-infra/source/tools/deployment/common/000-install-packages.sh
++++ b/openstack-helm-infra/source/tools/deployment/common/000-install-packages.sh
+@@ -14,8 +14,10 @@
+ 
+ set -xe
+ 
+-sudo apt-get update
+-sudo apt-get install --no-install-recommends -y \
++if command -v apt-get &> /dev/null
++then
++	sudo apt-get update
++	sudo apt-get install --no-install-recommends -y \
+         ca-certificates \
+         git \
+         make \
+@@ -24,3 +26,15 @@ sudo apt-get install --no-install-recommends -y \
+         bc \
+         python3-pip \
+         dnsutils
++else
++	sudo yum update --allowerasing --nobest
++	sudo yum install -y \
++        ca-certificates \
++        git \
++        make \
++        nmap \
++        curl \
++        bc \
++        python3-pip \
++        bind-utils
++fi
+diff --git a/openstack-helm-infra/source/tools/gate/deploy-k8s-kubeadm.sh b/openstack-helm-infra/source/tools/gate/deploy-k8s-kubeadm.sh
+index 507f0a9..ed44b01 100755
+--- a/openstack-helm-infra/source/tools/gate/deploy-k8s-kubeadm.sh
++++ b/openstack-helm-infra/source/tools/gate/deploy-k8s-kubeadm.sh
+@@ -61,12 +61,15 @@ configure_resolvconf
+ . /etc/os-release
+ 
+ # NOTE: Add docker repo
+-curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
+-sudo apt-key fingerprint 0EBFCD88
+-sudo add-apt-repository \
+-  "deb [arch=amd64] https://download.docker.com/linux/ubuntu \
+-  $(lsb_release -cs) \
+-  stable"
++if command -v apt-get &> /dev/null
++then
++  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
++  sudo apt-key fingerprint 0EBFCD88
++  sudo add-apt-repository \
++    "deb [arch=amd64] https://download.docker.com/linux/ubuntu \
++    $(lsb_release -cs) \
++    stable"
++fi
+ 
+ # NOTE: Configure docker
+ docker_resolv="/run/systemd/resolve/resolv.conf"
+@@ -75,7 +78,7 @@ docker_dns_list="$(awk '/^nameserver/ { printf "%s%s",sep,"\"" $NF "\""; sep=",
+ sudo -E mkdir -p /etc/docker
+ sudo -E tee /etc/docker/daemon.json <<EOF
+ {
+-  "exec-opts": ["native.cgroupdriver=systemd"],
++  "exec-opts": ["native.cgroupdriver=cgroupfs"],
+   "log-driver": "json-file",
+   "log-opts": {
+     "max-size": "100m"
+@@ -96,23 +99,51 @@ Environment="NO_PROXY=${NO_PROXY}"
+ EOF
+ fi
+ 
+-sudo -E apt-get update
+-sudo -E apt-get install -y \
+-  docker-ce \
+-  docker-ce-cli \
+-  containerd.io \
+-  socat \
+-  jq \
+-  util-linux \
+-  bridge-utils \
+-  iptables \
+-  conntrack \
+-  libffi-dev \
+-  ipvsadm \
+-  make \
+-  bc \
+-  git-review \
+-  notary
++if command -v apt-get &> /dev/null
++then
++  wget -q -O- 'https://download.ceph.com/keys/release.asc' | sudo apt-key add -
++  RELEASE_NAME=$(grep 'CODENAME' /etc/lsb-release | awk -F= '{print $2}')
++  sudo add-apt-repository "deb https://download.ceph.com/debian-nautilus/
++  ${RELEASE_NAME} main"
++
++  sudo -E apt-get update
++  sudo -E apt-get install -y \
++    docker \
++    socat \
++    jq \
++    util-linux \
++    bridge-utils \
++    iptables \
++    conntrack \
++    libffi-dev \
++    ipvsadm \
++    make \
++    bc \
++    git-review \
++    notary \
++    ceph-common \
++    rbd-nbd \
++    nfs-common
++else
++  sudo yum update --allowerasing --nobest
++  sudo -E yum install -y --nobest \
++    docker \
++    socat \
++    jq \
++    util-linux \
++    bridge-utils \
++    iptables \
++    conntrack \
++    libffi-devel \
++    ipvsadm \
++    make \
++    bc \
++    ceph-common \
++    rbd-nbd \
++    nfs-utils
++  curl https://github.com/notaryproject/notary/releases/download/v0.6.1/notary-Linux-amd64 -L -o /usr/bin/notary
++  chmod +x /usr/bin/notary
++fi
+ 
+ # Prepare tmpfs for etcd when running on CI
+ # CI VMs can have slow I/O causing issues for etcd
+@@ -140,10 +171,15 @@ sudo -E bash -c \
+ sudo -E mv "${TMP_DIR}"/helm /usr/local/bin/helm
+ rm -rf "${TMP_DIR}"
+ 
++sudo modprobe br_netfilter
++sudo echo 1 > /proc/sys/net/bridge/bridge-nf-call-iptables
++sudo echo 1 > /proc/sys/net/bridge/bridge-nf-call-ip6tables
+ # NOTE: Deploy kubernetes using kubeadm. A CNI that supports network policy is
+ # required for validation; use calico for simplicity.
+ sudo kubeadm init --pod-network-cidr=192.168.0.0/16
+ 
++sudo systemctl enable --now kubelet.service
++
+ mkdir -p $HOME/.kube
+ sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+ sudo chown $(id -u):$(id -g) $HOME/.kube/config
+diff --git a/openstack-helm-infra/source/tools/gate/deploy-k8s.sh b/openstack-helm-infra/source/tools/gate/deploy-k8s.sh
+index 4e435cc..6e73bf2 100755
+--- a/openstack-helm-infra/source/tools/gate/deploy-k8s.sh
++++ b/openstack-helm-infra/source/tools/gate/deploy-k8s.sh
+@@ -93,12 +93,15 @@ configure_resolvconf
+ . /etc/os-release
+ 
+ # NOTE: Add docker repo
+-curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
+-sudo apt-key fingerprint 0EBFCD88
+-sudo add-apt-repository \
+-  "deb [arch=amd64] https://download.docker.com/linux/ubuntu \
+-  $(lsb_release -cs) \
+-  stable"
++if command -v apt-get &> /dev/null
++then
++  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
++  sudo apt-key fingerprint 0EBFCD88
++  sudo add-apt-repository \
++    "deb [arch=amd64] https://download.docker.com/linux/ubuntu \
++    $(lsb_release -cs) \
++    stable"
++fi
+ 
+ # NOTE: Configure docker
+ docker_resolv="/run/systemd/resolve/resolv.conf"
+@@ -107,7 +110,7 @@ docker_dns_list="$(awk '/^nameserver/ { printf "%s%s",sep,"\"" $NF "\""; sep=",
+ sudo -E mkdir -p /etc/docker
+ sudo -E tee /etc/docker/daemon.json <<EOF
+ {
+-  "exec-opts": ["native.cgroupdriver=systemd"],
++  "exec-opts": ["native.cgroupdriver=cgroupfs"],
+   "log-driver": "json-file",
+   "log-opts": {
+     "max-size": "100m"
+@@ -129,31 +132,51 @@ EOF
+ fi
+ 
+ # Install required packages for K8s on host
+-wget -q -O- 'https://download.ceph.com/keys/release.asc' | sudo apt-key add -
+-RELEASE_NAME=$(grep 'CODENAME' /etc/lsb-release | awk -F= '{print $2}')
+-sudo add-apt-repository "deb https://download.ceph.com/debian-nautilus/
+-${RELEASE_NAME} main"
+-
+-sudo -E apt-get update
+-sudo -E apt-get install -y \
+-  docker-ce \
+-  docker-ce-cli \
+-  containerd.io=1.5.11-1 \
+-  socat \
+-  jq \
+-  util-linux \
+-  bridge-utils \
+-  iptables \
+-  conntrack \
+-  libffi-dev \
+-  ipvsadm \
+-  make \
+-  bc \
+-  git-review \
+-  notary \
+-  ceph-common \
+-  rbd-nbd \
+-  nfs-common
++if command -v apt-get &> /dev/null
++then
++  wget -q -O- 'https://download.ceph.com/keys/release.asc' | sudo apt-key add -
++  RELEASE_NAME=$(grep 'CODENAME' /etc/lsb-release | awk -F= '{print $2}')
++  sudo add-apt-repository "deb https://download.ceph.com/debian-nautilus/
++  ${RELEASE_NAME} main"
++
++  sudo -E apt-get update
++  sudo -E apt-get install -y \
++    docker \
++    socat \
++    jq \
++    util-linux \
++    bridge-utils \
++    iptables \
++    conntrack \
++    libffi-dev \
++    ipvsadm \
++    make \
++    bc \
++    git-review \
++    notary \
++    ceph-common \
++    rbd-nbd \
++    nfs-common
++else
++  sudo yum update --allowerasing --nobest
++  sudo -E yum install -y --nobest \
++    docker \
++    socat \
++    jq \
++    util-linux \
++    bridge-utils \
++    iptables \
++    conntrack \
++    libffi-devel \
++    ipvsadm \
++    make \
++    bc \
++    ceph-common \
++    rbd-nbd \
++    nfs-utils
++  curl https://github.com/notaryproject/notary/releases/download/v0.6.1/notary-Linux-amd64 -L -o /usr/bin/notary
++  chmod +x /usr/bin/notary
++fi
+ 
+ sudo -E tee /etc/modprobe.d/rbd.conf << EOF
+ install rbd /bin/true
+diff --git a/openstack-helm-infra/source/tools/gate/devel/start.sh b/openstack-helm-infra/source/tools/gate/devel/start.sh
+index 7dbddf5..879846b 100755
+--- a/openstack-helm-infra/source/tools/gate/devel/start.sh
++++ b/openstack-helm-infra/source/tools/gate/devel/start.sh
+@@ -43,6 +43,13 @@ function ansible_install {
+       curl
+     sudo curl -L -o /usr/bin/jq https://github.com/stedolan/jq/releases/download/jq-1.5/jq-linux64
+     sudo chmod +x /usr/bin/jq
++  elif [ "x$ID" == "xopenEuler" ]; then
++    sudo yum install -y \
++      openEuler-rpm-config \
++      gcc \
++      curl
++    sudo curl -L -o /usr/bin/jq https://github.com/stedolan/jq/releases/download/jq-1.5/jq-linux64
++    sudo chmod +x /usr/bin/jq
+   elif [ "x$ID" == "xfedora" ]; then
+     sudo dnf install -y \
+       python-devel \
+-- 
+2.36.1
+

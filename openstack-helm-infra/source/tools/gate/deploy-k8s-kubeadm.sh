@@ -61,12 +61,15 @@ configure_resolvconf
 . /etc/os-release
 
 # NOTE: Add docker repo
-curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
-sudo apt-key fingerprint 0EBFCD88
-sudo add-apt-repository \
-  "deb [arch=amd64] https://download.docker.com/linux/ubuntu \
-  $(lsb_release -cs) \
-  stable"
+if command -v apt-get &> /dev/null
+then
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
+  sudo apt-key fingerprint 0EBFCD88
+  sudo add-apt-repository \
+    "deb [arch=amd64] https://download.docker.com/linux/ubuntu \
+    $(lsb_release -cs) \
+    stable"
+fi
 
 # NOTE: Configure docker
 docker_resolv="/run/systemd/resolve/resolv.conf"
@@ -75,7 +78,7 @@ docker_dns_list="$(awk '/^nameserver/ { printf "%s%s",sep,"\"" $NF "\""; sep=", 
 sudo -E mkdir -p /etc/docker
 sudo -E tee /etc/docker/daemon.json <<EOF
 {
-  "exec-opts": ["native.cgroupdriver=systemd"],
+  "exec-opts": ["native.cgroupdriver=cgroupfs"],
   "log-driver": "json-file",
   "log-opts": {
     "max-size": "100m"
@@ -96,23 +99,51 @@ Environment="NO_PROXY=${NO_PROXY}"
 EOF
 fi
 
-sudo -E apt-get update
-sudo -E apt-get install -y \
-  docker-ce \
-  docker-ce-cli \
-  containerd.io \
-  socat \
-  jq \
-  util-linux \
-  bridge-utils \
-  iptables \
-  conntrack \
-  libffi-dev \
-  ipvsadm \
-  make \
-  bc \
-  git-review \
-  notary
+if command -v apt-get &> /dev/null
+then
+  wget -q -O- 'https://download.ceph.com/keys/release.asc' | sudo apt-key add -
+  RELEASE_NAME=$(grep 'CODENAME' /etc/lsb-release | awk -F= '{print $2}')
+  sudo add-apt-repository "deb https://download.ceph.com/debian-nautilus/
+  ${RELEASE_NAME} main"
+
+  sudo -E apt-get update
+  sudo -E apt-get install -y \
+    docker \
+    socat \
+    jq \
+    util-linux \
+    bridge-utils \
+    iptables \
+    conntrack \
+    libffi-dev \
+    ipvsadm \
+    make \
+    bc \
+    git-review \
+    notary \
+    ceph-common \
+    rbd-nbd \
+    nfs-common
+else
+  sudo yum update --allowerasing --nobest
+  sudo -E yum install -y --nobest \
+    docker \
+    socat \
+    jq \
+    util-linux \
+    bridge-utils \
+    iptables \
+    conntrack \
+    libffi-devel \
+    ipvsadm \
+    make \
+    bc \
+    ceph-common \
+    rbd-nbd \
+    nfs-utils
+  curl https://github.com/notaryproject/notary/releases/download/v0.6.1/notary-Linux-amd64 -L -o /usr/bin/notary
+  chmod +x /usr/bin/notary
+fi
 
 # Prepare tmpfs for etcd when running on CI
 # CI VMs can have slow I/O causing issues for etcd
@@ -140,9 +171,14 @@ sudo -E bash -c \
 sudo -E mv "${TMP_DIR}"/helm /usr/local/bin/helm
 rm -rf "${TMP_DIR}"
 
+sudo modprobe br_netfilter
+sudo echo 1 > /proc/sys/net/bridge/bridge-nf-call-iptables
+sudo echo 1 > /proc/sys/net/bridge/bridge-nf-call-ip6tables
 # NOTE: Deploy kubernetes using kubeadm. A CNI that supports network policy is
 # required for validation; use calico for simplicity.
 sudo kubeadm init --pod-network-cidr=192.168.0.0/16
+
+sudo systemctl enable --now kubelet.service
 
 mkdir -p $HOME/.kube
 sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
