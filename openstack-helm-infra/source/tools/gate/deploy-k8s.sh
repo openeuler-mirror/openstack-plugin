@@ -93,12 +93,15 @@ configure_resolvconf
 . /etc/os-release
 
 # NOTE: Add docker repo
-curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
-sudo apt-key fingerprint 0EBFCD88
-sudo add-apt-repository \
-  "deb [arch=amd64] https://download.docker.com/linux/ubuntu \
-  $(lsb_release -cs) \
-  stable"
+if command -v apt-get &> /dev/null
+then
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
+  sudo apt-key fingerprint 0EBFCD88
+  sudo add-apt-repository \
+    "deb [arch=amd64] https://download.docker.com/linux/ubuntu \
+    $(lsb_release -cs) \
+    stable"
+fi
 
 # NOTE: Configure docker
 docker_resolv="/run/systemd/resolve/resolv.conf"
@@ -107,7 +110,7 @@ docker_dns_list="$(awk '/^nameserver/ { printf "%s%s",sep,"\"" $NF "\""; sep=", 
 sudo -E mkdir -p /etc/docker
 sudo -E tee /etc/docker/daemon.json <<EOF
 {
-  "exec-opts": ["native.cgroupdriver=systemd"],
+  "exec-opts": ["native.cgroupdriver=cgroupfs"],
   "log-driver": "json-file",
   "log-opts": {
     "max-size": "100m"
@@ -129,31 +132,51 @@ EOF
 fi
 
 # Install required packages for K8s on host
-wget -q -O- 'https://download.ceph.com/keys/release.asc' | sudo apt-key add -
-RELEASE_NAME=$(grep 'CODENAME' /etc/lsb-release | awk -F= '{print $2}')
-sudo add-apt-repository "deb https://download.ceph.com/debian-nautilus/
-${RELEASE_NAME} main"
+if command -v apt-get &> /dev/null
+then
+  wget -q -O- 'https://download.ceph.com/keys/release.asc' | sudo apt-key add -
+  RELEASE_NAME=$(grep 'CODENAME' /etc/lsb-release | awk -F= '{print $2}')
+  sudo add-apt-repository "deb https://download.ceph.com/debian-nautilus/
+  ${RELEASE_NAME} main"
 
-sudo -E apt-get update
-sudo -E apt-get install -y \
-  docker-ce \
-  docker-ce-cli \
-  containerd.io=1.5.11-1 \
-  socat \
-  jq \
-  util-linux \
-  bridge-utils \
-  iptables \
-  conntrack \
-  libffi-dev \
-  ipvsadm \
-  make \
-  bc \
-  git-review \
-  notary \
-  ceph-common \
-  rbd-nbd \
-  nfs-common
+  sudo -E apt-get update
+  sudo -E apt-get install -y \
+    docker \
+    socat \
+    jq \
+    util-linux \
+    bridge-utils \
+    iptables \
+    conntrack \
+    libffi-dev \
+    ipvsadm \
+    make \
+    bc \
+    git-review \
+    notary \
+    ceph-common \
+    rbd-nbd \
+    nfs-common
+else
+  sudo yum update --allowerasing --nobest
+  sudo -E yum install -y --nobest \
+    docker \
+    socat \
+    jq \
+    util-linux \
+    bridge-utils \
+    iptables \
+    conntrack \
+    libffi-devel \
+    ipvsadm \
+    make \
+    bc \
+    ceph-common \
+    rbd-nbd \
+    nfs-utils
+  curl https://github.com/notaryproject/notary/releases/download/v0.6.1/notary-Linux-amd64 -L -o /usr/bin/notary
+  chmod +x /usr/bin/notary
+fi
 
 sudo -E tee /etc/modprobe.d/rbd.conf << EOF
 install rbd /bin/true

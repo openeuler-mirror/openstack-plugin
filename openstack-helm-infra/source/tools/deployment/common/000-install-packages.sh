@@ -14,8 +14,10 @@
 
 set -xe
 
-sudo apt-get update
-sudo apt-get install --no-install-recommends -y \
+if command -v apt-get &> /dev/null
+then
+	sudo apt-get update
+	sudo apt-get install --no-install-recommends -y \
         ca-certificates \
         git \
         make \
@@ -24,3 +26,15 @@ sudo apt-get install --no-install-recommends -y \
         bc \
         python3-pip \
         dnsutils
+else
+	sudo yum update --allowerasing --nobest
+	sudo yum install -y \
+        ca-certificates \
+        git \
+        make \
+        nmap \
+        curl \
+        bc \
+        python3-pip \
+        bind-utils
+fi

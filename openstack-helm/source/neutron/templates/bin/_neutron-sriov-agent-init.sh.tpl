@@ -99,7 +99,7 @@ ethtool --set-priv-flags ${NIC_FIRST_PORT} vf-true-promisc-support ${promisc_mod
 mkdir -p /tmp/pod-shared
 tee > /tmp/pod-shared/neutron-agent.ini << EOF
 [DEFAULT]
-host = $(hostname --fqdn)
+host = $(hostname)
 EOF
 {{- end }}
 
