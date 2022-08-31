@@ -13,6 +13,8 @@
 - Nova: 25.0.0
 - OpenStack-helm: ced30abead0bddb528d0c5fb7c1627dd8f1e22ba
 - OpenStack-helm-infra: ff70971009d29a37619e8e82080663a9ab76d57b
+- OpenStack-helm-images: 1072f9de5ca0b30a343208142905c002d77f2a1a
+- Loci: 2537db07aa3a3836cd215281e2fe2aa7923706b0
 - Kolla: 14.2.0
 - Kolla-ansible: 14.2.0
 

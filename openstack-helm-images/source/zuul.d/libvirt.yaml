@@ -1,0 +1,86 @@
+---
+# Copyright 2019, SUSE LINUX GmbH.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+- project:
+    check:
+      jobs:
+        - openstack-helm-images-build-libvirt
+    gate:
+      jobs:
+        - openstack-helm-images-upload-libvirt
+    promote:
+      jobs:
+        - openstack-helm-images-promote-libvirt
+    periodic-weekly:
+      jobs:
+        - openstack-helm-images-upload-libvirt
+        - openstack-helm-images-promote-libvirt:
+            dependencies:
+              - name: openstack-helm-images-compute-kit-ussuri-ubuntu_bionic
+              - name: openstack-helm-images-compute-kit-victoria-ubuntu_focal
+              - name: openstack-helm-images-compute-kit-wallaby-ubuntu_focal
+
+- job:
+    name: openstack-helm-images-build-libvirt
+    parent: openstack-helm-images-build
+    description: Build libvirt images
+    vars: &libvirt_vars
+      currentdate: "{{ now(utc=True,fmt='%Y%m%d') }}"
+      docker_images:
+        - context: libvirt
+          repository: openstackhelm/libvirt
+          dockerfile: Dockerfile.centos_7
+          tags:
+            - latest-centos_7
+            - "centos_7-{{ currentdate }}"
+        - context: libvirt
+          repository: openstackhelm/libvirt
+          dockerfile: Dockerfile.ubuntu_bionic
+          tags:
+            - latest-ubuntu_bionic
+            - "ubuntu_bionic-{{ currentdate }}"
+          build_args:
+            - "CEPH_REPO=https://mirror.mirantis.com/testing/ceph-nautilus/bionic/"
+            - "CEPH_KEY=https://mirror.mirantis.com/testing/ceph-nautilus/bionic/archive-ceph-nautilus.key"
+            - "CEPH_RELEASE_TAG=14.2.9-1.0~bionic"
+        - context: libvirt
+          repository: openstackhelm/libvirt
+          dockerfile: Dockerfile.ubuntu_focal
+          tags:
+            - latest-ubuntu_focal
+            - "ubuntu_focal-{{ currentdate }}"
+        - context: libvirt
+          repository: openstackhelm/libvirt
+          dockerfile: Dockerfile.debian_bullseye
+          tags:
+            - latest-debian_bullseye
+            - "debian_bullseye-{{ currentdate }}"
+    files: &libvirt_files
+      - libvirt/.*
+      - zuul.d/libvirt.yaml
+
+- job:
+    name: openstack-helm-images-upload-libvirt
+    parent: openstack-helm-images-upload
+    description: Build and upload libvirt images
+    vars: *libvirt_vars
+    files: *libvirt_files
+
+- job:
+    name: openstack-helm-images-promote-libvirt
+    parent: openstack-helm-images-promote
+    description: Promote a previously published libvirt image to latest.
+    vars: *libvirt_vars
+    files: *libvirt_files
