@@ -1,0 +1,303 @@
+From 27bc77e458db8f086e6c4de82d516f6a63c3a22b Mon Sep 17 00:00:00 2001
+From: lijiahui4 <jiahui@isrc.iscas.ac.cn>
+Date: Wed, 31 Aug 2022 15:53:26 +0800
+Subject: [PATCH] Add isula support for kolla
+
+---
+ common/config.py |   3 +
+ image/build.py   |  58 ++++++------
+ image/runtime.py | 140 ++++++++++++++++++++++++++++
+ 3 files changed, 172 insertions(+), 29 deletions(-)
+ create mode 100644 image/runtime.py
+
+diff --git a/common/config.py b/common/config.py
+index 6d067bf..dec8dcf 100755
+--- a/common/config.py
++++ b/common/config.py
+@@ -154,6 +154,9 @@ _CLI_OPTS = [
+     cfg.StrOpt('base-arch', default=hostarch,
+                choices=BASE_ARCH,
+                help='The base architecture. Default is same as host.'),
++    cfg.StrOpt('base-runtime', default='docker',
++               choices=['docker', 'isula'],
++               help='The base container runtime. Default is docker'),
+     cfg.BoolOpt('use-dumb-init', default=True,
+                 help='Use dumb-init as init system in containers'),
+     cfg.BoolOpt('debug', short='d', default=False,
+diff --git a/image/build.py b/image/build.py
+index f2a2eaf..c4d7dee 100755
+--- a/image/build.py
++++ b/image/build.py
+@@ -49,6 +49,7 @@ from kolla.common import config as common_config  # noqa
+ from kolla.common import task  # noqa
+ from kolla.common import utils  # noqa
+ from kolla import exception  # noqa
++from kolla.image import runtime
+ from kolla.template import filters as jinja_filters  # noqa
+ from kolla.template import methods as jinja_methods  # noqa
+ from kolla import version  # noqa
+@@ -184,19 +185,16 @@ def join_many(threads):
+ 
+ 
+ class DockerTask(task.Task):
+-
+-    docker_kwargs = docker.utils.kwargs_from_env()
+-
+-    def __init__(self):
++    def __init__(self, conf):
+         super(DockerTask, self).__init__()
+         self._dc = None
++        self.conf = conf
+ 
+     @property
+     def dc(self):
+         if self._dc is not None:
+             return self._dc
+-        docker_kwargs = self.docker_kwargs.copy()
+-        self._dc = docker.APIClient(version='auto', **docker_kwargs)
++        self._dc = runtime.RuntimeAdapter(self.conf.base_runtime)
+         return self._dc
+ 
+ 
+@@ -269,7 +267,7 @@ class PushTask(DockerTask):
+     """Task that pushes an image to a docker repository."""
+ 
+     def __init__(self, conf, image):
+-        super(PushTask, self).__init__()
++        super(PushTask, self).__init__(conf)
+         self.conf = conf
+         self.image = image
+         self.logger = image.logger
+@@ -307,9 +305,10 @@ class PushTask(DockerTask):
+ 
+         # Since docker 3.0.0, the argument of 'insecure_registry' is removed.
+         # To be compatible, set 'insecure_registry=True' for old releases.
+-        dc_running_ver = StrictVersion(docker.version)
+-        if dc_running_ver < StrictVersion('3.0.0'):
+-            kwargs['insecure_registry'] = True
++        if self.conf.base_runime == 'docker':
++            dc_running_ver = StrictVersion(docker.version)
++            if dc_running_ver < StrictVersion('3.0.0'):
++                kwargs['insecure_registry'] = True
+ 
+         for response in self.dc.push(image.canonical_name, **kwargs):
+             if 'stream' in response:
+@@ -325,7 +324,7 @@ class BuildTask(DockerTask):
+     """Task that builds out an image."""
+ 
+     def __init__(self, conf, image, push_queue):
+-        super(BuildTask, self).__init__()
++        super(BuildTask, self).__init__(conf)
+         self.conf = conf
+         self.image = image
+         self.push_queue = push_queue
+@@ -558,23 +557,25 @@ class BuildTask(DockerTask):
+                                         pull=pull,
+                                         forcerm=self.forcerm,
+                                         buildargs=buildargs):
+-                if 'stream' in stream:
+-                    for line in stream['stream'].split('\n'):
+-                        if line:
+-                            self.logger.info('%s', line)
+-                if 'errorDetail' in stream:
+-                    image.status = Status.ERROR
+-                    self.logger.error('Error\'d with the following message')
+-                    for line in stream['errorDetail']['message'].split('\n'):
+-                        if line:
+-                            self.logger.error('%s', line)
+-                    return
+-
++                if self.conf.base_runtime == 'docker':
++                    if 'stream' in stream:
++                        for line in stream['stream'].split('\n'):
++                            if line:
++                                self.logger.info('%s', line)
++                    if 'errorDetail' in stream:
++                        image.status = Status.ERROR
++                        self.logger.error('Error\'d with the following message')
++                        for line in stream['errorDetail']['message'].split('\n'):
++                            if line:
++                                self.logger.error('%s', line)
++                        return
++                else:
++                    self.logger.info('%s', stream)
+             if image.status != Status.ERROR and self.conf.squash:
+                 self.squash()
+-        except docker.errors.DockerException:
++        except runtime.InitException:
+             image.status = Status.ERROR
+-            self.logger.exception('Unknown docker error when building')
++            self.logger.exception('Init runtime client failed')
+         except Exception:
+             image.status = Status.ERROR
+             self.logger.exception('Unknown error when building')
+@@ -724,16 +725,15 @@ class KollaWorker(object):
+         self.maintainer = conf.maintainer
+         self.distro_python_version = conf.distro_python_version
+ 
+-        docker_kwargs = docker.utils.kwargs_from_env()
+         try:
+-            self.dc = docker.APIClient(version='auto', **docker_kwargs)
+-        except docker.errors.DockerException as e:
++            self.dc = runtime.RuntimeAdapter(conf.base_runtime)
++        except runtime.InitException as e:
+             self.dc = None
+             if not (conf.template_only or
+                     conf.save_dependency or
+                     conf.list_images or
+                     conf.list_dependencies):
+-                LOG.error("Unable to connect to Docker, exiting")
++                LOG.error("Unable to connect to %s, exiting" % conf.base_runtime)
+                 LOG.info("Exception caught: {0}".format(e))
+                 sys.exit(1)
+ 
+diff --git a/image/runtime.py b/image/runtime.py
+new file mode 100644
+index 0000000..a733ac3
+--- /dev/null
++++ b/image/runtime.py
+@@ -0,0 +1,140 @@
++import os
++
++import docker
++
++
++class DockerRuntime(object):
++    def __init__(self):
++        try:
++            docker_kwargs = docker.utils.kwargs_from_env()
++            self.client = docker.APIClient(version="auto", **docker_kwargs)
++        except docker.errors.DockerException:
++            raise InitException
++
++    def images(self, name=None, quiet=None):
++        return self.client.images(name=name, quiet=quiet)
++
++    def inspect_image(self, image_tag):
++        return self.client.history(image_tag)
++
++    def history(self, name):
++        return self.client.history(name)
++
++    def build(
++        self,
++        path=None,
++        tag=None,
++        nocache=None,
++        rm=None,
++        decode=None,
++        network_mode=None,
++        pull=None,
++        forcerm=None,
++        buildargs=None,
++    ):
++        return self.client.build(
++            path=path,
++            tag=tag,
++            nocache=nocache,
++            rm=rm,
++            decode=decode,
++            network_mode=network_mode,
++            pull=pull,
++            forcerm=forcerm,
++            buildargs=buildargs,
++        )
++
++    def push(self, name, **kwargs):
++        return self.client.push(name, **kwargs)
++
++
++class IsulaRuntime(object):
++    def __init__(self):
++        from isula import client
++        try:
++            self.builder_client = client.init_builder_client()
++            self.isulad_client = client.init_isulad_client()
++        except Exception:
++            raise InitException
++
++    def images(self, name=None, quiet=None):
++        return self.builder_client.list_images(image_name=name)
++
++    def inspect_image(self, image_tag):
++        # TODO(wxy): This API doesn't work now. Correct it.
++        #return self.isulad_client.inspect_image(image_tag)
++        raise NotImplementedError
++
++    def history(self, name):
++        # isula doesn't support this API.
++        raise NotImplementedError
++
++    def build(
++        self,
++        path=None,
++        tag=None,
++        nocache=None,
++        rm=None,
++        decode=None,
++        network_mode=None,
++        pull=None,
++        forcerm=None,
++        buildargs=None,
++    ):
++        docker_file = os.path.join(path, 'Dockerfile')
++        output = 'isulad:' + tag
++        image_format = 'oci'
++        return self.builder_client.build_image(docker_file, output,
++            image_format, path, nocache=nocache)
++
++    def push(self, name, **kwargs):
++        return self.builder_client.push_image(name, "oci")
++
++
++class RuntimeAdapter(object):
++    def __init__(self, base_runtime):
++        if base_runtime == "docker":
++            self.runtime = DockerRuntime()
++        elif base_runtime == "isula":
++            self.runtime = IsulaRuntime()
++
++    def images(self, name=None, quiet=None):
++        return self.runtime.images(name=name, quiet=quiet)
++
++    def inspect_image(self, image_tag):
++        return self.runtime.inspect_image(image_tag)
++
++    def history(self, name):
++        return self.runtime.history(name)
++
++    def build(
++        self,
++        path=None,
++        tag=None,
++        nocache=None,
++        rm=None,
++        decode=None,
++        network_mode=None,
++        pull=None,
++        forcerm=None,
++        buildargs=None,
++    ):
++        return self.runtime.build(
++            path=path,
++            tag=tag,
++            nocache=nocache,
++            rm=rm,
++            decode=decode,
++            network_mode=network_mode,
++            pull=pull,
++            forcerm=forcerm,
++            buildargs=buildargs,
++        )
++
++    def push(self, name, **kwargs):
++        return self.runtime.push(name, **kwargs)
++
++
++class InitException(Exception):
++    def __init__(self):
++        super(InitException, self).__init__()
+\ No newline at end of file
+-- 
+2.17.1
+
