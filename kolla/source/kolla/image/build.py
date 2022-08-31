@@ -49,6 +49,7 @@ from kolla.common import config as common_config  # noqa
 from kolla.common import task  # noqa
 from kolla.common import utils  # noqa
 from kolla import exception  # noqa
+from kolla.image import runtime
 from kolla.template import filters as jinja_filters  # noqa
 from kolla.template import methods as jinja_methods  # noqa
 from kolla import version  # noqa
@@ -184,19 +185,16 @@ def join_many(threads):
 
 
 class DockerTask(task.Task):
-
-    docker_kwargs = docker.utils.kwargs_from_env()
-
-    def __init__(self):
+    def __init__(self, conf):
         super(DockerTask, self).__init__()
         self._dc = None
+        self.conf = conf
 
     @property
     def dc(self):
         if self._dc is not None:
             return self._dc
-        docker_kwargs = self.docker_kwargs.copy()
-        self._dc = docker.APIClient(version='auto', **docker_kwargs)
+        self._dc = runtime.RuntimeAdapter(self.conf.base_runtime)
         return self._dc
 
 
@@ -269,7 +267,7 @@ class PushTask(DockerTask):
     """Task that pushes an image to a docker repository."""
 
     def __init__(self, conf, image):
-        super(PushTask, self).__init__()
+        super(PushTask, self).__init__(conf)
         self.conf = conf
         self.image = image
         self.logger = image.logger
@@ -307,9 +305,10 @@ class PushTask(DockerTask):
 
         # Since docker 3.0.0, the argument of 'insecure_registry' is removed.
         # To be compatible, set 'insecure_registry=True' for old releases.
-        dc_running_ver = StrictVersion(docker.version)
-        if dc_running_ver < StrictVersion('3.0.0'):
-            kwargs['insecure_registry'] = True
+        if self.conf.base_runime == 'docker':
+            dc_running_ver = StrictVersion(docker.version)
+            if dc_running_ver < StrictVersion('3.0.0'):
+                kwargs['insecure_registry'] = True
 
         for response in self.dc.push(image.canonical_name, **kwargs):
             if 'stream' in response:
@@ -325,7 +324,7 @@ class BuildTask(DockerTask):
     """Task that builds out an image."""
 
     def __init__(self, conf, image, push_queue):
-        super(BuildTask, self).__init__()
+        super(BuildTask, self).__init__(conf)
         self.conf = conf
         self.image = image
         self.push_queue = push_queue
@@ -558,23 +557,25 @@ class BuildTask(DockerTask):
                                         pull=pull,
                                         forcerm=self.forcerm,
                                         buildargs=buildargs):
-                if 'stream' in stream:
-                    for line in stream['stream'].split('\n'):
-                        if line:
-                            self.logger.info('%s', line)
-                if 'errorDetail' in stream:
-                    image.status = Status.ERROR
-                    self.logger.error('Error\'d with the following message')
-                    for line in stream['errorDetail']['message'].split('\n'):
-                        if line:
-                            self.logger.error('%s', line)
-                    return
-
+                if self.conf.base_runtime == 'docker':
+                    if 'stream' in stream:
+                        for line in stream['stream'].split('\n'):
+                            if line:
+                                self.logger.info('%s', line)
+                    if 'errorDetail' in stream:
+                        image.status = Status.ERROR
+                        self.logger.error('Error\'d with the following message')
+                        for line in stream['errorDetail']['message'].split('\n'):
+                            if line:
+                                self.logger.error('%s', line)
+                        return
+                else:
+                    self.logger.info('%s', stream)
             if image.status != Status.ERROR and self.conf.squash:
                 self.squash()
-        except docker.errors.DockerException:
+        except runtime.InitException:
             image.status = Status.ERROR
-            self.logger.exception('Unknown docker error when building')
+            self.logger.exception('Init runtime client failed')
         except Exception:
             image.status = Status.ERROR
             self.logger.exception('Unknown error when building')
@@ -724,16 +725,15 @@ class KollaWorker(object):
         self.maintainer = conf.maintainer
         self.distro_python_version = conf.distro_python_version
 
-        docker_kwargs = docker.utils.kwargs_from_env()
         try:
-            self.dc = docker.APIClient(version='auto', **docker_kwargs)
-        except docker.errors.DockerException as e:
+            self.dc = runtime.RuntimeAdapter(conf.base_runtime)
+        except runtime.InitException as e:
             self.dc = None
             if not (conf.template_only or
                     conf.save_dependency or
                     conf.list_images or
                     conf.list_dependencies):
-                LOG.error("Unable to connect to Docker, exiting")
+                LOG.error("Unable to connect to %s, exiting" % conf.base_runtime)
                 LOG.info("Exception caught: {0}".format(e))
                 sys.exit(1)
 
