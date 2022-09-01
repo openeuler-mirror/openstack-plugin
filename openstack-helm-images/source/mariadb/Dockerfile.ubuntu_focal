@@ -1,0 +1,24 @@
+# mariadb:10.5.9-focal
+ARG FROM=docker.io/mariadb@sha256:7e244fae615587335176db07e88b43eee5e4762f35306e17c13c68125d93b9bf
+FROM ${FROM}
+
+RUN set -ex ;\
+    apt update ;\
+    apt install -y --no-install-recommends \
+        python3-pip ;\
+    pip3 --no-cache-dir install --upgrade pip ;\
+    hash -r ;\
+    pip3 --no-cache-dir install --upgrade setuptools ;\
+    pip3 --no-cache-dir install --upgrade \
+      configparser \
+      iso8601 \
+      kubernetes \
+      pykube-ng ;\
+    apt clean -y ;\
+    rm -rf \
+       /var/cache/debconf/* \
+       /var/lib/apt/lists/* \
+       /var/log/* \
+       /tmp/* \
+       /var/tmp/* ;\
+    usermod -s /bin/false mysql

@@ -1,0 +1,78 @@
+From c95840dfd718d016548e398e464a266ab63ed346 Mon Sep 17 00:00:00 2001
+From: Yinuo Deng <i@dyn.im>
+Date: Tue, 30 Aug 2022 05:20:51 +0000
+Subject: [PATCH] Added support for openEuler
+
+---
+ scripts/cleanup.sh          |  2 +-
+ scripts/collect_info.sh     |  2 +-
+ scripts/install.sh          | 13 +++++++++++++
+ scripts/install_packages.sh |  2 +-
+ 4 files changed, 16 insertions(+), 3 deletions(-)
+
+diff --git a/scripts/cleanup.sh b/scripts/cleanup.sh
+index 75b02e8..4819d4e 100755
+--- a/scripts/cleanup.sh
++++ b/scripts/cleanup.sh
+@@ -11,7 +11,7 @@ case ${distro} in
+             virtualenv
+         rm -rf /var/lib/apt/lists/*
+         ;;
+-    centos)
++    centos|openeuler)
+         # We should be removing 'patch' here, but that breaks
+         # centos as it tries to rip out systemd for some reason
+         yum -y autoremove \
+diff --git a/scripts/collect_info.sh b/scripts/collect_info.sh
+index 96c963e..d31fd3c 100755
+--- a/scripts/collect_info.sh
++++ b/scripts/collect_info.sh
+@@ -11,7 +11,7 @@ case ${distro} in
+     ubuntu)
+         dpkg -l > $PACKAGES_INFO
+         ;;
+-    centos)
++    centos|openeuler)
+         yum list installed > $PACKAGES_INFO
+         ;;
+     *)
+diff --git a/scripts/install.sh b/scripts/install.sh
+index 335c700..d32b493 100755
+--- a/scripts/install.sh
++++ b/scripts/install.sh
+@@ -50,6 +50,19 @@ case ${distro} in
+           pip3 install virtualenv
+         fi
+         ;;
++    openeuler)
++        export LC_CTYPE=en_US.UTF-8
++        yum upgrade -y --allowerasing --nobest
++        yum install -y --setopt=skip_missing_names_on_install=False \
++            git \
++            patch \
++            redhat-lsb-core \
++            sudo \
++            ${rpm_python_packages[@]}
++        if [[ "${PYTHON3}" != "no" ]]; then
++          pip3 install virtualenv
++        fi
++        ;;
+     *)
+         echo "Unknown distro: ${distro}"
+         exit 1
+diff --git a/scripts/install_packages.sh b/scripts/install_packages.sh
+index 2534a42..be8f2cd 100755
+--- a/scripts/install_packages.sh
++++ b/scripts/install_packages.sh
+@@ -28,7 +28,7 @@ if [[ ! -z ${PACKAGES} ]]; then
+                 apt-get purge -y wget
+             fi
+             ;;
+-        centos)
++        centos|openeuler)
+             yum -y --setopt=skip_missing_names_on_install=False install ${PACKAGES[@]} ${DIST_PACKAGES}
+             ;;
+         *)
+-- 
+2.36.1
+
