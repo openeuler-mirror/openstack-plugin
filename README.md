@@ -8,7 +8,3 @@
 
 ## 特性说明
 
-### OpenStack Yoga
-
-- 虚拟机高低优先级
-    nova为[25.0.0](https://opendev.org/openstack/nova/src/tag/25.0.0)、placement为[7.0.0](https://opendev.org/openstack/placement/src/tag/7.0.0)，特性spec请阅读相关[文档](https://gitee.com/openeuler/openstack/blob/master/docs/spec/priority_vm.md)
