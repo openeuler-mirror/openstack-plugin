@@ -100,6 +100,25 @@ RESOURCE_ATTRIBUTE_MAP = {
                                        'required': False,
                                    }
                                }
+                           }},
+        'configurations': {'allow_post': True, 'allow_put': True,
+                           'is_visible': True, 'default': None,
+                           'enforce_policy': True,
+                           'validate': {
+                               'type:dict_or_nodata': {
+                                   'preferred_agent': {
+                                       'type:string': None,
+                                       'required': False
+                                   },
+                                   'master_agent': {
+                                       'type:string': None,
+                                       'required': False
+                                   },
+                                   'slave_agents': {
+                                       'type:list_of_unique_strings': None,
+                                       'required': False
+                                   }
+                               }
                            }}
     },
     FLOATINGIPS: {
