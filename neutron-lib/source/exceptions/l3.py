@@ -96,12 +96,3 @@ class IpTablesApplyException(exceptions.NeutronException):
     def __init__(self, message=None):
         self.message = message
         super(IpTablesApplyException, self).__init__()
-
-
-class RouterAgentNotGiven(exceptions.BadRequest):
-    message = _("Router network agent must be given at the same time "
-                "while creating.")
-
-
-class RouterAgentConflict(exceptions.Conflict):
-    message = _("Router master agent can not be same with slave agents.")

@@ -18,7 +18,6 @@ from neutron_lib.api.definitions import availability_zone as az_def
 from neutron_lib.api.validators import availability_zone as az_validator
 from neutron_lib import constants as n_const
 from neutron_lib.utils import net as net_utils
-from neutron_lib.objects import utils as obj_utils
 from oslo_versionedobjects import fields as obj_fields
 import six
 from sqlalchemy import func
@@ -71,8 +70,7 @@ class RouterRoute(base.NeutronDbObject):
 @base.NeutronObjectRegistry.register
 class RouterExtraAttributes(base.NeutronDbObject):
     # Version 1.0: Initial version
-    # Version 1.1: Add configurations
-    VERSION = '1.1'
+    VERSION = '1.0'
 
     db_model = l3_attrs.RouterExtraAttributes
 
@@ -82,8 +80,7 @@ class RouterExtraAttributes(base.NeutronDbObject):
         'service_router': obj_fields.BooleanField(default=False),
         'ha': obj_fields.BooleanField(default=False),
         'ha_vr_id': obj_fields.IntegerField(nullable=True),
-        'availability_zone_hints': obj_fields.ListOfStringsField(nullable=True),
-        'configurations': common_types.DictOfMiscValuesField(nullable=True),
+        'availability_zone_hints': obj_fields.ListOfStringsField(nullable=True)
     }
 
     primary_keys = ['router_id']
@@ -98,9 +95,6 @@ class RouterExtraAttributes(base.NeutronDbObject):
             result[az_def.AZ_HINTS] = (
                 az_validator.convert_az_string_to_list(
                     result[az_def.AZ_HINTS]))
-        if 'configurations' in result:
-            result['configurations'] = cls.load_json_from_str(
-                result['configurations'], default={})
         return result
 
     @classmethod
@@ -110,11 +104,6 @@ class RouterExtraAttributes(base.NeutronDbObject):
             result[az_def.AZ_HINTS] = (
                 az_validator.convert_az_list_to_string(
                     result[az_def.AZ_HINTS]))
-        if ('configurations' in result and
-                not isinstance(result['configurations'],
-                               obj_utils.StringMatchingFilterObj)):
-            result['configurations'] = (
-                cls.filter_to_json_str(result['configurations']))
         return result
 
     @classmethod
