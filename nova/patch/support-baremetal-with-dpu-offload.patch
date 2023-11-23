@@ -1,0 +1,963 @@
+diff --git a/tools/nova/nova-20.6.1/nova/compute/manager.py b/tools/nova/nova-20.6.1/nova/compute/manager.py
+index 6e5d72f..47f66a6 100644
+--- a/tools/nova/nova-20.6.1/nova/compute/manager.py
++++ b/tools/nova/nova-20.6.1/nova/compute/manager.py
+@@ -1084,21 +1084,7 @@ class ComputeManager(manager.Manager):
+             return
+ 
+         net_info = instance.get_network_info()
+-        try:
+-            self.driver.plug_vifs(instance, net_info)
+-        except NotImplementedError as e:
+-            LOG.debug(e, instance=instance)
+-        except exception.VirtualInterfacePlugException:
+-            # NOTE(mriedem): If we get here, it could be because the vif_type
+-            # in the cache is "binding_failed" or "unbound".
+-            # The periodic task _heal_instance_info_cache checks for this
+-            # condition. It should fix this by binding the ports again when
+-            # it gets to this instance.
+-            LOG.exception('Virtual interface plugging failed for instance. '
+-                          'The port binding:host_id may need to be manually '
+-                          'updated.', instance=instance)
+-            self._set_instance_obj_error_state(context, instance)
+-            return
++        # delete self.driver.plug_vifs
+ 
+         if instance.task_state == task_states.RESIZE_MIGRATING:
+             # We crashed during resize/migration, so roll back for safety
+@@ -2845,6 +2831,14 @@ class ComputeManager(manager.Manager):
+         block_device_info = self._get_instance_block_device_info(
+             context, instance, bdms=bdms)
+ 
++        LOG.debug('dpulog try_deallocate_networks start.',
++                  instance=instance)
++        # deallocate networks before destroy
++        if try_deallocate_networks:
++            self._try_deallocate_network(context, instance, requested_networks)
++        LOG.debug('dpulog try_deallocate_networks end.',
++                  instance=instance)
++
+         # NOTE(melwitt): attempt driver destroy before releasing ip, may
+         #                want to keep ip allocated for certain failures
+         try:
+@@ -2861,14 +2855,11 @@ class ComputeManager(manager.Manager):
+                 pass
+         except Exception:
+             with excutils.save_and_reraise_exception():
+-                # deallocate ip and fail without proceeding to
+-                # volume api calls, preserving current behavior
+-                if try_deallocate_networks:
+-                    self._try_deallocate_network(context, instance,
+-                                                 requested_networks)
++                # move try_deallocate_networks before self.driver.destroy
++                LOG.error('driver destroy with Exception.',
++                          instance=instance)
+ 
+-        if try_deallocate_networks:
+-            self._try_deallocate_network(context, instance, requested_networks)
++        # move try_deallocate_networks before self.driver.destroy
+ 
+         timer.restart()
+         for bdm in vol_bdms:
+@@ -4554,7 +4545,10 @@ class ComputeManager(manager.Manager):
+ 
+             block_device_info = self._get_instance_block_device_info(
+                     context, instance, refresh_conn_info=True, bdms=bdms)
+-
++            LOG.info('finish_revert_resize prepare_for_spawn node %s',
++                     instance.node,
++                     instance=instance)
++            self.driver.prepare_for_spawn(instance)
+             power_on = old_vm_state != vm_states.STOPPED
+             self.driver.finish_revert_migration(
+                 context, instance, network_info, migration, block_device_info,
+@@ -4944,6 +4938,10 @@ class ComputeManager(manager.Manager):
+             instance.task_state = task_states.RESIZE_MIGRATED
+             instance.save(expected_task_state=task_states.RESIZE_MIGRATING)
+ 
++            LOG.debug('_resize_instance prepare_for_spawn node %s',
++                      instance.node,
++                      instance=instance)
++            self.driver.prepare_for_spawn(instance)
+             # RPC cast to the destination host to finish the resize/migration.
+             self.compute_rpcapi.finish_resize(context, instance,
+                 migration, image, disk_info, migration.dest_compute,
+@@ -8638,6 +8636,7 @@ class ComputeManager(manager.Manager):
+ 
+         # We re-query the DB to get the latest instance info to minimize
+         # (not eliminate) race condition.
++        LOG.debug("start _sync_instance_power_state")
+         db_instance.refresh(use_slave=use_slave)
+         db_power_state = db_instance.power_state
+         vm_state = db_instance.vm_state
+@@ -9158,6 +9157,7 @@ class ComputeManager(manager.Manager):
+                                  self.network_api, context,
+                                  instance,
+                                  nw_info=network_info)
++                vif['force'] = True
+                 try:
+                     self.driver.detach_interface(context, instance, vif)
+                 except NotImplementedError:
+diff --git a/tools/nova/nova-20.6.1/nova/exception.py b/tools/nova/nova-20.6.1/nova/exception.py
+index d178034..5e7aba8 100644
+--- a/tools/nova/nova-20.6.1/nova/exception.py
++++ b/tools/nova/nova-20.6.1/nova/exception.py
+@@ -277,6 +277,11 @@ class VolumeDetachFailed(Invalid):
+                 "Reason: %(reason)s")
+ 
+ 
++class VolumeExtendFailed(Invalid):
++    msg_fmt = _("Volume %(volume_id)s could not be extended. "
++                "Reason: %(reason)s")
++
++
+ class MultiattachNotSupportedByVirtDriver(NovaException):
+     # This exception indicates the compute hosting the instance does not
+     # support multiattach volumes. This should generally be considered a
+diff --git a/tools/nova/nova-20.6.1/nova/virt/ironic/__init__.py b/tools/nova/nova-20.6.1/nova/virt/ironic/__init__.py
+index e37d322..a6f3004 100644
+--- a/tools/nova/nova-20.6.1/nova/virt/ironic/__init__.py
++++ b/tools/nova/nova-20.6.1/nova/virt/ironic/__init__.py
+@@ -14,5 +14,7 @@
+ # under the License.
+ 
+ from nova.virt.ironic import driver
++from nova.virt.ironic import dpu_driver
+ 
+ IronicDriver = driver.IronicDriver
++DPUIronicDriver = dpu_driver.DPUIronicDriver
+diff --git a/tools/nova/nova-20.6.1/nova/virt/ironic/dpu_api.py b/tools/nova/nova-20.6.1/nova/virt/ironic/dpu_api.py
+new file mode 100644
+index 0000000..f4fd3b6
+--- /dev/null
++++ b/tools/nova/nova-20.6.1/nova/virt/ironic/dpu_api.py
+@@ -0,0 +1,158 @@
++# Copyright 2023 Huawei Technology corp.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#   http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import json
++import requests
++import time
++
++from oslo_config import cfg
++from oslo_log import log as logging
++
++LOG = logging.getLogger(__name__)
++
++class APIClient(object):
++    def __init__(self, api_url):
++        self.api_url = api_url.rstrip('/')
++        self.api_version = "v2.1"
++
++        # Only keep alive a maximum of 2 connections to the API. More will be
++        # opened if they are needed, but they will be closed immediately after
++        # use.
++        adapter = requests.adapters.HTTPAdapter(pool_connections=2,
++                                                pool_maxsize=2)
++        self.session = requests.Session()
++        self.session.mount(self.api_url, adapter)
++
++        self.encoder = json.JSONEncoder()
++        self._init_auth_conf()
++
++    def _init_auth_conf(self):
++        group = cfg.OptGroup('keystone_authtoken')
++        opts = [
++            cfg.StrOpt('username', default=''),
++            cfg.StrOpt('project_domain_name', default=''),
++            cfg.StrOpt('user_domain_name', default=''),
++            cfg.StrOpt('project_name', default=''),
++            cfg.StrOpt('password', default=''),
++            cfg.StrOpt('auth_url', default=''),
++        ]
++        CONF = cfg.CONF
++        try:
++            CONF.register_group(group)
++            CONF.register_opts(opts, group=group)
++            CONF(default_config_files=['/etc/nova/nova.conf'])
++        except cfg.DuplicateOptError:
++            LOG.warning('cfg DuplicateOptError')
++
++        self.token_update_time = 0
++        self.token = ''
++        ka = CONF.keystone_authtoken
++        username = ka.username.lower()
++        project_domain_name = ka.project_domain_name.lower()
++        user_domain_name = ka.user_domain_name.lower()
++        project_name = ka.project_name.lower()
++        password = ka.password
++        self.auth_data = json.dumps({
++            "auth": {
++                "identity": {
++                    "methods": ["password"],
++                    "password": {
++                        "user": {
++                            "name": username,
++                            "domain": {"id": user_domain_name},
++                            "password": password
++                        }
++                    }
++                },
++                "scope": {
++                    "project": {
++                        "name": project_name,
++                        "domain": {"id": project_domain_name}
++                    }
++                }
++            }
++        })
++        self.auth_url = ka.auth_url + "/identity/v3/auth/tokens"
++
++    def _get_token(self):
++        if self.token_update_time < time.time() - 5 * 60:  # 5分钟过期，重新获取
++            headers = {
++                'Content-Type': 'application/json',
++                'Accept': 'application/json',
++            }
++            response = self.session.request('POST',
++                                            self.auth_url,
++                                            headers=headers,
++                                            data=self.auth_data,
++                                            verify=None,
++                                            cert=None)
++            self.token_update_time = time.time()
++            self.token = response.headers['X-Subject-Token']
++        return self.token
++
++    def _request(self, method, path, data=None, headers=None, **kwargs):
++        request_url = '{api_url}{path}'.format(api_url=self.api_url, path=path)
++
++        if data is not None:
++            data = self.encoder.encode(data)
++
++        headers = headers or {}
++        token = self._get_token()
++        headers.update({
++            'Content-Type': 'application/json',
++            'Accept': 'application/json',
++            'X-Auth-Token': token,
++        })
++
++        return self.session.request(method,
++                                    request_url,
++                                    headers=headers,
++                                    data=data,
++                                    verify=None,
++                                    cert=None,
++                                    **kwargs)
++
++    def attach_volume_dpu(self, server_id, data):
++        path = '/{}/dpu/{}/os-volume'.format(self.api_version, server_id)
++        try:
++            response = self._request('POST', path, data=data)
++        except Exception as err:
++            LOG.error('Unhandled error attach_volume_dpu. Error: %s ', err)
++            raise
++
++        # Got valid content
++        return response
++
++    def detach_volume_dpu(self, server_id, volume_id, data):
++        path = '/{}/dpu/{}/os-volume/{}'.format(self.api_version,
++                                                server_id, volume_id)
++        try:
++            response = self._request('POST', path, data=data)
++        except Exception as err:
++            LOG.error('Unhandled error detach_volume_dpu. Error: %s ', err)
++            raise
++
++        # Got valid content
++        return response
++
++    def extend_volume_dpu(self, server_id, data):
++        path = '/{}/dpu/{}/os-volume-extend'.format(self.api_version, server_id)
++        try:
++            response = self._request('POST', path, data=data)
++        except Exception as err:
++            LOG.error('Unhandled error extend_volume_dpu. Error: %s ', err)
++            raise
++
++        # Got valid content
++        return response
+diff --git a/tools/nova/nova-20.6.1/nova/virt/ironic/dpu_driver.py b/tools/nova/nova-20.6.1/nova/virt/ironic/dpu_driver.py
+new file mode 100644
+index 0000000..1896cdc
+--- /dev/null
++++ b/tools/nova/nova-20.6.1/nova/virt/ironic/dpu_driver.py
+@@ -0,0 +1,664 @@
++# Copyright 2023 Huawei Technology corp.
++#
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++import time
++
++from oslo_log import log as logging
++from oslo_serialization import jsonutils
++from oslo_service import loopingcall
++from oslo_utils import excutils
++from oslo_utils import netutils
++import six
++
++from nova.compute import vm_states
++import nova.conf
++from nova import exception
++from nova.i18n import _
++from nova.virt.ironic import driver
++from nova.virt.ironic import ironic_states
++from nova.virt.ironic import dpu_api
++import ironicclient as ironic
++
++LOG = logging.getLogger(__name__)
++
++CONF = nova.conf.CONF
++
++_NODE_FIELDS = ('uuid', 'power_state', 'target_power_state', 'provision_state',
++                'target_provision_state', 'last_error', 'maintenance',
++                'properties', 'instance_uuid', 'traits', 'resource_class',
++                'extra')
++
++class DPUIronicDriver(driver.IronicDriver):
++    """Hypervisor driver for Ironic with DPU provisioning."""
++
++    capabilities = {
++        "has_imagecache": False,
++        "supports_evacuate": False,
++        "supports_migrate_to_same_host": True,
++        "supports_attach_interface": True,
++        "supports_extend_volume": True,
++        "supports_multiattach": False,
++        "supports_trusted_certs": False,
++        "supports_pcpus": False,
++
++        # Image type support flags
++        "supports_image_type_aki": False,
++        "supports_image_type_ami": False,
++        "supports_image_type_ari": False,
++        "supports_image_type_iso": False,
++        "supports_image_type_qcow2": True,
++        "supports_image_type_raw": True,
++        "supports_image_type_vdi": False,
++        "supports_image_type_vhd": False,
++        "supports_image_type_vhdx": False,
++        "supports_image_type_vmdk": False,
++    }
++
++    def _get_node(self, node_id):
++        """Get a node by its UUID.
++
++           add extra field
++        """
++        node = self.ironic_connection.get_node(node_id, fields=_NODE_FIELDS)
++        node.uuid = node.id
++        node.instance_uuid = node.instance_id
++        node.maintenance = node.is_maintenance
++        return node
++
++    def _check_state_validation(self, instance):
++        if instance.task_state == None and \
++                instance.vm_state != vm_states.ACTIVE:
++            msg = ("check state validation failed instance vmstatus {} instance"
++                  " task status {}".format(instance.vm_state,
++                                           instance.task_state))
++            LOG.warning(msg, instance=instance)
++            raise exception.ValidationError(msg)
++        else:
++            LOG.debug(
++                "check state validation succeed instance vmstatus {} instance "
++                "task status {}".format(instance.vm_state, instance.task_state))
++
++    def _plug_vif(self, node, port_id):
++        last_attempt = 5
++        for attempt in range(0, last_attempt + 1):
++            try:
++                self.ironicclient.call("node.vif_attach", node.uuid,
++                                       port_id, retry_on_conflict=False)
++            except ironic.exc.BadRequest as e:
++                # NOTE(danms): If we race with ironic startup, there
++                # will be no ironic-conductor running, which will
++                # give us a failure to do this plug operation. So,
++                # be graceful in that case and wait/retry.
++                # NOTE(mdbooth): This will be fixed in ironic by
++                # change I2c21baae. This will ensure ironic returns a 503 here,
++                # which will cause ironicclient to automatically retry for us.
++                # We can remove this workaround once we are confident that we
++                # are only running against ironic containing this fix.
++                if ('No conductor' in six.text_type(e) and
++                        attempt < last_attempt):
++                    LOG.warning('No ironic conductor is running; '
++                                'waiting...')
++                    time.sleep(10)
++                    continue
++
++                msg = (_("Cannot attach VIF %(vif)s to the node %(node)s "
++                         "due to error: %(err)s") % {
++                             'vif': port_id,
++                             'node': node.uuid, 'err': e})
++                LOG.error(msg)
++                raise exception.VirtualInterfacePlugException(msg)
++            except ironic.exc.Conflict:
++                # NOTE (vsaienko) Return since the VIF is already attached.
++                return
++            except ironic.exc.InternalServerError as e:
++                msg = (_("Cannot attach VIF %(vif)s to the node %(node)s "
++                         "due to error: %(err)s") % {
++                           'vif': port_id,
++                           'node': node.uuid, 'err': e})
++                raise exception.VirtualInterfacePlugException(msg)
++            # Success, so don't retry
++            return
++
++    def _unplug_vifs(self, node, instance, network_info):
++        # NOTE(PhilDay): Accessing network_info will block if the thread
++        # it wraps hasn't finished, so do this ahead of time so that we
++        # don't block while holding the logging lock.
++        network_info_str = str(network_info)
++        LOG.debug("unplug: instance_uuid=%(uuid)s vif=%(network_info)s",
++                  {'uuid': instance.uuid,
++                   'network_info': network_info_str})
++        if not network_info:
++            return
++        for vif in network_info:
++            port_id = six.text_type(vif['id'])
++            LOG.debug("unplug_vif: port_id {} ".format(port_id))
++            try:
++                self.ironicclient.call("node.vif_detach", node.uuid,
++                                       port_id)
++            except ironic.exc.BadRequest:
++                LOG.debug("VIF %(vif)s isn't attached to Ironic node %(node)s",
++                          {'vif': port_id, 'node': node.uuid})
++            except ironic.exc.InternalServerError as e:
++                msg = (_("Cannot unplug VIF %(vif)s to the node %(node)s "
++                         "due to error: %(err)s") % {
++                           'vif': port_id,
++                           'node': node.uuid, 'err': e})
++                raise exception.VirtualInterfaceUnplugException(msg)
++
++    def destroy(self, context, instance, network_info,
++                block_device_info=None, destroy_disks=True):
++        """Destroy the specified instance, if it can be found.
++
++        :param context: The security context.
++        :param instance: The instance object.
++        :param network_info: Instance network information.
++        :param block_device_info: Instance block device
++            information. Ignored by this driver.
++        :param destroy_disks: Indicates if disks should be
++            destroyed. Ignored by this driver.
++        """
++        LOG.debug('DPUIronicDriver destroy called for instance',
++                  instance=instance)
++        try:
++            node = self._validate_instance_and_node(instance)
++        except exception.InstanceNotFound:
++            LOG.warning("Destroy called on non-existing instance %s.",
++                        instance.uuid)
++            # NOTE(deva): if nova.compute.ComputeManager._delete_instance()
++            #             is called on a non-existing instance, the only way
++            #             to delete it is to return from this method
++            #             without raising any exceptions.
++            return
++
++        try:
++            # 先unplug vif，_unprovision后就下电了
++            LOG.debug('unplug_vifs first when destroy instance',
++                      instance=instance)
++            self._unplug_vifs(node, instance, network_info)
++
++            if node.provision_state in driver._UNPROVISION_STATES:
++                self._unprovision(instance, node)
++            else:
++                # NOTE(hshiina): if spawn() fails before ironic starts
++                #                provisioning, instance information should be
++                #                removed from ironic node.
++                self._remove_instance_info_from_node(node, instance)
++        finally:
++            # NOTE(mgoddard): We don't need to remove instance info at this
++            # point since we will have already done it. The destroy will only
++            # succeed if this method returns without error, so we will end up
++            # removing the instance info eventually.
++            self._cleanup_deploy(node, instance, None,
++                                 remove_instance_info=False)
++
++        LOG.info('Successfully unprovisioned Ironic node %s',
++                 node.uuid, instance=instance)
++
++
++    def attach_interface(self, context, instance, image_meta, vif):
++        """Use hotplug to add a network interface to a running instance.
++        The counter action to this is :func:`detach_interface`.
++
++        :param context: The request context.
++        :param nova.objects.instance.Instance instance:
++            The instance which will get an additional network interface.
++        :param nova.objects.ImageMeta image_meta:
++            The metadata of the image of the instance.
++        :param nova.network.model.VIF vif:
++            The object which has the information about the interface to attach.
++        :raise nova.exception.NovaException: If the attach fails.
++        :returns: None
++        """
++        LOG.info('attach_interface vif: {}'.format(vif), instance=instance)
++        if not vif.get('force'):
++            self._check_state_validation(instance)
++        super().attach_interface(context, instance, image_meta, vif)
++
++    def detach_interface(self, context, instance, vif):
++        """Use hotunplug to remove a network interface from a running instance.
++        The counter action to this is :func:`attach_interface`.
++
++        :param context: The request context.
++        :param nova.objects.instance.Instance instance:
++            The instance which gets a network interface removed.
++        :param nova.network.model.VIF vif:
++            The object which has the information about the interface to detach.
++        :raise nova.exception.NovaException: If the detach fails.
++        :returns: None
++        """
++        LOG.info('detach_interface vif: {}'.format(vif), instance=instance)
++        if not vif.get('force'):
++            self._check_state_validation(instance)
++        super().detach_interface(context, instance, vif)
++
++    def _clean_up_volume_target(self, instance, volume_id):
++        try:
++            targets = self.ironicclient.call('node.list_volume_targets',
++                                             instance.node, detail=True)
++            for target in targets:
++                if volume_id == target.volume_id:
++                    volume_target_id = target.uuid
++                    self.ironicclient.call('volume_target.delete',
++                                           volume_target_id)
++                    break
++        except ironic.exc.NotFound:
++            LOG.debug("Volume target information %(target)s of volume "
++                      "%(volume)s is already removed from node %(node)s",
++                      {'target': volume_target_id,
++                       'volume': volume_id,
++                       'node': instance.node},
++                      instance=instance)
++        except ironic.exc.ClientException as e:
++            LOG.warning("Failed to remove volume target information "
++                        "%(target)s of volume %(volume)s from node "
++                        "%(node)s when detach volume from instance: "
++                        "%(reason)s",
++                        {'target': volume_target_id,
++                         'volume': volume_id,
++                         'node': instance.node,
++                         'reason': e},
++                        instance=instance)
++
++    def attach_volume(self, context, connection_info, instance, mountpoint,
++                      disk_bus=None, device_type=None, encryption=None):
++        volume_id = connection_info['volume_id']
++        LOG.info('attach_volume volume_id: %(volume_id)s.',
++                 {'volume_id': volume_id}, instance)
++        self._check_state_validation(instance)
++        if not volume_id:
++            msg = "Failed to attach volume, no volume_id in connection_info."
++            LOG.error(msg, instance)
++            raise exception.VolumeAttachFailed(reason=msg)
++
++        driver_volume_type = connection_info['driver_volume_type']
++        if driver_volume_type != "iscsi":
++            msg = "Invalid driver volume type: {}".format(driver_volume_type)
++            LOG.error(msg, instance)
++            raise exception.VolumeAttachFailed(reason=msg)
++
++        try:
++            target_properties = connection_info['data']
++            self.ironicclient.call('volume_target.create',
++                                   node_uuid=instance.node,
++                                   volume_type=driver_volume_type,
++                                   properties=target_properties,
++                                   boot_index=None,
++                                   volume_id=volume_id)
++        except (ironic.exc.BadRequest, ironic.exc.Conflict):
++            msg = (_("Failed to add volume target information of "
++                     "volume %(volume)s on node %(node)s when "
++                     "attach volume to instance %(instance_uuid)s")
++                   % {'volume': volume_id,
++                      'node': instance.node,
++                      'instance_uuid': instance.uuid})
++            LOG.error(msg, instance=instance)
++            raise exception.VolumeAttachFailed(msg)
++
++        response = self._attach_volume_dpu(
++            instance=instance,
++            connection_info=connection_info
++        )
++        LOG.info('attach_volume response: %(response)s.',
++                 {'response': response}, instance)
++        if int(response.status_code) != 200:
++            self._clean_up_volume_target(instance, volume_id)
++            raise exception.VolumeAttachFailed(volume_id=volume_id,
++                                               reason=response.content)
++
++    def detach_volume(self, context, connection_info, instance, mountpoint,
++                      encryption=None):
++        volume_id = connection_info['volume_id']
++        LOG.info('detach_volume volume_id: %(volume_id)s.',
++                 {'volume_id': volume_id}, instance)
++        self._check_state_validation(instance)
++
++        if not volume_id:
++            msg = "Failed to detach volume, no volume_id in connection_info."
++            LOG.error(msg, instance)
++            raise exception.VolumeDetachFailed(reason=msg)
++
++        driver_volume_type = connection_info['driver_volume_type']
++        if driver_volume_type != "iscsi":
++            msg = "Invalid driver volume type: {}".format(driver_volume_type)
++            LOG.error(msg, instance)
++            raise exception.VolumeDetachFailed(reason=msg)
++
++        self._clean_up_volume_target(instance, volume_id)
++
++        response = self._detach_volumes_dpu(
++            instance=instance,
++            volume_id=volume_id,
++            connection_info=connection_info
++        )
++        LOG.info('detach_volume response: %(response)s.',
++                 {'response': response}, instance)
++        if int(response.status_code) != 200:
++            raise exception.VolumeDetachFailed(volume_id=volume_id,
++                                               reason=response.content)
++
++    def extend_volume(self, connection_info, instance, requested_size):
++        volume_id = connection_info['volume_id']
++        LOG.info('extend_volume volume_id: %(volume_id)s.',
++                 {'volume_id': volume_id}, instance)
++
++        if not volume_id:
++            msg = "Failed to extend volume, no volume_id in connection_info."
++            LOG.error(msg, instance)
++            raise exception.VolumeExtendFailed(reason=msg)
++
++        driver_volume_type = connection_info['driver_volume_type']
++        if driver_volume_type != "iscsi":
++            msg = "Invalid driver volume type: {}".format(driver_volume_type)
++            LOG.error(msg, instance)
++            raise exception.VolumeExtendFailed(reason=msg)
++
++        connection_info['requested_size'] = requested_size
++        response = self._extend_volume_dpu(
++            instance=instance,
++            connection_info=connection_info
++        )
++        LOG.info('extend_volume response: %(response)s.',
++                 {'response': response}, instance)
++        if int(response.status_code) != 200:
++            raise exception.VolumeExtendFailed(volume_id=volume_id,
++                                               reason=response.content)
++
++    def _get_dpu_manager_url(self, instance):
++        node = self._get_node(instance.node)
++        dpu_ip = node.extra.get('dpu_ip')
++        if not netutils.is_valid_ipv4(dpu_ip):
++            raise exception.ValidationError("Invalid dpu manager ip address")
++        manager_url = "http://%(dpu_ip)s:8774" % {'dpu_ip': dpu_ip}
++        LOG.debug('dpu manager url: %(manager_url)s.',
++                 {'manager_url': manager_url})
++        return manager_url
++
++    def _attach_volume_dpu(self, instance, connection_info):
++        manager_url = self._get_dpu_manager_url(instance)
++        apiclient = dpu_api.APIClient(manager_url)
++        data = {
++            "connection_info": connection_info,
++        }
++        response = apiclient.attach_volume_dpu(instance.uuid, data)
++        return response
++
++    def _detach_volumes_dpu(self, instance, volume_id, connection_info):
++        manager_url = self._get_dpu_manager_url(instance)
++        apiclient = dpu_api.APIClient(manager_url)
++        data = {
++            "connection_info": connection_info,
++        }
++        response = apiclient.detach_volume_dpu(instance.uuid, volume_id, data)
++        return response
++
++    def _extend_volume_dpu(self, instance, connection_info):
++        manager_url = self._get_dpu_manager_url(instance)
++        apiclient = dpu_api.APIClient(manager_url)
++        data = {
++            "connection_info": connection_info
++        }
++        response = apiclient.extend_volume_dpu(instance.uuid, data)
++        return response
++
++    def get_host_ip_addr(self):
++        LOG.info('get_host_ip_addr')
++        return CONF.my_ip
++
++    def migrate_disk_and_power_off(self, context, instance, dest,
++                                   flavor, network_info,
++                                   block_device_info=None,
++                                   timeout=0, retry_interval=0):
++        """Transfers the disk of a running instance in multiple phases, turning
++        off the instance before the end.
++
++        :param nova.objects.instance.Instance instance:
++            The instance whose disk should be migrated.
++        :param str dest:
++            The IP address of the destination host.
++        :param nova.objects.flavor.Flavor flavor:
++            The flavor of the instance whose disk get migrated.
++        :param nova.network.model.NetworkInfo network_info:
++            The network information of the given `instance`.
++        :param dict block_device_info:
++            Information about the block devices.
++        :param int timeout:
++            The time in seconds to wait for the guest OS to shutdown.
++        :param int retry_interval:
++            How often to signal guest while waiting for it to shutdown.
++
++        :return: A list of disk information dicts in JSON format.
++        :rtype: str
++        """
++        LOG.info('Starting migrate_disk_and_power_off', instance=instance)
++
++        self.destroy(context, instance, network_info, block_device_info)
++
++        disk_info = []
++        return jsonutils.dumps(disk_info)
++
++    def finish_migration(self, context, migration, instance, disk_info,
++                         network_info, image_meta, resize_instance,
++                         block_device_info=None, power_on=True):
++        """Completes a resize/migration.
++
++        :param context: the context for the migration/resize
++        :param migration: the migrate/resize information
++        :param instance: nova.objects.instance.Instance being migrated/resized
++        :param disk_info: the newly transferred disk information
++        :param network_info: instance network information
++        :param nova.objects.ImageMeta image_meta:
++            The metadata of the image of the instance.
++        :param resize_instance: True if the instance is being resized,
++                                False otherwise
++        :param block_device_info: instance volume block device info
++        :param power_on: True if the instance should be powered on, False
++                         otherwise
++        """
++        LOG.info('Starting finish_migration', instance=instance)
++
++        node_uuid = instance.get('node')
++        LOG.info('node_uuid: {} '.format(node_uuid))
++        if not node_uuid:
++            raise ironic.exc.BadRequest(
++                _("Ironic node uuid not supplied to "
++                  "driver for instance %s.") % instance.uuid)
++
++        node = self._get_node(node_uuid)
++        LOG.debug('finish_migration '
++                  'node.instance_uuid : {}'.format(node.instance_uuid))
++        flavor = instance.flavor
++
++        self._add_instance_info_to_node(node, instance, image_meta, flavor,
++                                        block_device_info=block_device_info)
++
++        try:
++            self._add_volume_target_info(context, instance, block_device_info)
++        except Exception:
++            with excutils.save_and_reraise_exception():
++                LOG.error("Error preparing migrate for instance "
++                          "on baremetal node %(node)s.",
++                          {'node': node_uuid},
++                          instance=instance)
++                self._cleanup_deploy(node, instance)  # do not _unplug_vifs
++
++        # do not handle flavor.ephemeral_gb
++
++        # validate we are ready to do the deploy
++        validate_chk = self.ironicclient.call("node.validate", node_uuid)
++        if (not validate_chk.deploy.get('result') or
++                not validate_chk.power.get('result') or
++                not validate_chk.storage.get('result')):
++            # something is wrong. undo what we have done
++            self._cleanup_deploy(node, instance)  # do not _unplug_vifs
++            raise exception.ValidationError(_(
++                "Ironic node: %(id)s failed to validate."
++                " (deploy: %(deploy)s, power: %(power)s,"
++                " storage: %(storage)s)")
++                % {'id': node.uuid,
++                   'deploy': validate_chk.deploy,
++                   'power': validate_chk.power,
++                   'storage': validate_chk.storage})
++
++        # prepare for the deploy
++        try:
++            self._plug_vifs(node, instance, network_info)
++            self._start_firewall(instance, network_info)
++        except Exception:
++            with excutils.save_and_reraise_exception():
++                LOG.error("Error preparing deploy for instance "
++                          "%(instance)s on baremetal node %(node)s.",
++                          {'instance': instance.uuid,
++                           'node': node_uuid})
++                self._cleanup_deploy(node, instance, network_info)
++
++        # no Config drive
++
++        # trigger the node deploy
++        try:
++            self.ironicclient.call("node.set_provision_state", node_uuid,
++                                   ironic_states.ACTIVE,
++                                   configdrive=None)
++        except Exception as e:
++            with excutils.save_and_reraise_exception():
++                LOG.error("Failed to request Ironic to provision instance "
++                          "%(inst)s: %(reason)s",
++                          {'inst': instance.uuid,
++                           'reason': six.text_type(e)})
++                self._cleanup_deploy(node, instance, network_info)
++
++        LOG.info('finish_migration _wait_for_active ', instance=instance)
++        timer = loopingcall.FixedIntervalLoopingCall(self._wait_for_active,
++                                                     instance)
++        try:
++            timer.start(interval=CONF.ironic.api_retry_interval).wait()
++            LOG.info('Successfully provisioned Ironic node %s',
++                     node.uuid, instance=instance)
++        except Exception:
++            with excutils.save_and_reraise_exception():
++                LOG.error("Error deploying instance %(instance)s on "
++                          "baremetal node %(node)s.",
++                          {'instance': instance.uuid,
++                           'node': node_uuid})
++
++        LOG.info('finish_migration finished successfully', instance=instance)
++
++    def confirm_migration(self, context, migration, instance, network_info):
++        """Confirms a resize/migration, destroying the source VM.
++
++        :param instance: nova.objects.instance.Instance
++        """
++        LOG.info('Starting confirm_migration', instance=instance)
++
++    def finish_revert_migration(self, context, instance, network_info,
++                                migration, block_device_info=None,
++                                power_on=True):
++        """Finish reverting a resize/migration.
++
++        :param context: the context for the finish_revert_migration
++        :param instance: nova.objects.instance.Instance being migrated/resized
++        :param network_info: instance network information
++        :param migration: nova.objects.Migration for the migration
++        :param block_device_info: instance volume block device info
++        :param power_on: True if the instance should be powered on, False
++                         otherwise
++        """
++        LOG.info('Starting finish_revert_migration', instance=instance)
++
++        node_uuid = instance.get('node')
++        LOG.info('node_uuid: {} '.format(node_uuid))
++        if not node_uuid:
++            raise ironic.exc.BadRequest(
++                _("Ironic node uuid not supplied to "
++                  "driver for instance %s.") % instance.uuid)
++
++        node = self._get_node(node_uuid)
++        LOG.debug('finish_revert_migration '
++                  'node.instance_uuid : {}'.format(node.instance_uuid))
++        flavor = instance.flavor
++
++        self._add_instance_info_to_node(node, instance, instance.image_meta,
++                                        flavor,
++                                        block_device_info=block_device_info)
++
++        try:
++            self._add_volume_target_info(context, instance, block_device_info)
++        except Exception:
++            with excutils.save_and_reraise_exception():
++                LOG.error("Error preparing revert migration for instance "
++                          "on baremetal node %(node)s.",
++                          {'node': node_uuid},
++                          instance=instance)
++                self._cleanup_deploy(node, instance)  # do not _unplug_vifs
++
++        # do not handle flavor.ephemeral_gb
++
++        # validate we are ready to do the deploy
++        validate_chk = self.ironicclient.call("node.validate", node_uuid)
++        if (not validate_chk.deploy.get('result') or
++                not validate_chk.power.get('result') or
++                not validate_chk.storage.get('result')):
++            # something is wrong. undo what we have done
++            self._cleanup_deploy(node, instance)  # do not _unplug_vifs
++            raise exception.ValidationError(_(
++                "Ironic node: %(id)s failed to validate."
++                " (deploy: %(deploy)s, power: %(power)s,"
++                " storage: %(storage)s)")
++                % {'id': node.uuid,
++                   'deploy': validate_chk.deploy,
++                   'power': validate_chk.power,
++                   'storage': validate_chk.storage})
++
++        # prepare for the deploy
++        try:
++            self._plug_vifs(node, instance, network_info)
++            self._start_firewall(instance, network_info)
++        except Exception:
++            with excutils.save_and_reraise_exception():
++                LOG.error("Error preparing deploy for instance "
++                          "%(instance)s on baremetal node %(node)s.",
++                          {'instance': instance.uuid,
++                           'node': node_uuid})
++                self._cleanup_deploy(node, instance, network_info)
++
++        # no Config drive
++
++        # trigger the node deploy
++        try:
++            self.ironicclient.call("node.set_provision_state", node_uuid,
++                                   ironic_states.ACTIVE,
++                                   configdrive=None)
++        except Exception as e:
++            with excutils.save_and_reraise_exception():
++                LOG.error("Failed to request Ironic to provision instance "
++                          "%(inst)s: %(reason)s",
++                          {'inst': instance.uuid,
++                           'reason': six.text_type(e)})
++                self._cleanup_deploy(node, instance, network_info)
++
++        LOG.info('finish_revert_migration _wait_for_active ', instance=instance)
++        timer = loopingcall.FixedIntervalLoopingCall(self._wait_for_active,
++                                                     instance)
++        try:
++            timer.start(interval=CONF.ironic.api_retry_interval).wait()
++            LOG.info('Successfully provisioned Ironic node %s',
++                     node.uuid, instance=instance)
++        except Exception:
++            with excutils.save_and_reraise_exception():
++                LOG.error("Error deploying instance %(instance)s on "
++                          "baremetal node %(node)s.",
++                          {'instance': instance.uuid,
++                           'node': node_uuid})
++
++        LOG.info('finish_revert_migration finished successfully',
++                 instance=instance)
+\ No newline at end of file
