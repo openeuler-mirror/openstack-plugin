@@ -1,5 +1,0 @@
----
-features:
-  - |
-    Add ``endpoint add project``, ``endpoint remove project`` and ``endpoint
-    list`` commands to manage endpoint filters in identity v3.

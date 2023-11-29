@@ -1,5 +1,0 @@
-features:
-  - |
-    Add ``security_group`` as a valid ``--type`` value for the
-    ``network rbac create`` and ``network rbac list`` commands.
-

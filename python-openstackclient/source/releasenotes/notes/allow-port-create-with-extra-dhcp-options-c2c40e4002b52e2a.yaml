@@ -1,6 +1,0 @@
----
-features:
-  - |
-    Add ``--extra-dhcp-options`` parameter to the ``port create`` command. The
-    neutronclient ``port-create`` command can accept extra DHCP options, add
-    it to the openstackclient in order to be consistent.

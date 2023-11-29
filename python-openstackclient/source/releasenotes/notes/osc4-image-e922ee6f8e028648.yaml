@@ -1,5 +1,0 @@
----
-upgrade:
-  - |
-    Remove ``image create|set`` option ``--owner``.
-    Use ``--project`` option instead.
