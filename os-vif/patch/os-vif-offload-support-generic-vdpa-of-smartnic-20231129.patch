@@ -1,0 +1,201 @@
+diff --git a/os_vif/objects/vif.py b/os_vif/objects/vif.py
+index 0a71689..28b175f 100644
+--- a/os_vif/objects/vif.py
++++ b/os_vif/objects/vif.py
+@@ -231,6 +231,30 @@ class VIFHostDevice(VIFBase):
+     }
+ 
+ 
++@base.VersionedObjectRegistry.register
++class VIFVDPADevice(VIFBase):
++    """A vdpa-hostdev-style VIF.
++
++    Vdpa-Hostdev-style VIFs provide a guest with special vdpa-generic-vdpa-style VIFs.
++    Contrast this with :class:`~ovs_vif.objects.vif.VIFVDPA`, which allows the guest
++    connect to the VF by vdpa-generic.
++
++    For libvirt drivers, this maps to type='hostdev'
++    """
++
++    # Version 1,0: Initial release
++    VERSION = '1.0'
++
++    fields = {
++        'vif_name': fields.StringField(),
++        'hw_type': fields.StringField(),
++        'pci_id': fields.PCIAddressField(),
++        'n_rxq': fields.StringField(nullable=True),
++        'max_queues': fields.StringField(nullable=True),
++        'if_exists': fields.BooleanField(default=False),
++    }
++
++
+ @base.VersionedObjectRegistry.register
+ class VIFNestedDPDK(VIFBase):
+     """A nested DPDK-style VIF.
+diff --git a/vif_plug_ovs/exception.py b/vif_plug_ovs/exception.py
+index 011ca46..4b7b941 100644
+--- a/vif_plug_ovs/exception.py
++++ b/vif_plug_ovs/exception.py
+@@ -35,3 +35,7 @@ class RepresentorNotFound(osv_exception.ExceptionBase):
+ 
+ class PciDeviceNotFoundById(osv_exception.ExceptionBase):
+     msg_fmt = _("PCI device %(id)s not found")
++
++
++class WrongMaxQueues(osv_exception.ExceptionBase):
++    msg_fmt = _('A port max queue is error %(max_queues)s')
+diff --git a/vif_plug_ovs/ovs.py b/vif_plug_ovs/ovs.py
+index 9516f79..b3ce9e1 100644
+--- a/vif_plug_ovs/ovs.py
++++ b/vif_plug_ovs/ovs.py
+@@ -17,12 +17,14 @@
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
+ 
++import logging
+ import sys
+ 
+ from os_vif.internal.ip.api import ip as ip_lib
+ from os_vif import objects
+ from os_vif import plugin
+ from oslo_config import cfg
++from oslo_concurrency import processutils as putils
+ 
+ from vif_plug_ovs import constants
+ from vif_plug_ovs import exception
+@@ -30,6 +32,7 @@ from vif_plug_ovs import linux_net
+ from vif_plug_ovs.ovsdb import api as ovsdb_api
+ from vif_plug_ovs.ovsdb import ovsdb_lib
+ 
++LOG = logging.getLogger(__name__)
+ 
+ class OvsPlugin(plugin.PluginBase):
+     """An OVS plugin that can setup VIFs in many ways
+@@ -141,6 +144,23 @@ class OvsPlugin(plugin.PluginBase):
+             return vif.network.mtu
+         return self.config.network_device_mtu
+ 
++    def _get_vdpa_port_existence(self, vif):
++        port_name = vif.vif_name
++        port_existence = self.ovsdb.get_ovs_vif_port_existence(port_name)
++        vif.if_exists = port_existence
++
++    def _create_vdpa_vif_port(self, vif, vif_name, instance_info, **kwargs):
++        mtu = self._get_mtu(vif)
++        if self.config.isolate_vif:
++            kwargs['tag'] = constants.DEAD_VLAN
++        self.ovsdb.create_ovs_vdpa_vif_port(
++            vif.network.bridge,
++            vif_name,
++            vif.port_profile.interface_id,
++            vif.address, instance_info.uuid,
++            mtu,
++            **kwargs)
++
+     def _create_vif_port(self, vif, vif_name, instance_info, **kwargs):
+         mtu = self._get_mtu(vif)
+         # NOTE(sean-k-mooney): As part of a partial fix to bug #1734320
+@@ -194,6 +214,27 @@ class OvsPlugin(plugin.PluginBase):
+         self._create_vif_port(
+             vif, vif_name, instance_info, **args)
+ 
++    def _plug_vdpa(self, vif, instance_info):
++        self.ovsdb.ensure_ovs_bridge(
++            vif.network.bridge, self._get_vif_datapath_type(
++                vif, datapath=constants.OVS_DATAPATH_NETDEV))
++        vif_name = OvsPlugin.gen_port_name('vdpa', vif.id)
++
++        args = {}
++        args['interface_type'] = vif.hw_type
++        args['pci_id'] = vif.pci_id
++
++        if vif.max_queues:
++            max_queues = int(vif.max_queues)
++            if max_queues < 1 or max_queues > 32:
++                raise exception.WrongMaxQueues(vif.max_queues)
++            args['max_queues'] = vif.max_queues
++        if vif.n_rxq:
++            args['n_rxq'] = vif.n_rxq
++        self._get_vdpa_port_existence(vif)
++        self._create_vdpa_vif_port(
++            vif, vif_name, instance_info, **args)
++
+     def _plug_bridge(self, vif, instance_info):
+         """Plug using hybrid strategy
+ 
+@@ -297,6 +338,8 @@ class OvsPlugin(plugin.PluginBase):
+             self._plug_vhostuser(vif, instance_info)
+         elif isinstance(vif, objects.vif.VIFHostDevice):
+             self._plug_vf(vif, instance_info)
++        elif isinstance(vif, objects.vif.VIFVDPADevice):
++            self._plug_vdpa(vif, instance_info)
+ 
+     def _unplug_vhostuser(self, vif, instance_info):
+         self.ovsdb.delete_ovs_vif_port(vif.network.bridge,
+@@ -304,6 +347,9 @@ class OvsPlugin(plugin.PluginBase):
+                 constants.OVS_VHOSTUSER_PREFIX,
+                 vif.id))
+ 
++    def _unplug_vdpa(self, vif, instance_info):
++        self.ovsdb.delete_ovs_vif_port(vif.network.bridge, OvsPlugin.gen_port_name('vdpa', vif.id))
++
+     def _unplug_bridge(self, vif, instance_info):
+         """UnPlug using hybrid strategy
+ 
+@@ -372,3 +418,5 @@ class OvsPlugin(plugin.PluginBase):
+             self._unplug_vhostuser(vif, instance_info)
+         elif isinstance(vif, objects.vif.VIFHostDevice):
+             self._unplug_vf(vif)
++        elif isinstance(vif, objects.vif.VIFVDPADevice):
++            self._unplug_vdpa(vif, instance_info)
+diff --git a/vif_plug_ovs/ovsdb/ovsdb_lib.py b/vif_plug_ovs/ovsdb/ovsdb_lib.py
+index 2d5cc15..ae96b81 100644
+--- a/vif_plug_ovs/ovsdb/ovsdb_lib.py
++++ b/vif_plug_ovs/ovsdb/ovsdb_lib.py
+@@ -41,7 +41,8 @@ class BaseOVS(object):
+             return
+         if interface_type not in [
+             constants.OVS_VHOSTUSER_INTERFACE_TYPE,
+-            constants.OVS_VHOSTUSER_CLIENT_INTERFACE_TYPE]:
++            constants.OVS_VHOSTUSER_CLIENT_INTERFACE_TYPE,
++            constants.OVS_DPDK_INTERFACE_TYPE]:
+             if sys.platform != constants.PLATFORM_WIN32:
+                 # Hyper-V with OVS does not support external programming of
+                 # virtual interface MTUs via netsh or other Windows tools.
+@@ -60,6 +61,35 @@ class BaseOVS(object):
+         return self.ovsdb.add_br(bridge, may_exist=True,
+                                  datapath_type=datapath_type).execute()
+ 
++    def get_ovs_vif_port_existence(self, port_name):
++        cmd = self.ovsdb.db_get('Port', port_name, 'name')
++        return bool(cmd.execute(check_error=False, log_errors=False))
++
++    def create_ovs_vdpa_vif_port(self, bridge, dev, iface_id, mac, instance_id, mtu,
++                                 interface_type, pci_id, n_rxq=None, max_queues=None, tag=None):
++        LOG.debug("create vdpa vif port")
++        external_ids = {'iface-id': iface_id,
++                        'iface-status': 'active',
++                        'attached-mac': mac,
++                        'vm-uuid': instance_id}
++        col_values = [('external_ids', external_ids), ('type', interface_type)]
++        if n_rxq:
++            col_values.append(('options', {'n_rxq': n_rxq}))
++        if max_queues:
++            devargs_string = "{PCI_ID},max_queues={MAX_QUEUES_NUM},vf_mac={VF_MAC}".format(
++                PCI_ID=pci_id, MAX_QUEUES_NUM=max_queues, VF_MAC=mac)
++            col_values.append(('options', {'dpdk-devargs': devargs_string}))
++        else:
++            devargs_string = "{PCI_ID},vf_mac={VF_MAC}".format(
++                PCI_ID=pci_id, VF_MAC=mac)
++            col_values.append(('options', {'dpdk-devargs': devargs_string}))
++        if tag:
++            col_values.append(('tag', tag))
++        with self.ovsdb.transaction() as txn:
++            txn.add(self.ovsdb.add_port(bridge, dev))
++            txn.add(self.ovsdb.db_set('Interface', dev, *col_values))
++        self.update_device_mtu(dev, mtu, interface_type=interface_type)
++
+     def create_ovs_vif_port(self, bridge, dev, iface_id, mac, instance_id,
+                             mtu=None, interface_type=None,
+                             vhost_server_path=None, tag=None,
