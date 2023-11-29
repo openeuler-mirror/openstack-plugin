@@ -1,7 +1,0 @@
----
-fixes:
-  - |
-    You can now remove role assignments from keystone that reference non-existent
-    users or groups.
-
-    [Bug `2006635 <https://storyboard.openstack.org/#!/story/2006635>`_]

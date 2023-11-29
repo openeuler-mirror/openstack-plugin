@@ -1,6 +1,0 @@
----
-other:
-  - |
-    The ``configuration show`` command no longer requires authentication.
-    This is useful in debugging cloud configurations, particularly
-    auth configurations.

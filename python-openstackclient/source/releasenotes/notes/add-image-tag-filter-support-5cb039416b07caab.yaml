@@ -1,4 +1,0 @@
----
-features:
-  - |
-    Add ``--tag`` option to ``image list`` command to filter by tag.

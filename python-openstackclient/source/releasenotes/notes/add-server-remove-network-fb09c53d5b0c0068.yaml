@@ -1,5 +1,0 @@
----
-features:
-  - |
-    Add ``server remove network`` command. This command will remove all
-    network ports from the specified network and instance.

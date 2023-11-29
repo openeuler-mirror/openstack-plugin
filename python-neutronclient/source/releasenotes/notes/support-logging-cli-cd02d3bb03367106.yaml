@@ -1,5 +1,0 @@
----
-features:
-  - |
-    CLI support for 'Logging' feature, which enable to collect packet logs
-    for specified resource. Currently, only security-group can be logged.

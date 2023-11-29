@@ -1,5 +1,0 @@
----
-features:
-  - |
-    CLI support for the "VPN as a Service" feature, which is enhanced
-    VPNaaS functionality, as OSC plugin commands.

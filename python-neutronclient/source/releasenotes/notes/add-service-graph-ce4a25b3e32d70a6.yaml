@@ -1,5 +1,0 @@
----
-features:
-  - |
-    Added support for SFC Service Graph resource.
-    Related RFE: https://bugs.launchpad.net/networking-sfc/+bug/1587486.

@@ -1,5 +1,0 @@
----
-fixes:
-  - |
-    Add ``--tag`` support to ``floating ip create|list|set|unset`` commands.
-    [:lpbug:`1750985`]

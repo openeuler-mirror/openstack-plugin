@@ -1,4 +1,0 @@
----
-features:
-  - |
-    Add ``network qos rule type show`` command.
