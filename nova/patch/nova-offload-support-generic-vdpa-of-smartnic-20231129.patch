@@ -1,0 +1,799 @@
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index 6e5d72f..c9a5cff 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -5552,7 +5552,7 @@ class ComputeManager(manager.Manager):
+         instance.system_metadata['shelved_host'] = self.host
+         instance.vm_state = vm_states.SHELVED
+         instance.task_state = None
+-        if CONF.shelved_offload_time == 0:
++        if offload:
+             instance.task_state = task_states.SHELVING_OFFLOADING
+         instance.power_state = self._get_power_state(context, instance)
+         instance.save(expected_task_state=[
+@@ -5677,7 +5677,7 @@ class ComputeManager(manager.Manager):
+         @utils.synchronized(instance.uuid)
+         def do_unshelve_instance():
+             self._unshelve_instance(context, instance, image,
+-                                    filter_properties, node)
++                                    filter_properties, node, request_spec)
+         do_unshelve_instance()
+ 
+     def _unshelve_instance_key_scrub(self, instance):
+@@ -5694,7 +5694,7 @@ class ComputeManager(manager.Manager):
+         instance.update(keys)
+ 
+     def _unshelve_instance(self, context, instance, image, filter_properties,
+-                           node):
++                           node, request_spec):
+         LOG.info('Unshelving', instance=instance)
+         bdms = objects.BlockDeviceMappingList.get_by_instance_uuid(
+                 context, instance.uuid)
+@@ -5727,13 +5727,25 @@ class ComputeManager(manager.Manager):
+                 utils.get_image_from_system_metadata(
+                     instance.system_metadata))
+ 
++        provider_mappings = self._get_request_group_mapping(request_spec)
++
+         try:
+-            self.network_api.setup_instance_network_on_host(context, instance,
+-                                                            self.host)
+-            network_info = self.network_api.get_instance_nw_info(
+-                context, instance)
++            if provider_mappings:
++                self._update_pci_request_spec_with_allocated_interface_name(
++                    context,
++                    instance,
++                    provider_mappings)
++
+             with self.rt.instance_claim(context, instance, node, allocations,
+                                         limits):
++                self.network_api.setup_instance_network_on_host(
++                    context,
++                    instance,
++                    self.host,
++                    provider_mappings=provider_mappings)
++                network_info = self.network_api.get_instance_nw_info(
++                    context, instance)
++
+                 self.driver.spawn(context, instance, image_meta,
+                                   injected_files=[],
+                                   admin_password=None,
+@@ -5744,6 +5756,10 @@ class ComputeManager(manager.Manager):
+             with excutils.save_and_reraise_exception(logger=LOG):
+                 LOG.exception('Instance failed to spawn',
+                               instance=instance)
++                # Set the image_ref back to initial image_ref because instance
++                # object might have been saved with image['id']
++                # https://bugs.lauchpad.net/nova/+bugs/1934094
++                instance.image_ref = shelved_image_ref
+                 # Cleanup allocations created by the scheduler on this host
+                 # since we failed to spawn the instance. We do this both if
+                 # the instance claim failed with ComputeResourcesUnavailable
+@@ -6611,6 +6627,11 @@ class ComputeManager(manager.Manager):
+             # cinder v3 api flow
+             self.volume_api.attachment_delete(context, bdm.attachment_id)
+ 
++    def _unclaim_and_remove_pci_devices(self, context, instance, pci_device):
++        if pci_device:
++            self.rt.unclaim_pci_devices(context, pci_device, instance)
++            instance.remove_pci_device_and_request(pci_device)
++
+     def _deallocate_port_for_instance(self, context, instance, port_id,
+                                       raise_on_failure=False):
+         try:
+@@ -6645,6 +6666,42 @@ class ComputeManager(manager.Manager):
+                                     {'port_id': port_id, 'error': ex},
+                                     instance=instance)
+ 
++    def _claim_pci_device_for_interface_attach(
++            self,
++            context: nova.context.RequestContext,
++            instance: 'objects.Instance',
++            pci_reqs: 'objects.InstancePCIRequests',
++    ):
++        """Claim PCI devices if there are PCI requests
++
++        :param context: nova.context.RequestContext
++        :param instance: the objects.Instance to where the interface is being
++            attached
++        :param pci_reqs: A InstancePCIRequests object describing the
++            needed PCI devices
++        :raises InterfaceAttachPciClaimFailed: if the PCI device claim fails
++        :returns: An objects.PciDevice describing the claimed PCI device for
++            the interface or None if no device is requested
++        """
++
++        if not pci_reqs.requests:
++            return None
++
++        devices = self.rt.claim_pci_devices(context, pci_reqs)
++
++        if not devices:
++            LOG.info('Failed to claim PCI devices during interface attach '
++                     'for PCI request %s', pci_reqs, instance=instance)
++            raise exception.InterfaceAttachPciClaimFailed(
++                instance_uuid=instance.uuid)
++
++        # NOTE(gibi): We assume that maximum one PCI devices is attached per
++        # interface attach request.
++        device = devices[0]
++        instance.pci_devices.objects.append(device)
++
++        return device
++
+     # TODO(mriedem): There are likely race failures which can result in
+     # NotFound and QuotaError exceptions getting traced as well.
+     @messaging.expected_exceptions(
+@@ -6680,9 +6737,50 @@ class ComputeManager(manager.Manager):
+             phase=fields.NotificationPhase.START)
+ 
+         bind_host_id = self.driver.network_binding_host_id(context, instance)
+-        network_info = self.network_api.allocate_port_for_instance(
+-            context, instance, port_id, network_id, requested_ip,
+-            bind_host_id=bind_host_id, tag=tag)
++
++        requested_networks = objects.NetworkRequestList(
++            objects=[
++                objects.NetworkRequest(
++                    network_id=network_id,
++                    port_id=port_id,
++                    address=requested_ip,
++                    tag=tag,
++                )
++            ]
++        )
++
++        if len(requested_networks) != 1:
++            LOG.warning(
++                "Interface attach only supports one interface per attach "
++                "request", instance=instance)
++            raise exception.InterfaceAttachFailed(instance_uuid=instance.uuid)
++
++        pci_reqs = objects.InstancePCIRequests(
++            requests=[], instance_uuid=instance.uuid)
++
++        self.network_api.create_resource_requests(
++            context,
++            requested_networks,
++            pci_reqs)
++
++        try:
++            pci_device = self._claim_pci_device_for_interface_attach(
++                context, instance, pci_reqs)
++        except exception.InterfaceAttachPciClaimFailed:
++            raise exception.InterfaceAttachFailed(
++                instance_uuid=instance.uuid)
++
++        instance.pci_requests.requests.extend(pci_reqs.requests)
++
++        network_info = self.network_api.allocate_for_instance(
++            context,
++            instance,
++            False,
++            requested_networks,
++            bind_host_id=bind_host_id,
++            attach=True,
++        )
++
+         if len(network_info) != 1:
+             LOG.error('allocate_port_for_instance returned %(ports)s '
+                       'ports', {'ports': len(network_info)})
+@@ -6702,6 +6800,7 @@ class ComputeManager(manager.Manager):
+                         {'port_id': port_id, 'msg': ex},
+                         instance=instance)
+             self._deallocate_port_for_instance(context, instance, port_id)
++            self._unclaim_and_remove_pci_devices(context, instance, pci_device)
+ 
+             tb = traceback.format_exc()
+             compute_utils.notify_about_instance_action(
+@@ -6712,6 +6811,10 @@ class ComputeManager(manager.Manager):
+ 
+             raise exception.InterfaceAttachFailed(
+                 instance_uuid=instance.uuid)
++        if pci_device:
++            self.rt.allocate_pci_devices_for_instance(context, instance)
++
++        instance.save()
+ 
+         compute_utils.notify_about_instance_action(
+             context, instance, self.host,
+@@ -6734,6 +6837,24 @@ class ComputeManager(manager.Manager):
+         if condemned is None:
+             raise exception.PortNotFound(_("Port %s is not "
+                                            "attached") % port_id)
++        pci_req = pci_req_module.get_instance_pci_request_from_vif(
++            context, instance, condemned)
++
++        pci_device = None
++        if pci_req:
++            pci_devices = [pci_device
++                           for pci_device in instance.pci_devices.objects
++                           if pci_device.request_id == pci_req.request_id]
++
++            if not pci_devices:
++                LOG.warning(
++                    "Detach interface failed, port_id=%(port_id)s, "
++                    "reason: PCI device not found for PCI request %(pci_req)s",
++                    {'port_id': port_id, 'pci_req': pci_req})
++                raise exception.InterfaceDetachFailed(
++                    instance_uuid=instance.uuid)
++
++            pci_device = pci_devices[0]
+ 
+         compute_utils.notify_about_instance_action(
+             context, instance, self.host,
+@@ -6756,6 +6877,9 @@ class ComputeManager(manager.Manager):
+         else:
+             self._deallocate_port_for_instance(
+                 context, instance, port_id, raise_on_failure=True)
++            self._unclaim_and_remove_pci_devices(context, instance, pci_device)
++
++        instance.save()
+ 
+         compute_utils.notify_about_instance_action(
+             context, instance, self.host,
+diff --git a/nova/compute/resource_tracker.py b/nova/compute/resource_tracker.py
+index b2ba014..4106ed7 100644
+--- a/nova/compute/resource_tracker.py
++++ b/nova/compute/resource_tracker.py
+@@ -1772,6 +1772,18 @@ class ResourceTracker(object):
+         self.pci_tracker.save(context)
+         return result
+ 
++    @utils.synchronized(COMPUTE_RESOURCE_SEMAPHORE, fair=True)
++    def unclaim_pci_devices(self, context, pci_device, instance):
++        """Deallocate PCI devices
++
++        :param context: security context
++        :param pci_device: the objects.PciDevice describing the PCI device to
++            be freed
++        :param instance: the objects.Instance the PCI resources are freed from
++        """
++        self.pci_tracker.free_device(pci_device, instance)
++        self.pci_tracker.save(context)
++
+     @utils.synchronized(COMPUTE_RESOURCE_SEMAPHORE)
+     def allocate_pci_devices_for_instance(self, context, instance):
+         """Allocate instance claimed PCI resources
+diff --git a/nova/exception.py b/nova/exception.py
+index d178034..6ec5f79 100644
+--- a/nova/exception.py
++++ b/nova/exception.py
+@@ -690,6 +690,11 @@ class VolumeBDMPathNotFound(VolumeBDMNotFound):
+     msg_fmt = _("No volume Block Device Mapping at path: %(path)s")
+ 
+ 
++class InterfaceAttachPciClaimFailed():
++    msg_fmt = _("Failed to claim PCI device for %(instance_uuid)s during "
++                "interface attach")
++
++
+ class DeviceDetachFailed(NovaException):
+     msg_fmt = _("Device detach failed for %(device)s: %(reason)s")
+ 
+@@ -2553,3 +2558,8 @@ class GetPMEMNamespaceFailed(NovaException):
+ class VPMEMCleanupFailed(NovaException):
+     msg_fmt = _("Failed to clean up the vpmem backend device %(dev)s: "
+                 "%(error)s")
++
++
++class ProcessExecuteException(Invalid):
++    msg_fmt = _("Run cmd %(cmd)s failed. "
++                "Reason: %(reason)s")
+\ No newline at end of file
+diff --git a/nova/network/model.py b/nova/network/model.py
+index d8119fa..71accf2 100644
+--- a/nova/network/model.py
++++ b/nova/network/model.py
+@@ -104,19 +104,23 @@ VNIC_TYPE_MACVTAP = 'macvtap'
+ VNIC_TYPE_DIRECT_PHYSICAL = 'direct-physical'
+ VNIC_TYPE_BAREMETAL = 'baremetal'
+ VNIC_TYPE_VIRTIO_FORWARDER = 'virtio-forwarder'
++VNIC_TYPE_VDPA = 'vdpa'
+ 
+ # Define list of ports which needs pci request.
+ # Note: The macvtap port needs a PCI request as it is a tap interface
+ # with VF as the lower physical interface.
+ # Note: Currently, VNIC_TYPE_VIRTIO_FORWARDER assumes a 1:1
+ # relationship with a VF. This is expected to change in the future.
+-VNIC_TYPES_SRIOV = (VNIC_TYPE_DIRECT, VNIC_TYPE_MACVTAP,
+-                    VNIC_TYPE_DIRECT_PHYSICAL, VNIC_TYPE_VIRTIO_FORWARDER)
++VNIC_TYPES_SRIOV = (
++    VNIC_TYPE_DIRECT, VNIC_TYPE_MACVTAP, VNIC_TYPE_DIRECT_PHYSICAL,
++    VNIC_TYPE_VIRTIO_FORWARDER, VNIC_TYPE_VDPA
++)
+ 
+ # Define list of ports which are passthrough to the guest
+ # and need a special treatment on snapshot and suspend/resume
+ VNIC_TYPES_DIRECT_PASSTHROUGH = (VNIC_TYPE_DIRECT,
+-                                 VNIC_TYPE_DIRECT_PHYSICAL)
++                                 VNIC_TYPE_DIRECT_PHYSICAL,
++                                 VNIC_TYPE_VDPA)
+ 
+ # Constants for the 'vif_model' values
+ VIF_MODEL_VIRTIO = 'virtio'
+diff --git a/nova/network/neutronv2/api.py b/nova/network/neutronv2/api.py
+index 8f85a74..9162b41 100644
+--- a/nova/network/neutronv2/api.py
++++ b/nova/network/neutronv2/api.py
+@@ -341,32 +341,42 @@ class API(base_api.NetworkAPI):
+                 # the current instance.host.
+                 has_binding_ext = self.supports_port_binding_extension(context)
+                 if port_migrating and has_binding_ext:
+-                    # Attempt to delete all port bindings on the host and raise
+-                    # any errors at the end.
+-                    failed_port_ids = []
+-                    for port in ports:
+-                        # This call is safe in that 404s for non-existing
+-                        # bindings are ignored.
+-                        try:
+-                            self.delete_port_binding(
+-                                context, port['id'], host)
+-                        except exception.PortBindingDeletionFailed:
+-                            # delete_port_binding will log an error for each
+-                            # failure but since we're iterating a list we want
+-                            # to keep track of all failures to build a generic
+-                            # exception to raise
+-                            failed_port_ids.append(port['id'])
+-                    if failed_port_ids:
+-                        msg = (_("Failed to delete binding for port(s) "
+-                                 "%(port_ids)s and host %(host)s.") %
+-                               {'port_ids': ','.join(failed_port_ids),
+-                                'host': host})
+-                        raise exception.PortBindingDeletionFailed(msg)
++                    self._delete_port_bindings(context, ports, host)
+             elif port_migrating:
+                 # Setup the port profile
+                 self._setup_migration_port_profile(
+                     context, instance, host, admin_client, ports)
+ 
++    def _delete_port_bindings(self, context, ports, host):
++        """Attempt to delete all port bindings on the host
++
++        :param context: The user request context.
++        :param ports: list of port dicts to cleanup; the 'id' field is required
++            per port dict in the list
++        :param host: host from which to delete port bindings
++        :raises: PortBindingDeletionFailed if port binding deletion fails.
++        """
++        failed_port_ids = []
++
++        for port in ports:
++            # This call is safe in that 404s for non-existing
++            # bindings are ignored.
++            try:
++                self.delete_port_binding(context, port['id'], host)
++            except exception.PortBindingDeletionFailed:
++                # delete_port_binding will log an error for each
++                # failure but since we're iterating a list we want
++                # to keep track of all failures to build a generic
++                # exception to raise
++                failed_port_ids.append(port['id'])
++
++        if failed_port_ids:
++            msg = (_("Failed to delete binding for port(s) "
++                     "%(port_ids)s and host %(host)s.") %
++                   {'port_ids': ','.join(failed_port_ids),
++                    'host': host})
++            raise exception.PortBindingDeletionFailed(msg)
++
+     def _get_available_networks(self, context, project_id,
+                                 net_ids=None, neutron=None,
+                                 auto_allocate=False):
+@@ -693,10 +703,15 @@ class API(base_api.NetworkAPI):
+                         # SR-IOV port attach is not supported.
+                         vnic_type = port.get('binding:vnic_type',
+                                              network_model.VNIC_TYPE_NORMAL)
++                        profile = port.get('binding:profile', None)
++                        vdpa_type = None
++                        if profile:
++                            vdpa_type = profile.get('vdpa_type', None)
+                         if vnic_type in network_model.VNIC_TYPES_SRIOV:
+-                            raise exception.AttachSRIOVPortNotSupported(
+-                                port_id=port['id'],
+-                                instance_uuid=instance.uuid)
++                            if vdpa_type != 'generic':
++                                raise exception.AttachSRIOVPortNotSupported(
++                                    port_id=port['id'],
++                                    instance_uuid=instance.uuid)
+ 
+                     # If requesting a specific port, automatically process
+                     # the network for that port as if it were explicitly
+@@ -2007,6 +2022,9 @@ class API(base_api.NetworkAPI):
+             requester_id = None
+ 
+             if request_net.port_id:
++                # InstancePCIRequest.requester_id is semantically linked
++                # to a port with a resource_request.
++                requester_id = request_net.port_id
+                 result = self._get_port_vnic_info(
+                     context, neutron, request_net.port_id)
+                 vnic_type, trusted, network_id, resource_request = result
+@@ -2014,9 +2032,6 @@ class API(base_api.NetworkAPI):
+                     context, neutron, network_id)
+ 
+                 if resource_request:
+-                    # InstancePCIRequest.requester_id is semantically linked
+-                    # to a port with a resource_request.
+-                    requester_id = request_net.port_id
+                     # NOTE(gibi): explicitly orphan the RequestGroup by setting
+                     # context=None as we never intended to save it to the DB.
+                     resource_requests.append(
+@@ -3284,10 +3299,10 @@ class API(base_api.NetworkAPI):
+         raise NotImplementedError()
+ 
+     def setup_instance_network_on_host(self, context, instance, host,
+-                                       migration=None):
++                                       migration=None, provider_mappings=None):
+         """Setup network for specified instance on host."""
+         self._update_port_binding_for_instance(context, instance, host,
+-                                               migration)
++                                               migration, provider_mappings)
+ 
+     def cleanup_instance_network_on_host(self, context, instance, host):
+         """Cleanup network for specified instance on host."""
+@@ -3300,6 +3315,38 @@ class API(base_api.NetworkAPI):
+         # device_id field on the port which is not what we'd want for shelve.
+         pass
+ 
++    def _get_port_pci_dev(self, instance, port):
++        """Find the PCI device corresponding to the port.
++        Assumes the port is an SRIOV one.
++
++        :param instance: The instance to which the port is attached.
++        :param port: The Neutron port, as obtained from the Neutron API
++            JSON form.
++        :return: The PciDevice object, or None if unable to find.
++        """
++        # Find the port's PCIRequest, or return None
++        for r in instance.pci_requests.requests:
++            if r.requester_id == port['id']:
++                request = r
++                break
++        else:
++            LOG.debug('No PCI request found for port %s', port['id'],
++                      instance=instance)
++            return None
++        # Find the request's device, or return None
++        for d in instance.pci_devices:
++            if d.request_id == request.request_id:
++                device = d
++                break
++        else:
++            LOG.debug('No PCI device found for request %s',
++                      request.request_id, instance=instance)
++            return None
++
++        LOG.debug('Get the pci device %s corresponding to the port %s',
++                  device, port)
++        return device
++
+     def _get_pci_mapping_for_migration(self, instance, migration):
+         if not instance.migration_context:
+             return {}
+@@ -3350,27 +3397,43 @@ class API(base_api.NetworkAPI):
+             # that this function is called without a migration object, such
+             # as in an unshelve operation.
+             vnic_type = p.get('binding:vnic_type')
+-            if (vnic_type in network_model.VNIC_TYPES_SRIOV and
+-                    migration is not None and
+-                    migration['migration_type'] != constants.LIVE_MIGRATION):
+-                # Note(adrianc): for live migration binding profile was already
+-                # updated in conductor when calling bind_ports_to_host()
+-                if not pci_mapping:
+-                    pci_mapping = self._get_pci_mapping_for_migration(
+-                        instance, migration)
+-
+-                pci_slot = binding_profile.get('pci_slot')
+-                new_dev = pci_mapping.get(pci_slot)
+-                if new_dev:
+-                    binding_profile.update(
+-                        self._get_pci_device_profile(new_dev))
+-                    updates[constants.BINDING_PROFILE] = binding_profile
++            if vnic_type in network_model.VNIC_TYPES_SRIOV:
++                if migration is not None:
++                    if migration['migration_type'] != constants.LIVE_MIGRATION:
++                        # Note(adrianc): for live migration binding profile
++                        # was already updated in conductor when calling
++                        # bind_ports_to_host()
++                        if not pci_mapping:
++                            pci_mapping = self._get_pci_mapping_for_migration(
++                                instance, migration)
++
++                        pci_slot = binding_profile.get('pci_slot')
++                        new_dev = pci_mapping.get(pci_slot)
++                        if new_dev:
++                            binding_profile.update(
++                                self._get_pci_device_profile(new_dev))
++                            updates[constants.BINDING_PROFILE] = binding_profile
++                        else:
++                            raise exception.PortUpdateFailed(port_id=p['id'],
++                                reason=_("Unable to correlate PCI slot %s") %
++                                         pci_slot)
++                # NOTE(artom) If migration is None, this is an unshelve, and we
++                # need to figure out the pci related binding information from
++                # the InstancePCIRequest and PciDevice objects.
+                 else:
+-                    raise exception.PortUpdateFailed(port_id=p['id'],
+-                        reason=_("Unable to correlate PCI slot %s") %
+-                                 pci_slot)
+-
+-            if p.get('resource_request'):
++                    pci_dev = self._get_port_pci_dev(instance, p)
++                    if pci_dev:
++                        binding_profile.update(
++                            self._get_pci_device_profile(pci_dev))
++                        updates[constants.BINDING_PROFILE] = binding_profile
++
++            # NOTE(gibi): during live migration the conductor already sets the
++            # allocation key in the port binding. However during resize, cold
++            # migrate, evacuate and unshelve we have to set the binding here.
++            # Also note that during unshelve no migration object is created.
++            if p.get('resource_request') and (
++                migration is None or not migration.is_live_migration
++            ):
+                 if not provider_mappings:
+                     # TODO(gibi): Remove this check when compute RPC API is
+                     # bumped to 6.0
+diff --git a/nova/network/os_vif_util.py b/nova/network/os_vif_util.py
+index 9b76ef3..c124860 100644
+--- a/nova/network/os_vif_util.py
++++ b/nova/network/os_vif_util.py
+@@ -347,6 +347,9 @@ def _nova_to_osvif_vif_ovs(vif):
+         interface_id=vif.get('ovs_interfaceid') or vif['id'],
+         datapath_type=vif['details'].get(
+             model.VIF_DETAILS_OVS_DATAPATH_TYPE))
++    if vnic_type == model.VNIC_TYPE_VDPA:
++        obj = _get_vnic_vdpa_vif_instance(vif, port_profile=profile, plugin="ovs")
++        return obj
+     if vnic_type == model.VNIC_TYPE_DIRECT:
+         obj = _get_vnic_direct_vif_instance(
+             vif,
+@@ -373,6 +376,31 @@ def _nova_to_osvif_vif_ovs(vif):
+     return obj
+ 
+ 
++def _get_vnic_vdpa_vif_instance(vif, port_profile, plugin, set_bridge=True):
++    vif_name = ('vdpa' + vif['id'])[:model.NIC_NAME_LEN]
++    obj = _get_vif_instance(
++        vif,
++        objects.vif.VIFVDPADevice,
++        port_profile=port_profile,
++        plugin=plugin,
++        pci_id=vif["profile"]["pci_slot"],
++        vif_name=vif_name,
++        hw_type='dpdk',
++        dev_path=None
++    )
++    if set_bridge and vif["network"]["bridge"] is not None:
++        obj.network.bridge = vif["network"]["bridge"]
++
++    max_queues = vif['profile'].get('max_queues', None)
++    obj.max_queues = max_queues
++    n_rxq = vif['profile'].get('n_rxq', None)
++    obj.n_rxq = n_rxq
++
++    dev_path = vif['profile'].get('dev_path', None)
++    obj.dev_path = dev_path
++    return obj
++
++
+ # VIF_TYPE_AGILIO_OVS = 'agilio_ovs'
+ def _nova_to_osvif_vif_agilio_ovs(vif):
+     vnic_type = vif.get('vnic_type', model.VNIC_TYPE_NORMAL)
+diff --git a/nova/objects/fields.py b/nova/objects/fields.py
+index 366a970..5b87b2a 100644
+--- a/nova/objects/fields.py
++++ b/nova/objects/fields.py
+@@ -710,8 +710,9 @@ class PciDeviceType(BaseNovaEnum):
+     STANDARD = "type-PCI"
+     SRIOV_PF = "type-PF"
+     SRIOV_VF = "type-VF"
++    VDPA = "vdpa"
+ 
+-    ALL = (STANDARD, SRIOV_PF, SRIOV_VF)
++    ALL = (STANDARD, SRIOV_PF, SRIOV_VF, VDPA)
+ 
+ 
+ class PCINUMAAffinityPolicy(BaseNovaEnum):
+diff --git a/nova/objects/instance.py b/nova/objects/instance.py
+index ba0ea15..7dbce27 100644
+--- a/nova/objects/instance.py
++++ b/nova/objects/instance.py
+@@ -1207,6 +1207,14 @@ class Instance(base.NovaPersistentObject, base.NovaObject,
+         return objects.BlockDeviceMappingList.get_by_instance_uuid(
+             self._context, self.uuid)
+ 
++    def remove_pci_device_and_request(self, pci_device):
++        """Remove the PciDevice and the related InstancePciRequest"""
++        if pci_device in self.pci_devices.objects:
++            self.pci_devices.objects.remove(pci_device)
++        self.pci_requests.requests = [
++            pci_req for pci_req in self.pci_requests.requests
++            if pci_req.request_id != pci_device.request_id]
++
+ 
+ def _make_instance_list(context, inst_list, db_inst_list, expected_attrs):
+     get_fault = expected_attrs and 'fault' in expected_attrs
+diff --git a/nova/objects/pci_device.py b/nova/objects/pci_device.py
+index 56492a1..551dced 100644
+--- a/nova/objects/pci_device.py
++++ b/nova/objects/pci_device.py
+@@ -95,7 +95,8 @@ class PciDevice(base.NovaPersistentObject, base.NovaObject):
+     # Version 1.4: Added parent_addr field
+     # Version 1.5: Added 2 new device statuses: UNCLAIMABLE and UNAVAILABLE
+     # Version 1.6: Added uuid field
+-    VERSION = '1.6'
++    # Version 1.7: Added 'vdpa' to 'dev_type' field
++    VERSION = '1.7'
+ 
+     fields = {
+         'id': fields.IntegerField(),
+@@ -137,6 +138,13 @@ class PciDevice(base.NovaPersistentObject, base.NovaObject):
+                         status, target_version))
+         if target_version < (1, 6) and 'uuid' in primitive:
+             del primitive['uuid']
++        if target_version < (1, 7) and 'dev_type' in primitive:
++            dev_type = primitive['dev_type']
++            if dev_type == fields.PciDeviceType.VDPA:
++                raise exception.ObjectActionError(
++                    action='obj_make_compatible',
++                    reason='dev_type=%s not supported in version %s' % (
++                        dev_type, target_version))
+ 
+     def update_device(self, dev_dict):
+         """Sync the content from device dictionary to device object.
+@@ -283,7 +291,9 @@ class PciDevice(base.NovaPersistentObject, base.NovaObject):
+             self._bulk_update_status(vfs_list,
+                                            fields.PciDeviceStatus.UNCLAIMABLE)
+ 
+-        elif self.dev_type == fields.PciDeviceType.SRIOV_VF:
++        elif self.dev_type in (
++                fields.PciDeviceType.SRIOV_VF, fields.PciDeviceType.VDPA
++        ):
+             # Update VF status to CLAIMED if it's parent has not been
+             # previously allocated or claimed
+             # When claiming/allocating a VF, it's parent PF becomes
+@@ -343,7 +353,9 @@ class PciDevice(base.NovaPersistentObject, base.NovaObject):
+             self._bulk_update_status(vfs_list,
+                                      fields.PciDeviceStatus.UNAVAILABLE)
+ 
+-        elif (self.dev_type == fields.PciDeviceType.SRIOV_VF):
++        elif self.dev_type in (
++            fields.PciDeviceType.SRIOV_VF, fields.PciDeviceType.VDPA
++        ):
+             parent = self.parent_device
+             if parent:
+                 if parent.status not in parent_ok_statuses:
+@@ -402,7 +414,9 @@ class PciDevice(base.NovaPersistentObject, base.NovaObject):
+             self._bulk_update_status(vfs_list,
+                                      fields.PciDeviceStatus.AVAILABLE)
+             free_devs.extend(vfs_list)
+-        if self.dev_type == fields.PciDeviceType.SRIOV_VF:
++        if self.dev_type in (
++            fields.PciDeviceType.SRIOV_VF, fields.PciDeviceType.VDPA
++        ):
+             # Set PF status to AVAILABLE if all of it's VFs are free
+             parent = self.parent_device
+             if not parent:
+diff --git a/nova/pci/manager.py b/nova/pci/manager.py
+index 05930b0..8554b6f 100644
+--- a/nova/pci/manager.py
++++ b/nova/pci/manager.py
+@@ -152,7 +152,9 @@ class PciDevTracker(object):
+             if dev.dev_type == fields.PciDeviceType.SRIOV_PF:
+                 dev.child_devices = []
+                 parents[dev.address] = dev
+-            elif dev.dev_type == fields.PciDeviceType.SRIOV_VF:
++            elif dev.dev_type in (
++                fields.PciDeviceType.SRIOV_VF, fields.PciDeviceType.VDPA
++            ):
+                 dev.parent_device = parents.get(dev.parent_addr)
+                 if dev.parent_device:
+                     parents[dev.parent_addr].child_devices.append(dev)
+diff --git a/nova/pci/request.py b/nova/pci/request.py
+index 845a3d5..cbfbfd2 100644
+--- a/nova/pci/request.py
++++ b/nova/pci/request.py
+@@ -57,7 +57,8 @@ PCI_TRUSTED_TAG = 'trusted'
+ PCI_DEVICE_TYPE_TAG = 'dev_type'
+ 
+ DEVICE_TYPE_FOR_VNIC_TYPE = {
+-    network_model.VNIC_TYPE_DIRECT_PHYSICAL: obj_fields.PciDeviceType.SRIOV_PF
++    network_model.VNIC_TYPE_DIRECT_PHYSICAL: obj_fields.PciDeviceType.SRIOV_PF,
++    network_model.VNIC_TYPE_VDPA: obj_fields.PciDeviceType.VDPA
+ }
+ 
+ CONF = nova.conf.CONF
+diff --git a/nova/pci/stats.py b/nova/pci/stats.py
+index 0a80ece..44a67df 100644
+--- a/nova/pci/stats.py
++++ b/nova/pci/stats.py
+@@ -15,6 +15,7 @@
+ #    under the License.
+ 
+ import copy
++import typing as ty
+ 
+ from oslo_config import cfg
+ from oslo_log import log as logging
+@@ -31,6 +32,12 @@ CONF = cfg.CONF
+ LOG = logging.getLogger(__name__)
+ 
+ 
++# TODO(stephenfin): We might want to use TypedDict here. Refer to
++# https://mypy.readthedocs.io/en/latest/kinds_of_types.html#typeddict for
++# more information.
++Pool = ty.Dict[str, ty.Any]
++
++
+ class PciDeviceStats(object):
+ 
+     """PCI devices summary information.
+@@ -176,6 +183,32 @@ class PciDeviceStats(object):
+             free_devs.extend(pool['devices'])
+         return free_devs
+ 
++    def _filter_pools_for_unrequested_vdpa_devices(
++        self,
++        pools: ty.List[Pool],
++        request: 'objects.InstancePCIRequest',
++    ) -> ty.List[Pool]:
++        """Filter out pools with VDPA devices, unless these are required.
++
++        This is necessary as vdpa devices require special handling and
++        should not be allocated to generic pci device requests.
++
++        :param pools: A list of PCI device pool dicts
++        :param request: An InstancePCIRequest object describing the type,
++            quantity and required NUMA affinity of device(s) we want.
++        :returns: A list of pools that can be used to support the request if
++            this is possible.
++        """
++        if all(
++            spec.get('dev_type') != fields.PciDeviceType.VDPA
++            for spec in request.spec
++        ):
++            pools = [
++                pool for pool in pools
++                if not pool.get('dev_type') == fields.PciDeviceType.VDPA
++            ]
++        return pools
++
+     def consume_requests(self, pci_requests, numa_cells=None):
+         alloc_devices = []
+         for request in pci_requests:
+@@ -191,6 +224,7 @@ class PciDeviceStats(object):
+                 pools = self._filter_pools_for_numa_cells(
+                     pools, numa_cells, numa_policy, count)
+             pools = self._filter_non_requested_pfs(pools, request)
++            pools = self._filter_pools_for_unrequested_vdpa_devices(pools, request)
+             # Failed to allocate the required number of devices
+             # Return the devices already allocated back to their pools
+             if sum([pool['count'] for pool in pools]) < count:
+@@ -232,7 +266,10 @@ class PciDeviceStats(object):
+             if vfs_list:
+                 for vf in vfs_list:
+                     self.remove_device(vf)
+-        elif pci_dev.dev_type == fields.PciDeviceType.SRIOV_VF:
++        elif pci_dev.dev_type in (
++                fields.PciDeviceType.SRIOV_VF,
++                fields.PciDeviceType.VDPA
++        ):
+             try:
+                 parent = pci_dev.parent_device
+                 # Make sure not to decrease PF pool count if this parent has
+diff --git a/nova/pci/utils.py b/nova/pci/utils.py
+index 5b0a082..6e809c5 100644
+--- a/nova/pci/utils.py
++++ b/nova/pci/utils.py
+@@ -221,6 +221,6 @@ def get_net_name_by_vf_pci_address(vfaddress):
+         return ("net_%(ifname)s_%(mac)s" %
+                 {'ifname': ifname, 'mac': '_'.join(mac)})
+     except Exception:
+-        LOG.warning("No net device was found for VF %(vfaddress)s",
+-                    {'vfaddress': vfaddress})
++        # LOG.warning("No net device was found for VF %(vfaddress)s",
++        #             {'vfaddress': vfaddress})
+         return
