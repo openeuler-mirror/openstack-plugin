@@ -797,3 +797,1066 @@ index 5b0a082..6e809c5 100644
 +        # LOG.warning("No net device was found for VF %(vfaddress)s",
 +        #             {'vfaddress': vfaddress})
          return
+diff --git a/nova/virt/libvirt/config.py b/nova/virt/libvirt/config.py
+index 39c4da8..a9d35d8 100644
+--- a/nova/virt/libvirt/config.py
++++ b/nova/virt/libvirt/config.py
+@@ -2042,6 +2042,35 @@ class LibvirtConfigGuestHostdevPCI(LibvirtConfigGuestHostdev):
+                         self.function = sub.get('function')
+ 
+ 
++class LibvirtConfigGuestVDPAPCI(LibvirtConfigGuestHostdevPCI):
++    def __init__(self, **kwargs):
++        super(LibvirtConfigGuestVDPAPCI, self).\
++                __init__(**kwargs)
++        self.domain = None
++        self.bus = None
++        self.slot = None
++        self.function = None
++        self.source_dev = None
++
++    def format_dom(self):
++        dev = super(LibvirtConfigGuestHostdevPCI, self).format_dom()
++
++        dev.set("type", 'vdpa')
++        dev.append(etree.Element("source", dev=self.source_dev))
++        return dev
++
++    def parse_dom(self, xmldoc):
++        childs = super(LibvirtConfigGuestHostdevPCI, self).parse_dom(xmldoc)
++        for c in childs:
++            if c.tag == "source":
++                for sub in c:
++                    if sub.tag == 'address':
++                        self.domain = sub.get('domain')
++                        self.bus = sub.get('bus')
++                        self.slot = sub.get('slot')
++                        self.function = sub.get('function')
++
++
+ class LibvirtConfigGuestHostdevMDEV(LibvirtConfigGuestHostdev):
+     def __init__(self, **kwargs):
+         super(LibvirtConfigGuestHostdevMDEV, self).__init__(
+@@ -2886,9 +2915,12 @@ class LibvirtConfigNodeDevice(LibvirtConfigObject):
+         super(LibvirtConfigNodeDevice, self).__init__(root_name="device",
+                                                 **kwargs)
+         self.name = None
++        self.path = None
+         self.parent = None
+         self.pci_capability = None
+         self.mdev_information = None
++        self.vdpa_capability = None
++        self.vpd_capability = None
+ 
+     def parse_dom(self, xmldoc):
+         super(LibvirtConfigNodeDevice, self).parse_dom(xmldoc)
+@@ -2896,6 +2928,8 @@ class LibvirtConfigNodeDevice(LibvirtConfigObject):
+         for c in xmldoc:
+             if c.tag == "name":
+                 self.name = c.text
++            elif c.tag == "path":
++                self.path = c.text
+             elif c.tag == "parent":
+                 self.parent = c.text
+             elif c.tag == "capability" and c.get("type") in ['pci', 'net']:
+@@ -2906,6 +2940,23 @@ class LibvirtConfigNodeDevice(LibvirtConfigObject):
+                 mdev_info = LibvirtConfigNodeDeviceMdevInformation()
+                 mdev_info.parse_dom(c)
+                 self.mdev_information = mdev_info
++            elif c.tag == "capability" and c.get("type") in ['vdpa']:
++                vdpa_caps = LibvirtConfigNodeDeviceVDPACap()
++                vdpa_caps.parse_dom(c)
++                self.vdpa_capability = vdpa_caps
++
++
++class LibvirtConfigNodeDeviceVDPACap(LibvirtConfigObject):
++    def __init__(self, **kwargs):
++        super().__init__(
++            root_name="capability", **kwargs)
++        self.dev_path = None
++
++    def parse_dom(self, xmldoc):
++        super().parse_dom(xmldoc)
++        for c in xmldoc:
++            if c.tag == "chardev":
++                self.dev_path = c.text
+ 
+ 
+ class LibvirtConfigNodeDevicePciCap(LibvirtConfigObject):
+@@ -2925,6 +2976,7 @@ class LibvirtConfigNodeDevicePciCap(LibvirtConfigObject):
+         self.numa_node = None
+         self.fun_capability = []
+         self.mdev_capability = []
++        self.vpd_capability = None
+         self.interface = None
+         self.address = None
+         self.link_state = None
+@@ -2967,6 +3019,9 @@ class LibvirtConfigNodeDevicePciCap(LibvirtConfigObject):
+                 mdevcap = LibvirtConfigNodeDeviceMdevCapableSubFunctionCap()
+                 mdevcap.parse_dom(c)
+                 self.mdev_capability.append(mdevcap)
++    def pci_address(self):
++        return "%04x:%02x:%02x.%01x" % (
++            self.domain, self.bus, self.slot, self.function)
+ 
+ 
+ class LibvirtConfigNodeDevicePciSubFunctionCap(LibvirtConfigObject):
+@@ -3026,6 +3081,101 @@ class LibvirtConfigNodeDeviceMdevInformation(LibvirtConfigObject):
+                 self.iommu_group = int(c.get('number'))
+ 
+ 
++class LibvirtConfigNodeDeviceVpdCap(LibvirtConfigObject):
++
++    def __init__(self, **kwargs):
++        super().__init__(
++            root_name="capability", **kwargs)
++        self._card_name = None
++        self._change_level = None
++        self._manufacture_id = None
++        self._part_number = None
++        self._serial_number = None
++        self._asset_tag = None
++        self._ro_vendor_fields = {}
++        self._rw_vendor_fields = {}
++        self._rw_system_fields = {}
++
++    @staticmethod
++    def _process_custom_field(fields_dict, field_element):
++        index = field_element.get('index')
++        if index:
++            fields_dict[index] = field_element.text
++
++    def _parse_ro_fields(self, fields_element):
++        for e in fields_element:
++            if e.tag == 'change_level':
++                self._change_level = e.text
++            elif e.tag == 'manufacture_id':
++                self._manufacture_id = e.text
++            elif e.tag == 'part_number':
++                self._part_number = e.text
++            elif e.tag == 'serial_number':
++                self._serial_number = e.text
++            elif e.tag == 'vendor_field':
++                self._process_custom_field(self._ro_vendor_fields, e)
++
++    def _parse_rw_fields(self, fields_element):
++        for e in fields_element:
++            if e.tag == 'asset_tag':
++                self._asset_tag = e.text
++            elif e.tag == 'vendor_field':
++                self._process_custom_field(self._rw_vendor_fields, e)
++            elif e.tag == 'system_field':
++                self._process_custom_field(self._rw_system_fields, e)
++
++    def parse_dom(self, xmldoc):
++        super(LibvirtConfigNodeDeviceVpdCap, self).parse_dom(xmldoc)
++        for c in xmldoc:
++            if c.tag == "name":
++                self._card_name = c.text
++            if c.tag == "fields":
++                access = c.get('access')
++                if access:
++                    if access == 'readonly':
++                        self._parse_ro_fields(c)
++                    elif access == 'readwrite':
++                        self._parse_rw_fields(c)
++                    else:
++                        continue
++
++    @property
++    def card_name(self):
++        return self._card_name
++
++    @property
++    def change_level(self):
++        return self._change_level
++
++    @property
++    def manufacture_id(self):
++        return self._manufacture_id
++
++    @property
++    def part_number(self):
++        return self._part_number
++
++    @property
++    def card_serial_number(self):
++        return self._serial_number
++
++    @property
++    def asset_tag(self):
++        return self._asset_tag
++
++    @property
++    def ro_vendor_fields(self):
++        return self._ro_vendor_fields
++
++    @property
++    def rw_vendor_fields(self):
++        return self._rw_vendor_fields
++
++    @property
++    def rw_system_fields(self):
++        return self._rw_system_fields
++
++
+ class LibvirtConfigGuestRng(LibvirtConfigGuestDevice):
+ 
+     def __init__(self, **kwargs):
+diff --git a/nova/virt/libvirt/driver.py b/nova/virt/libvirt/driver.py
+index f51463f..3379ace 100644
+--- a/nova/virt/libvirt/driver.py
++++ b/nova/virt/libvirt/driver.py
+@@ -366,7 +366,7 @@ class LibvirtDriver(driver.ComputeDriver):
+             DEFAULT_FIREWALL_DRIVER,
+             host=self._host)
+ 
+-        self.vif_driver = libvirt_vif.LibvirtGenericVIFDriver()
++        self.vif_driver = libvirt_vif.LibvirtGenericVIFDriver(self._host)
+ 
+         # TODO(mriedem): Long-term we should load up the volume drivers on
+         # demand as needed rather than doing this on startup, as there might
+@@ -4145,20 +4145,30 @@ class LibvirtDriver(driver.ComputeDriver):
+                 guest.detach_device(self._get_guest_pci_device(dev), live=True)
+                 # after detachDeviceFlags returned, we should check the dom to
+                 # ensure the detaching is finished
+-                xml = guest.get_xml_desc()
+-                xml_doc = etree.fromstring(xml)
+-                guest_config = vconfig.LibvirtConfigGuest()
+-                guest_config.parse_dom(xml_doc)
+-
+-                for hdev in [d for d in guest_config.devices
+-                    if isinstance(d, vconfig.LibvirtConfigGuestHostdevPCI)]:
+-                    hdbsf = [hdev.domain, hdev.bus, hdev.slot, hdev.function]
+-                    dbsf = pci_utils.parse_address(dev.address)
+-                    if [int(x, 16) for x in hdbsf] ==\
+-                            [int(x, 16) for x in dbsf]:
+-                        raise exception.PciDeviceDetachFailed(reason=
+-                                                              "timeout",
+-                                                              dev=dev)
++                count = 0
++                err_times = 0
++                while count < 30:
++                    xml = guest.get_xml_desc()
++                    xml_doc = etree.fromstring(xml)
++                    guest_config = vconfig.LibvirtConfigGuest()
++                    guest_config.parse_dom(xml_doc)
++                    old_err_times = copy.deepcopy(err_times)
++
++                    for hdev in [d for d in guest_config.devices
++                        if isinstance(d, vconfig.LibvirtConfigGuestHostdevPCI) or
++                            isinstance(d, vconfig.LibvirtConfigGuestHostdevVDPAPCI)]:
++                        hdbsf = [hdev.domain, hdev.bus, hdev.slot, hdev.function]
++                        dbsf = pci_utils.parse_address(dev.address)
++                        if [int(x, 16) for x in hdbsf] ==\
++                                [int(x, 16) for x in dbsf]:
++                            err_times = err_times + 1
++                    if old_err_times == err_times:
++                        break
++                    time.sleep(1)
++                    count = count + 1
++
++                if count == 30:
++                    raise exception.PciDeviceDetachFailed(reason="timeout", dev=dev)
+ 
+         except libvirt.libvirtError as ex:
+             error_code = ex.get_error_code()
+@@ -4196,7 +4206,8 @@ class LibvirtDriver(driver.ComputeDriver):
+         if self._has_direct_passthrough_port(network_info):
+             for vif in network_info:
+                 if (vif['vnic_type'] in
+-                    network_model.VNIC_TYPES_DIRECT_PASSTHROUGH):
++                    network_model.VNIC_TYPES_DIRECT_PASSTHROUGH and
++                    vif['profile'].get('vdpa_type', None) != 'generic'):
+                     cfg = self.vif_driver.get_config(instance,
+                                                      vif,
+                                                      instance.image_meta,
+@@ -4222,7 +4233,8 @@ class LibvirtDriver(driver.ComputeDriver):
+                 for vif in network_info
+                 if (vif['vnic_type'] in
+                     network_model.VNIC_TYPES_DIRECT_PASSTHROUGH and
+-                    vif['profile'].get('pci_slot') is not None)
++                    vif['profile'].get('pci_slot') is not None and
++                    vif['profile'].get('vdpa_type', None) != 'generic')
+             ]
+ 
+             # use detach_pci_devices to avoid failure in case of
+@@ -6782,27 +6794,45 @@ class LibvirtDriver(driver.ComputeDriver):
+         """
+         # Bail early if we know we can't support `listDevices` to avoid
+         # repeated warnings within a periodic task
+-        if not getattr(self, '_list_devices_supported', True):
+-            return jsonutils.dumps([])
++        dev_flags = (
++                libvirt.VIR_CONNECT_LIST_NODE_DEVICES_CAP_NET |
++                libvirt.VIR_CONNECT_LIST_NODE_DEVICES_CAP_PCI_DEV
++        )
+ 
+-        try:
+-            dev_names = self._host.list_pci_devices() or []
+-        except libvirt.libvirtError as ex:
+-            error_code = ex.get_error_code()
+-            if error_code == libvirt.VIR_ERR_NO_SUPPORT:
+-                self._list_devices_supported = False
+-                LOG.warning("URI %(uri)s does not support "
+-                            "listDevices: %(error)s",
+-                            {'uri': self._uri(),
+-                             'error': encodeutils.exception_to_unicode(ex)})
+-                return jsonutils.dumps([])
+-            else:
+-                raise
++        dev_flags |= libvirt.VIR_CONNECT_LIST_NODE_DEVICES_CAP_VDPA
+ 
+-        pci_info = []
+-        for name in dev_names:
+-            pci_info.append(self._get_pcidev_info(name))
++        devices = {
++            dev.name(): dev for dev in
++            self._host.list_all_devices(flags=dev_flags)
++        }
+ 
++        # NOTE(mnaser): The listCaps() function can raise an exception if the
++        #               device disappeared while we're looping, this method
++        #               returns an empty list rather than raising an exception
++        #               which will remove the device for Nova's resource
++        #               tracker, but that is OK since the device disappeared.
++        def _safe_list_caps(dev):
++            try:
++                return dev.listCaps()
++            except libvirt.libvirtError:
++                return []
++
++        net_devs = [
++            dev for dev in devices.values() if "net" in _safe_list_caps(dev)
++        ]
++        vdpa_devs = [
++            dev for dev in devices.values() if "vdpa" in _safe_list_caps(dev)
++        ]
++        pci_devs = {
++            name: dev for name, dev in devices.items()
++            if "pci" in _safe_list_caps(dev)}
++        pci_info = [
++            self._host._get_pcidev_info(
++                name, dev, net_devs,
++                vdpa_devs, list(pci_devs.values())
++            )
++            for name, dev in pci_devs.items()
++        ]
+         return jsonutils.dumps(pci_info)
+ 
+     def _get_mdev_capabilities_for_dev(self, devname, types=None):
+@@ -8587,7 +8617,14 @@ class LibvirtDriver(driver.ComputeDriver):
+             if vif['vnic_type'] in direct_vnics:
+                 LOG.info("Detaching vif %s from instnace "
+                          "%s for live migration", vif['id'], instance.id)
+-                self.detach_interface(context, instance, vif)
++                vdpa_type = vif['profile'].get('vdpa_type', None)
++                if vdpa_type == 'generic':
++                    pci_slot = vif['profile'].get('pci_slot', None)
++                    dev_path = self._host.get_vdpa_device_path(pci_slot)
++                    vif['profile'].update({'dev_path': dev_path})
++                    LOG.warning("Can't detach vif %s during live migration", vif)
++                else:
++                    self.detach_interface(context, instance, vif)
+ 
+     def _live_migration_operation(self, context, instance, dest,
+                                   block_migration, migrate_data, guest,
+@@ -8630,10 +8667,9 @@ class LibvirtDriver(driver.ComputeDriver):
+             migrate_uri = None
+             if ('target_connect_addr' in migrate_data and
+                     migrate_data.target_connect_addr is not None):
+-                dest = migrate_data.target_connect_addr
+                 if (migration_flags &
+                     libvirt.VIR_MIGRATE_TUNNELLED == 0):
+-                    migrate_uri = self._migrate_uri(dest)
++                    migrate_uri = self._migrate_uri(migrate_data.target_connect_addr)
+ 
+             new_xml_str = None
+             if CONF.libvirt.virt_type != "parallels":
+@@ -9144,8 +9180,12 @@ class LibvirtDriver(driver.ComputeDriver):
+                 if vif['vnic_type'] in direct_vnics:
+                     LOG.info("Attaching vif %s to instance %s",
+                              vif['id'], instance.id)
+-                    self.attach_interface(context, instance,
+-                                          instance.image_meta, vif)
++                    vdpa_type = vif['profile'].get('vdpa_type', None)
++                    if vdpa_type == 'generic':
++                        LOG.warning("Can't reattach vif %s during live migration", vif)
++                    else:
++                        self.attach_interface(context, instance,
++                                              instance.image_meta, vif)
+ 
+     def rollback_live_migration_at_source(self, context, instance,
+                                           migrate_data):
+@@ -9217,6 +9257,17 @@ class LibvirtDriver(driver.ComputeDriver):
+                                 instance=instance)
+                     greenthread.sleep(1)
+ 
++    def _update_live_migration_vifs(self, migrate_data):
++        for index in range(len(migrate_data.vifs)):
++            migrate_vif = migrate_data.vifs[index]
++            profile = jsonutils.loads(migrate_vif.profile_json)
++            dev_path = self._host.get_vdpa_device_path(profile['pci_slot'])
++            dev_path_dict = {"dev_path": dev_path}
++            profile.update(dev_path_dict)
++            migrate_vif.profile_json = jsonutils.dumps(profile)
++            migrate_data.vifs[index] = migrate_vif
++        return migrate_data
++
+     def pre_live_migration(self, context, instance, block_device_info,
+                            network_info, disk_info, migrate_data):
+         """Preparation live migration."""
+@@ -9315,6 +9366,8 @@ class LibvirtDriver(driver.ComputeDriver):
+         self._pre_live_migration_plug_vifs(
+             instance, network_info, migrate_data)
+ 
++        migrate_data = self._update_live_migration_vifs(migrate_data)
++
+         # Store server_listen and latest disk device info
+         if not migrate_data:
+             migrate_data = objects.LibvirtLiveMigrateData(bdms=[])
+diff --git a/nova/virt/libvirt/guest.py b/nova/virt/libvirt/guest.py
+index a7fbc50..a606abf 100644
+--- a/nova/virt/libvirt/guest.py
++++ b/nova/virt/libvirt/guest.py
+@@ -234,21 +234,30 @@ class Guest(object):
+         """
+ 
+         if cfg:
+-            interfaces = self.get_all_devices(
+-                vconfig.LibvirtConfigGuestInterface)
+-            for interface in interfaces:
+-                # NOTE(leehom) LibvirtConfigGuestInterface get from domain and
+-                # LibvirtConfigGuestInterface generated by
+-                # nova.virt.libvirt.vif.get_config must be identical.
+-                # NOTE(arches) Skip checking target_dev for vhostuser
+-                # vif type; target_dev is not a valid value for vhostuser.
+-                if (interface.mac_addr == cfg.mac_addr and
+-                        interface.net_type == cfg.net_type and
+-                        interface.source_dev == cfg.source_dev and
+-                        (cfg.net_type == 'vhostuser' or
+-                            interface.target_dev == cfg.target_dev) and
+-                        interface.vhostuser_path == cfg.vhostuser_path):
+-                    return interface
++            if isinstance(cfg, vconfig.LibvirtConfigGuestVDPAPCI):
++                hostdevs = self.get_all_devices(vconfig.LibvirtConfigGuestHostdevPCI)
++                for hostdev in hostdevs:
++                    if (int(hostdev.domain, 16) == int(cfg.domain, 16) and
++                        int(hostdev.bus, 16) == int(cfg.bus, 16) and
++                        int(hostdev.slot, 16) == int(cfg.slot, 16) and
++                        int(hostdev.function, 16) == int(cfg.function, 16)):
++                        return cfg
++            else:
++                interfaces = self.get_all_devices(
++                    vconfig.LibvirtConfigGuestInterface)
++                for interface in interfaces:
++                    # NOTE(leehom) LibvirtConfigGuestInterface get from domain and
++                    # LibvirtConfigGuestInterface generated by
++                    # nova.virt.libvirt.vif.get_config must be identical.
++                    # NOTE(arches) Skip checking target_dev for vhostuser
++                    # vif type; target_dev is not a valid value for vhostuser.
++                    if (interface.mac_addr == cfg.mac_addr and
++                            interface.net_type == cfg.net_type and
++                            interface.source_dev == cfg.source_dev and
++                            (cfg.net_type == 'vhostuser' or
++                                interface.target_dev == cfg.target_dev) and
++                            interface.vhostuser_path == cfg.vhostuser_path):
++                        return interface
+ 
+     def get_vcpus_info(self):
+         """Returns virtual cpus information of guest.
+diff --git a/nova/virt/libvirt/host.py b/nova/virt/libvirt/host.py
+index d8078dd..ccd7851 100644
+--- a/nova/virt/libvirt/host.py
++++ b/nova/virt/libvirt/host.py
+@@ -33,6 +33,7 @@ import operator
+ import os
+ import socket
+ import threading
++import typing as ty
+ import traceback
+ 
+ from eventlet import greenio
+@@ -52,6 +53,8 @@ import nova.conf
+ from nova import context as nova_context
+ from nova import exception
+ from nova.i18n import _
++from nova.objects import fields
++from nova.pci import utils as pci_utils
+ from nova import rpc
+ from nova import utils
+ from nova.virt import event as virtevent
+@@ -1142,6 +1145,337 @@ class Host(object):
+         """
+         return self.get_connection().nodeDeviceLookupByName(name)
+ 
++    def _get_pcinet_info(
++            self,
++            dev: 'libvirt.virNodeDevice',
++            net_devs: ty.List['libvirt.virNodeDevice']
++    ) -> ty.Optional[ty.List[str]]:
++        """Returns a dict of NET device."""
++        net_dev = {dev.parent(): dev for dev in net_devs}.get(dev.name(), None)
++        if net_dev is None:
++            return None
++        xmlstr = net_dev.XMLDesc(0)
++        cfgdev = vconfig.LibvirtConfigNodeDevice()
++        cfgdev.parse_str(xmlstr)
++        return cfgdev.pci_capability.features
++
++    def _get_vf_parent_pci_vpd_info(
++            self,
++            vf_device: 'libvirt.virNodeDevice',
++            parent_pf_name: str,
++            candidate_devs: ty.List['libvirt.virNodeDevice']
++    ) -> ty.Optional[vconfig.LibvirtConfigNodeDeviceVpdCap]:
++        """Returns PCI VPD info of a parent device of a PCI VF.
++
++        :param vf_device: a VF device object to use for lookup.
++        :param str parent_pf_name: parent PF name formatted as pci_dddd_bb_ss_f
++        :param candidate_devs: devices that could be parent devs for the VF.
++        :returns: A VPD capability object of a parent device.
++        """
++        parent_dev = next(
++            (dev for dev in candidate_devs if dev.name() == parent_pf_name),
++            None
++        )
++        if parent_dev is None:
++            return None
++
++        xmlstr = parent_dev.XMLDesc(0)
++        cfgdev = vconfig.LibvirtConfigNodeDevice()
++        cfgdev.parse_str(xmlstr)
++        return cfgdev.pci_capability.vpd_capability
++
++    @staticmethod
++    def _get_vpd_card_serial_number(
++        dev: 'libvirt.virNodeDevice',
++    ) -> ty.Optional[ty.List[str]]:
++        """Returns a card serial number stored in PCI VPD (if present)."""
++        xmlstr = dev.XMLDesc(0)
++        cfgdev = vconfig.LibvirtConfigNodeDevice()
++        cfgdev.parse_str(xmlstr)
++        vpd_cap = cfgdev.pci_capability.vpd_capability
++        if not vpd_cap:
++            return None
++        return vpd_cap.card_serial_number
++
++    def _get_pf_details(self, device: dict, pci_address: str) -> dict:
++        if device.get('dev_type') != fields.PciDeviceType.SRIOV_PF:
++            return {}
++
++        try:
++            return {
++                'mac_address': pci_utils.get_mac_by_pci_address(pci_address)
++            }
++        except exception.PciDeviceNotFoundById:
++            LOG.debug(
++                'Cannot get MAC address of the PF %s. It is probably attached '
++                'to a guest already', pci_address)
++            return {}
++
++    def _get_pcidev_info(
++            self,
++            devname: str,
++            dev: 'libvirt.virNodeDevice',
++            net_devs: ty.List['libvirt.virNodeDevice'],
++            vdpa_devs: ty.List['libvirt.virNodeDevice'],
++            pci_devs: ty.List['libvirt.virNodeDevice'],
++    ) -> ty.Dict[str, ty.Union[str, dict]]:
++        """Returns a dict of PCI device."""
++
++        def _get_device_type(
++                cfgdev: vconfig.LibvirtConfigNodeDevice,
++                pci_address: str,
++                device: 'libvirt.virNodeDevice',
++                net_devs: ty.List['libvirt.virNodeDevice'],
++                vdpa_devs: ty.List['libvirt.virNodeDevice'],
++        ) -> ty.Dict[str, str]:
++            """Get a PCI device's device type.
++
++            An assignable PCI device can be a normal PCI device,
++            a SR-IOV Physical Function (PF), or a SR-IOV Virtual
++            Function (VF).
++            """
++            net_dev_parents = {dev.parent() for dev in net_devs}
++            vdpa_parents = {dev.parent() for dev in vdpa_devs}
++            for fun_cap in cfgdev.pci_capability.fun_capability:
++                if fun_cap.type == 'virt_functions':
++                    return {
++                        'dev_type': fields.PciDeviceType.SRIOV_PF,
++                    }
++                if (
++                        fun_cap.type == 'phys_function' and
++                        len(fun_cap.device_addrs) != 0
++                ):
++                    phys_address = "%04x:%02x:%02x.%01x" % (
++                        fun_cap.device_addrs[0][0],
++                        fun_cap.device_addrs[0][1],
++                        fun_cap.device_addrs[0][2],
++                        fun_cap.device_addrs[0][3])
++                    result = {
++                        'dev_type': fields.PciDeviceType.SRIOV_VF,
++                        'parent_addr': phys_address,
++                    }
++                    parent_ifname = None
++                    # NOTE(sean-k-mooney): if the VF is a parent of a netdev
++                    # the PF should also have a netdev, however on some exotic
++                    # hardware such as Cavium ThunderX this may not be the case
++                    # see bug #1915255 for details. As such we wrap this in a
++                    # try except block.
++                    if device.name() in net_dev_parents:
++                        try:
++                            parent_ifname = (
++                                pci_utils.get_ifname_by_pci_address(
++                                    pci_address, pf_interface=True))
++                            result['parent_ifname'] = parent_ifname
++                        except exception.PciDeviceNotFoundById:
++                            # NOTE(sean-k-mooney): we ignore this error as it
++                            # is expected when the virtual function is not a
++                            # NIC or the VF does not have a parent PF with a
++                            # netdev. We do not log here as this is called
++                            # in a periodic task and that would be noisy at
++                            # debug level.
++                            pass
++                    if device.name() in vdpa_parents:
++                        result['dev_type'] = fields.PciDeviceType.VDPA
++                    return result
++
++            return {'dev_type': fields.PciDeviceType.STANDARD}
++
++        def _get_vpd_details(
++            device_dict: dict,
++            device: 'libvirt.virNodeDevice',
++            pci_devs: ty.List['libvirt.virNodeDevice']
++        ) -> ty.Dict[str, ty.Any]:
++            """Get information from PCI VPD (if present).
++
++            PCI/PCIe devices may include the optional VPD capability. It may
++            contain useful information such as the unique serial number
++            uniquely assigned at a factory.
++
++            If a device is a VF and it does not contain the VPD capability,
++            a parent device's VPD is used (if present) as a fallback to
++            retrieve the unique add-in card number. Whether a VF exposes
++            the VPD capability or not may be controlled via a vendor-specific
++            firmware setting.
++            """
++            vpd_info: ty.Dict[str, ty.Any] = {}
++            # At the time of writing only the serial number had a clear
++            # use-case. However, the set of fields may be extended.
++            card_serial_number = self._get_vpd_card_serial_number(device)
++
++            if (not card_serial_number and
++               device_dict.get('dev_type') == fields.PciDeviceType.SRIOV_VF
++            ):
++                # Format the address of a physical function to use underscores
++                # since that's how Libvirt formats the <name> element content.
++                pf_addr = device_dict.get('parent_addr')
++                if not pf_addr:
++                    LOG.warning("A VF device dict does not have a parent PF "
++                                "address in it which is unexpected. Skipping "
++                                "serial number retrieval")
++                    return vpd_info
++
++                formatted_addr = pf_addr.replace('.', '_').replace(':', '_')
++                vpd_cap = self._get_vf_parent_pci_vpd_info(
++                    device, f'pci_{formatted_addr}', pci_devs)
++                if vpd_cap is not None:
++                    card_serial_number = vpd_cap.card_serial_number
++
++            if card_serial_number:
++                vpd_info = {'card_serial_number': card_serial_number}
++            return vpd_info
++
++        def _get_sriov_netdev_details(
++            device_dict: dict,
++            device: 'libvirt.virNodeDevice',
++        ) -> ty.Dict[str, ty.Dict[str, ty.Any]]:
++            """Get SR-IOV related information"""
++            sriov_info: ty.Dict[str, ty.Any] = {}
++
++            if device_dict.get('dev_type') != fields.PciDeviceType.SRIOV_VF:
++                return sriov_info
++
++            pf_addr = device_dict['parent_addr']
++
++            # A netdev VF may be associated with a PF which does not have a
++            # netdev as described in LP #1915255.
++            try:
++                sriov_info.update({
++                    'pf_mac_address': pci_utils.get_mac_by_pci_address(pf_addr)
++                })
++            except exception.PciDeviceNotFoundById:
++                LOG.debug(f'Could not get a PF mac for {pf_addr}')
++                # For the purposes Nova uses this information currently,
++                # having both a PF MAC and a VF number is needed so we return
++                # an empty dict if a PF MAC is not available.
++                return {}
++
++            vf_num = pci_utils.get_vf_num_by_pci_address(
++                device_dict['address'])
++
++            sriov_info.update({'vf_num': vf_num})
++            return sriov_info
++
++        def _get_device_capabilities(
++            device_dict: dict,
++            device: 'libvirt.virNodeDevice',
++            pci_devs: ty.List['libvirt.virNodeDevice'],
++            net_devs: ty.List['libvirt.virNodeDevice']
++        ) -> ty.Dict[str, ty.Any]:
++            """Get PCI VF device's additional capabilities.
++
++            If a PCI device is a virtual function, this function reads the PCI
++            parent's network capabilities (must be always a NIC device) and
++            appends this information to the device's dictionary.
++            """
++            caps: ty.Dict[str, ty.Any] = {}
++
++            if device_dict.get('dev_type') == fields.PciDeviceType.SRIOV_VF:
++                pcinet_info = self._get_pcinet_info(device, net_devs)
++                if pcinet_info:
++                    caps['network'] = pcinet_info
++                    # Only attempt to get SR-IOV details if a VF is a netdev
++                    # because there are no use cases for other dev types yet.
++                sriov_caps = _get_sriov_netdev_details(device_dict, dev)
++                if sriov_caps:
++                    caps['sriov'] = sriov_caps
++
++            vpd_info = _get_vpd_details(device_dict, device, pci_devs)
++            if vpd_info:
++                caps['vpd'] = vpd_info
++
++            if caps:
++                return {'capabilities': caps}
++
++            return caps
++
++        xmlstr = dev.XMLDesc(0)
++        cfgdev = vconfig.LibvirtConfigNodeDevice()
++        cfgdev.parse_str(xmlstr)
++
++        address = "%04x:%02x:%02x.%1x" % (
++            cfgdev.pci_capability.domain,
++            cfgdev.pci_capability.bus,
++            cfgdev.pci_capability.slot,
++            cfgdev.pci_capability.function)
++
++        device = {
++            "dev_id": cfgdev.name,
++            "address": address,
++            "product_id": "%04x" % cfgdev.pci_capability.product_id,
++            "vendor_id": "%04x" % cfgdev.pci_capability.vendor_id,
++            }
++
++        device["numa_node"] = cfgdev.pci_capability.numa_node
++
++        # requirement by DataBase Model
++        device['label'] = 'label_%(vendor_id)s_%(product_id)s' % device
++        device.update(
++            _get_device_type(cfgdev, address, dev, net_devs, vdpa_devs))
++        device.update(_get_device_capabilities(device, dev,
++                                               pci_devs, net_devs))
++        device.update(self._get_pf_details(device, address))
++        return device
++
++    def get_vdpa_nodedev_by_address(
++        self, pci_address: str,
++    ) -> vconfig.LibvirtConfigNodeDevice:
++        """Finds a vDPA device by the parent VF PCI device address.
++
++        :param pci_address: Parent PCI device address
++        :returns: A libvirt nodedev representing the vDPA device
++        :raises: StopIteration if not found
++        """
++        dev_flags = (
++            libvirt.VIR_CONNECT_LIST_NODE_DEVICES_CAP_VDPA |
++            libvirt.VIR_CONNECT_LIST_NODE_DEVICES_CAP_PCI_DEV
++        )
++        devices = {
++            dev.name(): dev for dev in
++            self.list_all_devices(flags=dev_flags)}
++        vdpa_devs = [
++            dev for dev in devices.values() if "vdpa" in dev.listCaps()]
++        pci_info = [
++            self._get_pcidev_info(name, dev, [], vdpa_devs, []) for name, dev
++            in devices.items() if "pci" in dev.listCaps()]
++        parent_dev = next(
++            dev for dev in pci_info if dev['address'] == pci_address)
++        vdpa_dev = next(
++            dev for dev in vdpa_devs if dev.parent() == parent_dev['dev_id'])
++        xmlstr = vdpa_dev.XMLDesc(0)
++        cfgdev = vconfig.LibvirtConfigNodeDevice()
++        cfgdev.parse_str(xmlstr)
++        return cfgdev
++
++    def get_vdpa_device_path(
++        self, pci_address: str,
++    ) -> str:
++        """Finds a vDPA device path by the parent VF PCI device address.
++
++        :param pci_address: Parent PCI device address
++        :returns: Device path as string
++        :raises: StopIteration if not found
++        """
++        nodedev = self.get_vdpa_nodedev_by_address(pci_address)
++        return nodedev.vdpa_capability.dev_path
++
++    def get_vdpa_device_name(
++        self, pci_address: str,
++    ) -> str:
++        """Finds a vDPA device name by the parent VF PCI device address.
++
++        :param pci_address: Parent PCI device address
++        :returns: Device name as string
++        :raises: StopIteration if not found
++        """
++        nodedev = self.get_vdpa_nodedev_by_address(pci_address)
++        name_idx = nodedev.path.rfind("/")
++
++        if name_idx == -1 or name_idx == len(nodedev.path) - 1:
++            raise exception.InternalError(
++                _("The obtained vdpa path is invalid!")
++            )
++        return nodedev.path[name_idx + 1:]
++
+     def list_pci_devices(self, flags=0):
+         """Lookup pci devices.
+ 
+@@ -1180,6 +1514,20 @@ class Host(object):
+             else:
+                 raise
+ 
++    def list_all_devices(
++            self, flags: int = 0,
++    ) -> ty.List['libvirt.virNodeDevice']:
++        """Lookup devices.
++
++        :param flags: a bitmask of flags to filter the returned devices.
++        :returns: a list of virNodeDevice xml strings.
++        """
++        try:
++            return self.get_connection().listAllDevices(flags) or []
++        except libvirt.libvirtError as ex:
++            LOG.warning(ex)
++            return []
++
+     def compare_cpu(self, xmlDesc, flags=0):
+         """Compares the given CPU description with the host CPU."""
+         return self.get_connection().compareCPU(xmlDesc, flags)
+diff --git a/nova/virt/libvirt/migration.py b/nova/virt/libvirt/migration.py
+index 7b72147..c0a2faa 100644
+--- a/nova/virt/libvirt/migration.py
++++ b/nova/virt/libvirt/migration.py
+@@ -21,6 +21,7 @@ from collections import deque
+ 
+ from lxml import etree
+ from oslo_log import log as logging
++from oslo_serialization import jsonutils
+ 
+ from nova.compute import power_state
+ import nova.conf
+@@ -89,6 +90,7 @@ def get_updated_guest_xml(guest, migrate_data, get_volume_config,
+     xml_doc = _update_memory_backing_xml(xml_doc, migrate_data)
+     if get_vif_config is not None:
+         xml_doc = _update_vif_xml(xml_doc, migrate_data, get_vif_config)
++        xml_doc = _update_generic_vdpa_vif_xml(xml_doc, migrate_data, get_vif_config)
+     if 'dst_numa_info' in migrate_data:
+         xml_doc = _update_numa_xml(xml_doc, migrate_data)
+     return etree.tostring(xml_doc, encoding='unicode')
+@@ -397,6 +399,47 @@ def _update_vif_xml(xml_doc, migrate_data, get_vif_config):
+ 
+     return xml_doc
+ 
++def _update_generic_vdpa_vif_xml(xml_doc, migrate_data, get_vif_config):
++    instance_uuid = xml_doc.findtext('uuid')
++    parser = etree.XMLParser(remove_blank_text=True)
++    hostdev_nodes = xml_doc.findall('./devices/hostdev')
++    if hostdev_nodes is None:
++        return xml_doc
++
++    migrate_vif_by_pci = {vif.source_vif['profile'].get('dev_path'): vif
++                        for vif in migrate_data.vifs}
++    for host_dev in hostdev_nodes:
++        dev_type = host_dev.get('type')
++        if dev_type != 'vdpa':
++            continue
++        source = host_dev.find('source')
++
++        if source is not None:
++            source_dev = source.get('dev')
++            migrate_vif = migrate_vif_by_pci[source_dev]
++            vif = migrate_vif.get_dest_vif()
++            vif_config = get_vif_config(vif=vif)
++        else:
++            # This shouldn't happen but if it does, we need to abort the
++            # migration.
++            raise exception.NovaException(
++                'Unable to find vdpa_vif in hostdev XML for '
++                'instance %s: %s' % (
++                    instance_uuid,
++                    etree.tostring(host_dev, encoding='unicode')))
++
++        conf_xml = vif_config.to_xml()
++        LOG.debug('Updating guest XML with vif config: %s', conf_xml,
++                  instance_uuid=instance_uuid)
++        dest_hostdev_elem = etree.XML(conf_xml, parser)
++        host_dev.clear()
++        # Insert attributes.
++        for attr_name, attr_value in dest_hostdev_elem.items():
++            host_dev.set(attr_name, attr_value)
++        # Insert sub-elements.
++        for index, dest_interface_subelem in enumerate(dest_hostdev_elem):
++            host_dev.insert(index, dest_interface_subelem)
++    return xml_doc
+ 
+ def find_job_type(guest, instance, logging_ok=True):
+     """Determine the (likely) current migration job type
+diff --git a/nova/virt/libvirt/vif.py b/nova/virt/libvirt/vif.py
+index c03548d..a985cf7 100644
+--- a/nova/virt/libvirt/vif.py
++++ b/nova/virt/libvirt/vif.py
+@@ -19,6 +19,7 @@
+ """VIF drivers for libvirt."""
+ 
+ import os
++import typing as ty
+ 
+ import os_vif
+ from os_vif import exception as osv_exception
+@@ -41,6 +42,7 @@ from nova import profiler
+ from nova import utils
+ from nova.virt.libvirt import config as vconfig
+ from nova.virt.libvirt import designer
++from nova.virt.libvirt import host as libvirt_host
+ from nova.virt.libvirt import utils as libvirt_utils
+ from nova.virt import osinfo
+ 
+@@ -60,6 +62,20 @@ MIN_LIBVIRT_TX_QUEUE_SIZE = (3, 7, 0)
+ MIN_QEMU_TX_QUEUE_SIZE = (2, 10, 0)
+ 
+ 
++def execute(*cmd, **kwargs):
++    return processutils.execute(*cmd, **kwargs)
++
++def _run_cmd_by_root(cmd):
++    try:
++        root_helper = utils.get_root_helper()
++        return execute(*cmd, root_helper=root_helper, run_as_root=True)
++    except processutils.ProcessExecutionError as e:
++        reason = _('Please check the cmd, an unexpected exception occurs because {}'.format(e))
++        raise exception.ProcessExecuteException(
++            cmd=' '.join(cmd),
++            reason=reason
++        )
++
+ def is_vif_model_valid_for_virt(virt_type, vif_model):
+     valid_models = {
+         'qemu': [network_model.VIF_MODEL_VIRTIO,
+@@ -121,6 +137,10 @@ def set_vf_interface_vlan(pci_addr, mac_addr, vlan=0):
+ class LibvirtGenericVIFDriver(object):
+     """Generic VIF driver for libvirt networking."""
+ 
++    def __init__(self, host: libvirt_host.Host = None):
++        super().__init__()
++        self.host = host
++
+     def get_vif_devname(self, vif):
+         if 'devname' in vif:
+             return vif['devname']
+@@ -512,6 +532,22 @@ class LibvirtGenericVIFDriver(object):
+         designer.set_vif_host_backend_vhostuser_config(
+             conf, vif.mode, vif.path, rx_queue_size, tx_queue_size)
+ 
++    def _set_config_VIFVDPADevice(self, instance, vif, conf, host=None):
++        dev_path = vif.dev_path
++        if not dev_path:
++            dev_path = self._get_vdpa_dev_path(vif.pci_id)
++
++        dbsf = pci_utils.parse_address(vif.pci_id)
++        conf.domain, conf.bus, conf.slot, conf.function = dbsf
++        conf.source_dev = dev_path
++        vif.dev_path = dev_path
++
++        # only kvm support managed mode
++        if CONF.libvirt.virt_type in ('xen', 'parallels',):
++            conf.managed = 'no'
++        if CONF.libvirt.virt_type in ('kvm', 'qemu'):
++            conf.managed = 'yes'
++
+     def _set_config_VIFHostDevice(self, instance, vif, conf, host=None):
+         if vif.dev_type == osv_fields.VIFHostDeviceDevType.ETHERNET:
+             # This sets the required fields for an <interface type='hostdev'>
+@@ -542,6 +578,36 @@ class LibvirtGenericVIFDriver(object):
+             raise exception.InternalError(
+                 _('Unsupported VIF port profile type %s') % profile_name)
+ 
++    def _get_vdpa_dev_path(self, pci_address: ty.Text) -> ty.Text:
++        if self.host is not None:
++            return self.host.get_vdpa_device_path(pci_address)
++        # TODO(sean-k-mooney) this should never be raised remove when host
++        # is not optional in __init__.
++        raise TypeError("self.host must set to use this function.")
++
++    def _get_vdpa_dev_name(self, pci_address: ty.Text) -> ty.Text:
++        if self.host is not None:
++            return self.host.get_vdpa_device_name(pci_address)
++        raise TypeError("self.host must set to use this function.")
++
++    def _delete_vdpa_vif_dev(self, vdpa_name):
++        delete_vdpa_cmd = ['vdpa', 'dev', 'del', vdpa_name]
++        _run_cmd_by_root(delete_vdpa_cmd)
++
++    def _recreate_vdpa_vif_dev(self, vdpa_name, pci_id):
++        create_vdpa_cmd = ['vdpa', 'dev', 'add', 'name', vdpa_name,
++                           'mgmtdev', 'pci/%s' % pci_id]
++        _run_cmd_by_root(create_vdpa_cmd)
++
++    def _update_vdpa_device(self, vif):
++        if vif.if_exists:
++            return
++
++        LOG.debug("Update the max_queue of vDPA")
++        vdpa_name = self._get_vdpa_dev_name(vif.pci_id)
++        self._delete_vdpa_vif_dev(vdpa_name)
++        self._recreate_vdpa_vif_dev(vdpa_name, vif.pci_id)
++
+     def _get_config_os_vif(self, instance, vif, image_meta, inst_type,
+                            virt_type, host, vnic_type):
+         """Get the domain config for a VIF
+@@ -558,9 +624,12 @@ class LibvirtGenericVIFDriver(object):
+         """
+ 
+         # Do the config that's common to all vif types
+-        conf = self.get_base_config(instance, vif.address, image_meta,
+-                                    inst_type, virt_type, vnic_type,
+-                                    host)
++        if isinstance(vif, osv_vifs.VIFVDPADevice):
++            conf = vconfig.LibvirtConfigGuestVDPAPCI()
++        else:
++            conf = self.get_base_config(instance, vif.address, image_meta,
++                                        inst_type, virt_type, vnic_type,
++                                        host)
+ 
+         # Do the VIF type specific config
+         if isinstance(vif, osv_vifs.VIFGeneric):
+@@ -573,6 +642,9 @@ class LibvirtGenericVIFDriver(object):
+             self._set_config_VIFVHostUser(instance, vif, conf, host)
+         elif isinstance(vif, osv_vifs.VIFHostDevice):
+             self._set_config_VIFHostDevice(instance, vif, conf, host)
++        elif isinstance(vif, osv_vifs.VIFVDPADevice):
++            self._set_config_VIFVDPADevice(instance, vif, conf, host)
++            return conf
+         else:
+             raise exception.InternalError(
+                 _("Unsupported VIF type %s") % vif.obj_name())
+@@ -758,6 +830,8 @@ class LibvirtGenericVIFDriver(object):
+         vif_obj = os_vif_util.nova_to_osvif_vif(vif)
+         if vif_obj is not None:
+             self._plug_os_vif(instance, vif_obj)
++            if isinstance(vif_obj, osv_vifs.VIFVDPADevice):
++                self._update_vdpa_device(vif_obj)
+             return
+ 
+         # Legacy non-os-vif codepath
