@@ -1,7 +1,7 @@
-diff --git a/tools/nova/nova-20.6.1/nova/compute/manager.py b/tools/nova/nova-20.6.1/nova/compute/manager.py
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
 index 6e5d72f..47f66a6 100644
---- a/tools/nova/nova-20.6.1/nova/compute/manager.py
-+++ b/tools/nova/nova-20.6.1/nova/compute/manager.py
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
 @@ -1084,21 +1084,7 @@ class ComputeManager(manager.Manager):
              return
  
@@ -98,10 +98,10 @@ index 6e5d72f..47f66a6 100644
                  try:
                      self.driver.detach_interface(context, instance, vif)
                  except NotImplementedError:
-diff --git a/tools/nova/nova-20.6.1/nova/exception.py b/tools/nova/nova-20.6.1/nova/exception.py
+diff --git a/nova/exception.py b/nova/exception.py
 index d178034..5e7aba8 100644
---- a/tools/nova/nova-20.6.1/nova/exception.py
-+++ b/tools/nova/nova-20.6.1/nova/exception.py
+--- a/nova/exception.py
++++ b/nova/exception.py
 @@ -277,6 +277,11 @@ class VolumeDetachFailed(Invalid):
                  "Reason: %(reason)s")
  
@@ -114,10 +114,10 @@ index d178034..5e7aba8 100644
  class MultiattachNotSupportedByVirtDriver(NovaException):
      # This exception indicates the compute hosting the instance does not
      # support multiattach volumes. This should generally be considered a
-diff --git a/tools/nova/nova-20.6.1/nova/virt/ironic/__init__.py b/tools/nova/nova-20.6.1/nova/virt/ironic/__init__.py
+diff --git a/nova/virt/ironic/__init__.py b/nova/virt/ironic/__init__.py
 index e37d322..a6f3004 100644
---- a/tools/nova/nova-20.6.1/nova/virt/ironic/__init__.py
-+++ b/tools/nova/nova-20.6.1/nova/virt/ironic/__init__.py
+--- a/nova/virt/ironic/__init__.py
++++ b/nova/virt/ironic/__init__.py
 @@ -14,5 +14,7 @@
  # under the License.
  
@@ -126,12 +126,12 @@ index e37d322..a6f3004 100644
  
  IronicDriver = driver.IronicDriver
 +DPUIronicDriver = dpu_driver.DPUIronicDriver
-diff --git a/tools/nova/nova-20.6.1/nova/virt/ironic/dpu_api.py b/tools/nova/nova-20.6.1/nova/virt/ironic/dpu_api.py
+diff --git a/nova/virt/ironic/dpu_api.py b/nova/virt/ironic/dpu_api.py
 new file mode 100644
-index 0000000..f4fd3b6
+index 0000000..78c6224
 --- /dev/null
-+++ b/tools/nova/nova-20.6.1/nova/virt/ironic/dpu_api.py
-@@ -0,0 +1,158 @@
++++ b/nova/virt/ironic/dpu_api.py
+@@ -0,0 +1,159 @@
 +# Copyright 2023 Huawei Technology corp.
 +#
 +# Licensed under the Apache License, Version 2.0 (the "License");
@@ -233,6 +233,7 @@ index 0000000..f4fd3b6
 +                                            cert=None)
 +            self.token_update_time = time.time()
 +            self.token = response.headers['X-Subject-Token']
++            LOG.debug('get token success')
 +        return self.token
 +
 +    def _request(self, method, path, data=None, headers=None, **kwargs):
@@ -290,12 +291,12 @@ index 0000000..f4fd3b6
 +
 +        # Got valid content
 +        return response
-diff --git a/tools/nova/nova-20.6.1/nova/virt/ironic/dpu_driver.py b/tools/nova/nova-20.6.1/nova/virt/ironic/dpu_driver.py
+diff --git a/nova/virt/ironic/dpu_driver.py b/nova/virt/ironic/dpu_driver.py
 new file mode 100644
-index 0000000..1896cdc
+index 0000000..c3785e2
 --- /dev/null
-+++ b/tools/nova/nova-20.6.1/nova/virt/ironic/dpu_driver.py
-@@ -0,0 +1,664 @@
++++ b/nova/virt/ironic/dpu_driver.py
+@@ -0,0 +1,665 @@
 +# Copyright 2023 Huawei Technology corp.
 +#
 +#    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -310,6 +311,7 @@ index 0000000..1896cdc
 +#    License for the specific language governing permissions and limitations
 +#    under the License.
 +
++import requests
 +import time
 +
 +from oslo_log import log as logging
@@ -378,7 +380,7 @@ index 0000000..1896cdc
 +        if instance.task_state == None and \
 +                instance.vm_state != vm_states.ACTIVE:
 +            msg = ("check state validation failed instance vmstatus {} instance"
-+                  " task status {}".format(instance.vm_state,
++                   " task status {}".format(instance.vm_state,
 +                                           instance.task_state))
 +            LOG.warning(msg, instance=instance)
 +            raise exception.ValidationError(msg)
@@ -503,7 +505,6 @@ index 0000000..1896cdc
 +        LOG.info('Successfully unprovisioned Ironic node %s',
 +                 node.uuid, instance=instance)
 +
-+
 +    def attach_interface(self, context, instance, image_meta, vif):
 +        """Use hotplug to add a network interface to a running instance.
 +        The counter action to this is :func:`detach_interface`.
@@ -550,20 +551,22 @@ index 0000000..1896cdc
 +                    self.ironicclient.call('volume_target.delete',
 +                                           volume_target_id)
 +                    break
++            else:
++                LOG.warning("Can't find volume target of volume %(volume)s "
++                            "from list_volume_targets. node %(node)s",
++                            {'volume': volume_id,
++                             'node': instance.node},
++                            instance=instance)
 +        except ironic.exc.NotFound:
-+            LOG.debug("Volume target information %(target)s of volume "
-+                      "%(volume)s is already removed from node %(node)s",
-+                      {'target': volume_target_id,
-+                       'volume': volume_id,
-+                       'node': instance.node},
-+                      instance=instance)
++            LOG.warning("Can't find volume target of volume %(volume)s on "
++                        "node %(node)s",
++                        {'volume': volume_id,
++                         'node': instance.node},
++                        instance=instance)
 +        except ironic.exc.ClientException as e:
-+            LOG.warning("Failed to remove volume target information "
-+                        "%(target)s of volume %(volume)s from node "
-+                        "%(node)s when detach volume from instance: "
-+                        "%(reason)s",
-+                        {'target': volume_target_id,
-+                         'volume': volume_id,
++            LOG.warning("Error deleting volume target of volume %(volume)s on "
++                        "node %(node)s. reason: %(reason)s",
++                        {'volume': volume_id,
 +                         'node': instance.node,
 +                         'reason': e},
 +                        instance=instance)
@@ -572,17 +575,17 @@ index 0000000..1896cdc
 +                      disk_bus=None, device_type=None, encryption=None):
 +        volume_id = connection_info['volume_id']
 +        LOG.info('attach_volume volume_id: %(volume_id)s.',
-+                 {'volume_id': volume_id}, instance)
++                 {'volume_id': volume_id}, instance=instance)
 +        self._check_state_validation(instance)
 +        if not volume_id:
 +            msg = "Failed to attach volume, no volume_id in connection_info."
-+            LOG.error(msg, instance)
++            LOG.error(msg, instance=instance)
 +            raise exception.VolumeAttachFailed(reason=msg)
 +
 +        driver_volume_type = connection_info['driver_volume_type']
 +        if driver_volume_type != "iscsi":
 +            msg = "Invalid driver volume type: {}".format(driver_volume_type)
-+            LOG.error(msg, instance)
++            LOG.error(msg, instance=instance)
 +            raise exception.VolumeAttachFailed(reason=msg)
 +
 +        try:
@@ -596,10 +599,9 @@ index 0000000..1896cdc
 +        except (ironic.exc.BadRequest, ironic.exc.Conflict):
 +            msg = (_("Failed to add volume target information of "
 +                     "volume %(volume)s on node %(node)s when "
-+                     "attach volume to instance %(instance_uuid)s")
++                     "attaching volume to the instance")
 +                   % {'volume': volume_id,
-+                      'node': instance.node,
-+                      'instance_uuid': instance.uuid})
++                      'node': instance.node})
 +            LOG.error(msg, instance=instance)
 +            raise exception.VolumeAttachFailed(msg)
 +
@@ -608,8 +610,8 @@ index 0000000..1896cdc
 +            connection_info=connection_info
 +        )
 +        LOG.info('attach_volume response: %(response)s.',
-+                 {'response': response}, instance)
-+        if int(response.status_code) != 200:
++                 {'response': response}, instance=instance)
++        if response.status_code != requests.codes.OK:
 +            self._clean_up_volume_target(instance, volume_id)
 +            raise exception.VolumeAttachFailed(volume_id=volume_id,
 +                                               reason=response.content)
@@ -618,21 +620,19 @@ index 0000000..1896cdc
 +                      encryption=None):
 +        volume_id = connection_info['volume_id']
 +        LOG.info('detach_volume volume_id: %(volume_id)s.',
-+                 {'volume_id': volume_id}, instance)
++                 {'volume_id': volume_id}, instance=instance)
 +        self._check_state_validation(instance)
 +
 +        if not volume_id:
 +            msg = "Failed to detach volume, no volume_id in connection_info."
-+            LOG.error(msg, instance)
++            LOG.error(msg, instance=instance)
 +            raise exception.VolumeDetachFailed(reason=msg)
 +
 +        driver_volume_type = connection_info['driver_volume_type']
 +        if driver_volume_type != "iscsi":
 +            msg = "Invalid driver volume type: {}".format(driver_volume_type)
-+            LOG.error(msg, instance)
++            LOG.error(msg, instance=instance)
 +            raise exception.VolumeDetachFailed(reason=msg)
-+
-+        self._clean_up_volume_target(instance, volume_id)
 +
 +        response = self._detach_volumes_dpu(
 +            instance=instance,
@@ -640,25 +640,27 @@ index 0000000..1896cdc
 +            connection_info=connection_info
 +        )
 +        LOG.info('detach_volume response: %(response)s.',
-+                 {'response': response}, instance)
-+        if int(response.status_code) != 200:
++                 {'response': response}, instance=instance)
++        if response.status_code != requests.codes.OK:
 +            raise exception.VolumeDetachFailed(volume_id=volume_id,
 +                                               reason=response.content)
++
++        self._clean_up_volume_target(instance, volume_id)
 +
 +    def extend_volume(self, connection_info, instance, requested_size):
 +        volume_id = connection_info['volume_id']
 +        LOG.info('extend_volume volume_id: %(volume_id)s.',
-+                 {'volume_id': volume_id}, instance)
++                 {'volume_id': volume_id}, instance=instance)
 +
 +        if not volume_id:
 +            msg = "Failed to extend volume, no volume_id in connection_info."
-+            LOG.error(msg, instance)
++            LOG.error(msg, instance=instance)
 +            raise exception.VolumeExtendFailed(reason=msg)
 +
 +        driver_volume_type = connection_info['driver_volume_type']
 +        if driver_volume_type != "iscsi":
 +            msg = "Invalid driver volume type: {}".format(driver_volume_type)
-+            LOG.error(msg, instance)
++            LOG.error(msg, instance=instance)
 +            raise exception.VolumeExtendFailed(reason=msg)
 +
 +        connection_info['requested_size'] = requested_size
@@ -667,8 +669,8 @@ index 0000000..1896cdc
 +            connection_info=connection_info
 +        )
 +        LOG.info('extend_volume response: %(response)s.',
-+                 {'response': response}, instance)
-+        if int(response.status_code) != 200:
++                 {'response': response}, instance=instance)
++        if response.status_code != requests.codes.OK:
 +            raise exception.VolumeExtendFailed(volume_id=volume_id,
 +                                               reason=response.content)
 +
@@ -679,7 +681,7 @@ index 0000000..1896cdc
 +            raise exception.ValidationError("Invalid dpu manager ip address")
 +        manager_url = "http://%(dpu_ip)s:8774" % {'dpu_ip': dpu_ip}
 +        LOG.debug('dpu manager url: %(manager_url)s.',
-+                 {'manager_url': manager_url})
++                  {'manager_url': manager_url})
 +        return manager_url
 +
 +    def _attach_volume_dpu(self, instance, connection_info):
@@ -738,7 +740,7 @@ index 0000000..1896cdc
 +        :return: A list of disk information dicts in JSON format.
 +        :rtype: str
 +        """
-+        LOG.info('Starting migrate_disk_and_power_off', instance=instance)
++        LOG.info('Migrate disk and power off', instance=instance)
 +
 +        self.destroy(context, instance, network_info, block_device_info)
 +
@@ -763,7 +765,7 @@ index 0000000..1896cdc
 +        :param power_on: True if the instance should be powered on, False
 +                         otherwise
 +        """
-+        LOG.info('Starting finish_migration', instance=instance)
++        LOG.info('Finish migration', instance=instance)
 +
 +        node_uuid = instance.get('node')
 +        LOG.info('node_uuid: {} '.format(node_uuid))
@@ -856,7 +858,7 @@ index 0000000..1896cdc
 +
 +        :param instance: nova.objects.instance.Instance
 +        """
-+        LOG.info('Starting confirm_migration', instance=instance)
++        LOG.info('Confirm migration', instance=instance)
 +
 +    def finish_revert_migration(self, context, instance, network_info,
 +                                migration, block_device_info=None,
@@ -871,7 +873,7 @@ index 0000000..1896cdc
 +        :param power_on: True if the instance should be powered on, False
 +                         otherwise
 +        """
-+        LOG.info('Starting finish_revert_migration', instance=instance)
++        LOG.info('Finish revert migration', instance=instance)
 +
 +        node_uuid = instance.get('node')
 +        LOG.info('node_uuid: {} '.format(node_uuid))
@@ -960,4 +962,3 @@ index 0000000..1896cdc
 +
 +        LOG.info('finish_revert_migration finished successfully',
 +                 instance=instance)
-\ No newline at end of file

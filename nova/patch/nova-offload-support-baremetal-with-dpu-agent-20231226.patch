@@ -1,0 +1,938 @@
+diff --git a/nova/api/openstack/compute/dpu.py b/nova/api/openstack/compute/dpu.py
+new file mode 100644
+index 0000000..3472359
+--- /dev/null
++++ b/nova/api/openstack/compute/dpu.py
+@@ -0,0 +1,178 @@
++# Copyright 2023 Huawei Technology corp.
++#
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++from webob import exc
++
++from oslo_log import log as logging
++
++from nova.api.openstack import common
++from nova.compute import api as compute
++from nova import exception
++from nova.api.openstack import wsgi
++
++LOG = logging.getLogger(__name__)
++
++class DPUController(wsgi.Controller):
++    """The DPU API controller for the OpenStack API."""
++
++    def __init__(self, *args, **kwargs):
++        super(DPUController, self).__init__(*args, **kwargs)
++        self.compute_api = compute.API()
++
++    @wsgi.expected_errors((400, 403, 404, 409))
++    def attach_volume(self, req, server_id, body):
++        """Attach a volume to the DPU."""
++        LOG.info("attach_volume server_id:%s", server_id)
++        context = req.environ['nova.context']
++        connection_info = body['connection_info']
++        instance = common.get_instance(self.compute_api, context, server_id)
++
++        try:
++            self.compute_api.attach_volume_dpu(
++                context, instance, connection_info)
++        except exception.VolumeNotFound as e:
++            raise exc.HTTPNotFound(explanation=e.format_message())
++        except (exception.InstanceIsLocked,
++                exception.DevicePathInUse,
++                exception.MultiattachNotSupportedByVirtDriver) as e:
++            raise exc.HTTPConflict(explanation=e.format_message())
++        except exception.InstanceInvalidState as state_error:
++            common.raise_http_conflict_for_instance_invalid_state(
++                state_error, 'attach_volume', server_id)
++        except (exception.InvalidVolume,
++                exception.InvalidDevicePath,
++                exception.InvalidInput,
++                exception.VolumeTaggedAttachNotSupported,
++                exception.MultiattachNotSupportedOldMicroversion,
++                exception.MultiattachToShelvedNotSupported) as e:
++            raise exc.HTTPBadRequest(explanation=e.format_message())
++        except exception.TooManyDiskDevices as e:
++            raise exc.HTTPForbidden(explanation=e.format_message())
++        except exception.VolumeAttachFailed as e:
++            raise exc.HTTPBadRequest(explanation=e.format_message())
++
++    @wsgi.expected_errors((400, 403, 404, 409))
++    def detach_volume(self, req, server_id, id, body):
++        """Detach a volume from the DPU."""
++        LOG.info("Detach_volume server_id:%s, id:%s", server_id, id)
++        context = req.environ['nova.context']
++        connection_info = body['connection_info']
++        volume_id = connection_info['volume_id']
++        if volume_id != id:
++            msg = "detach_volume error, volume_id %s, id %s" % (volume_id, id)
++            LOG.error(msg)
++            raise exc.HTTPBadRequest(msg)
++        instance = common.get_instance(self.compute_api, context, server_id,
++                                       expected_attrs=['device_metadata'])
++
++        try:
++            self.compute_api.detach_volume_dpu(context, instance,
++                                               connection_info)
++        except exception.InvalidVolume as e:
++            raise exc.HTTPBadRequest(explanation=e.format_message())
++        except exception.InvalidInput as e:
++            raise exc.HTTPBadRequest(explanation=e.format_message())
++        except exception.InstanceIsLocked as e:
++            raise exc.HTTPConflict(explanation=e.format_message())
++        except exception.InstanceInvalidState as state_error:
++            common.raise_http_conflict_for_instance_invalid_state(
++                state_error, 'detach_volume', server_id)
++        except exception.VolumeDetachFailed as e:
++            raise exc.HTTPBadRequest(explanation=e.format_message())
++
++    @wsgi.expected_errors((400, 403, 404, 409))
++    def create_interface(self, req, server_id, body):
++        """Attach a port to the DPU."""
++        LOG.info("create_interface server_id:%s", server_id)
++        context = req.environ['nova.context']
++        port_name = body['interfaceAttachment'].get('port_name')
++        port_id = body['interfaceAttachment'].get('port_id')
++        port_status = body['interfaceAttachment'].get('port_status')
++        vm_uuid = body['interfaceAttachment'].get('vm_uuid')
++        mac_address = body['interfaceAttachment'].get('mac_address')
++
++        instance = common.get_instance(self.compute_api, context, server_id)
++
++        try:
++            mac_address = self.compute_api.attach_interface_dpu(
++                context, instance, port_name, port_id, port_status,
++                vm_uuid, mac_address)
++        except (exception.InterfaceAttachFailedNoNetwork,
++                exception.NetworkAmbiguous,
++                exception.NoMoreFixedIps,
++                exception.PortNotUsable,
++                exception.AttachInterfaceNotSupported,
++                exception.SecurityGroupCannotBeApplied,
++                exception.NetworkInterfaceTaggedAttachNotSupported,
++                exception.NetworksWithQoSPolicyNotSupported) as e:
++            raise exc.HTTPBadRequest(explanation=e.format_message())
++        except (exception.InstanceIsLocked,
++                exception.FixedIpAlreadyInUse,
++                exception.PortInUse) as e:
++            raise exc.HTTPConflict(explanation=e.format_message())
++        except (exception.PortNotFound,
++                exception.NetworkNotFound) as e:
++            raise exc.HTTPNotFound(explanation=e.format_message())
++        except exception.PortLimitExceeded as e:
++            raise exc.HTTPForbidden(explanation=e.format_message())
++        except exception.InterfaceAttachFailed as e:
++            raise exc.HTTPInternalServerError(
++                explanation=e.format_message())
++        return {'mac_address': mac_address}
++
++    @wsgi.response(202)
++    @wsgi.expected_errors((400, 403, 404, 409))
++    def delete_interface(self, req, server_id, id):
++        """Detach a port from the DPU."""
++        LOG.info("delete_interface server_id:%s, id:%s", server_id, id)
++        context = req.environ['nova.context']
++        instance = common.get_instance(self.compute_api, context, server_id)
++        try:
++            self.compute_api.detach_interface_dpu(context, instance, id)
++        except exception.InterfaceDetachFailed as e:
++            raise exc.HTTPBadRequest(explanation=e.format_message())
++
++    @wsgi.expected_errors((400, 403, 404, 409))
++    def extend_volume(self, req, server_id, body):
++        """Extend volume size."""
++        LOG.info("extend_volume server_id:%s", server_id)
++        context = req.environ['nova.context']
++        connection_info = body['connection_info']
++        instance = common.get_instance(self.compute_api, context, server_id)
++
++        try:
++            self.compute_api.extend_volume_dpu(context, instance,
++                                               connection_info)
++        except exception.VolumeNotFound as e:
++            raise exc.HTTPNotFound(explanation=e.format_message())
++        except (exception.InstanceIsLocked,
++                exception.DevicePathInUse,
++                exception.MultiattachNotSupportedByVirtDriver) as e:
++            raise exc.HTTPConflict(explanation=e.format_message())
++        except exception.InstanceInvalidState as state_error:
++            common.raise_http_conflict_for_instance_invalid_state(
++                state_error, 'attach_volume', server_id)
++        except (exception.InvalidVolume,
++                exception.InvalidDevicePath,
++                exception.InvalidInput,
++                exception.VolumeTaggedAttachNotSupported,
++                exception.MultiattachNotSupportedOldMicroversion,
++                exception.MultiattachToShelvedNotSupported) as e:
++            raise exc.HTTPBadRequest(explanation=e.format_message())
++        except exception.TooManyDiskDevices as e:
++            raise exc.HTTPForbidden(explanation=e.format_message())
++        except (exception.VolumeExtendFailed,
++                exception.VolumeBDMNotFound,
++                exception.InvalidConnectionInfo) as e:
++            raise exc.HTTPBadRequest(explanation=e.format_message())
+diff --git a/nova/api/openstack/compute/routes.py b/nova/api/openstack/compute/routes.py
+index 763db39..a31c890 100644
+--- a/nova/api/openstack/compute/routes.py
++++ b/nova/api/openstack/compute/routes.py
+@@ -85,6 +85,7 @@ from nova.api.openstack.compute import tenant_networks
+ from nova.api.openstack.compute import versionsV21
+ from nova.api.openstack.compute import virtual_interfaces
+ from nova.api.openstack.compute import volumes
++from nova.api.openstack.compute import dpu
+ from nova.api.openstack import wsgi
+ from nova.api import wsgi as base_wsgi
+ 
+@@ -351,6 +352,8 @@ virtual_interfaces_controller = functools.partial(_create_controller,
+ volumes_controller = functools.partial(_create_controller,
+     volumes.VolumeController, [])
+ 
++dpu_controller = functools.partial(_create_controller,
++    dpu.DPUController, [])
+ 
+ # NOTE(alex_xu): This is structure of this route list as below:
+ # (
+@@ -838,6 +841,22 @@ ROUTE_LIST = (
+     ('/servers/{server_id}/topology', {
+         'GET': [server_topology_controller, 'index']
+     }),
++    ('/dpu/{server_id}/os-interface', {
++        'POST': [dpu_controller, 'create_interface']
++    }),
++    ('/dpu/{server_id}/os-interface/{id}', {
++        'DELETE': [dpu_controller, 'delete_interface']
++    }),
++    ('/dpu/{server_id}/os-volume', {
++        'POST': [dpu_controller, 'attach_volume']
++    }),
++    ('/dpu/{server_id}/os-volume/{id}', {
++        'POST': [dpu_controller, 'detach_volume']
++    }),
++    ('/dpu/{server_id}/os-volume-extend', {
++        'POST': [dpu_controller, 'extend_volume']
++    }),
++
+ )
+ 
+ 
+diff --git a/nova/compute/api.py b/nova/compute/api.py
+index 4fa0cc2..327c423 100644
+--- a/nova/compute/api.py
++++ b/nova/compute/api.py
+@@ -5045,6 +5045,36 @@ class API(base.Base):
+             host_statuses[instance.uuid] = host_status
+         return host_statuses
+ 
++    def attach_interface_dpu(self, context, instance, port_name, port_id,
++                             port_status, vm_uuid, mac_address):
++        LOG.info('attach_interface_dpu id {} '.format(port_id))
++        return self.compute_rpcapi.attach_interface_dpu(
++            context, instance=instance, port_name=port_name, port_id=port_id,
++            port_status=port_status, vm_uuid=vm_uuid, mac_address=mac_address)
++
++    def detach_interface_dpu(self, context, instance, id):
++        LOG.info('detach_interface_dpu id {} '.format(id))
++        return self.compute_rpcapi.detach_interface_dpu(
++            context, instance, id)
++
++    def attach_volume_dpu(self, context, instance, connection_info):
++        volume_id = connection_info['volume_id']
++        LOG.info('attach_volume_dpu volume_id {}'.format(volume_id))
++        return self.compute_rpcapi.attach_volume_dpu(
++            context, instance, connection_info)
++
++    def detach_volume_dpu(self, context, instance, connection_info):
++        volume_id = connection_info['volume_id']
++        LOG.info('detach_volume_dpu volume_id {}'.format(volume_id))
++        return self.compute_rpcapi.detach_volume_dpu(
++            context, instance, connection_info)
++
++    def extend_volume_dpu(self, context, instance, connection_info):
++        volume_id = connection_info['volume_id']
++        LOG.info('extend_volume_dpu volume_id {}'.format(volume_id))
++        return self.compute_rpcapi.extend_volume_dpu(
++            context, instance, connection_info)
++
+ 
+ def target_host_cell(fn):
+     """Target a host-based function to a cell.
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index 6e5d72f..45ebcb7 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -9590,3 +9590,92 @@ class ComputeManager(manager.Manager):
+             LOG.debug("Updating migrate VIF profile for port %(port_id)s:"
+                       "%(profile)s", {'port_id': port_id,
+                                       'profile': profile})
++
++    def attach_interface_dpu(self, context, instance, port_name, port_id,
++                             port_status, vm_uuid, mac_address):
++        LOG.info('Handling dpu attach_interface event for port %(port_id)s',
++                 {'port_id': port_id}, instance=instance)
++        try:
++            mac_address = self.driver.attach_interface_dpu(
++                context, instance, port_name, port_id,
++                port_status, vm_uuid, mac_address)
++        except exception.NovaException as ex:
++            LOG.error("attach interface failed, port %(port_id)s, "
++                      "reason: %(msg)s",
++                      {'port_id': port_id, 'msg': ex},
++                      instance=instance)
++            raise exception.InterfaceAttachFailed(instance_uuid=instance.uuid)
++        return mac_address
++
++    def detach_interface_dpu(self, context, instance, port_id):
++        LOG.info('Handling dpu detach_interface event for port %(port_id)s',
++                 {'port_id': port_id}, instance=instance)
++        try:
++            self.driver.detach_interface_dpu(context, port_id)
++        except exception.NovaException as ex:
++            LOG.error("detach interface failed, port %(port_id)s, "
++                      "reason: %(msg)s",
++                      {'port_id': port_id, 'msg': ex},
++                      instance=instance)
++            raise exception.InterfaceDetachFailed(instance_uuid=instance.uuid)
++
++    def attach_volume_dpu(self, context, instance, connection_info):
++        LOG.info('Handling dpu attach_volume event for volume %(vol)s',
++                 {'vol': connection_info['volume_id']}, instance=instance)
++
++        @utils.synchronized(instance.uuid)
++        def do_attach_volume(context, instance, connection_info):
++            volume_id = connection_info['volume_id']
++            try:
++                self.driver.attach_volume(context, connection_info, instance,
++                                          None)
++            except exception.NovaException as ex:
++                LOG.error('Attach volume failed, '
++                          'volume_id=%(volume_id)s, reason: %(msg)s',
++                          {'volume_id': volume_id, 'msg': ex},
++                          instance=instance)
++                raise exception.VolumeAttachFailed(volume_id=volume_id,
++                                                   reason=ex.format_message())
++
++        return do_attach_volume(context, instance, connection_info)
++
++    def detach_volume_dpu(self, context, instance, connection_info):
++        LOG.info('Handling dpu detach_volume event for volume %(vol)s',
++                 {'vol': connection_info['volume_id']}, instance=instance)
++
++        @utils.synchronized(instance.uuid)
++        def do_detach_volume(context, instance, connection_info):
++            volume_id = connection_info['volume_id']
++            try:
++                self.driver.detach_volume(context, connection_info, instance,
++                                          None)
++            except exception.NovaException as ex:
++                LOG.error('Detach volume failed, '
++                          'volume_id=%(volume_id)s, reason: %(msg)s',
++                          {'volume_id': volume_id, 'msg': ex},
++                          instance=instance)
++                raise exception.VolumeDetachFailed(volume_id=volume_id,
++                                                   reason=ex.format_message())
++
++        do_detach_volume(context, instance, connection_info)
++
++    def extend_volume_dpu(self, context, instance, connection_info):
++        LOG.info('Handling dpu extend_volume event for volume %(vol)s',
++                 {'vol': connection_info['volume_id']}, instance=instance)
++
++        @utils.synchronized(instance.uuid)
++        def do_extend_volume(context, instance, connection_info):
++            volume_id = connection_info['volume_id']
++            requested_size = connection_info['requested_size']
++            try:
++                self.driver.extend_volume(connection_info,
++                                          instance, requested_size)
++            except exception.NovaException as ex:
++                LOG.error('Extend volume failed, '
++                          'volume_id=%(volume_id)s, reason: %(msg)s',
++                          {'volume_id': volume_id, 'msg': ex},
++                          instance=instance)
++                raise exception.VolumeExtendFailed(volume_id=volume_id,
++                                                   reason=ex.format_message())
++
++        do_extend_volume(context, instance, connection_info)
+diff --git a/nova/compute/rpcapi.py b/nova/compute/rpcapi.py
+index f37241c..ea2e4b0 100644
+--- a/nova/compute/rpcapi.py
++++ b/nova/compute/rpcapi.py
+@@ -14,6 +14,7 @@
+ """
+ Client side of the compute RPC API.
+ """
++import socket
+ 
+ from oslo_concurrency import lockutils
+ from oslo_log import log as logging
+@@ -1237,3 +1238,48 @@ class ComputeAPI(object):
+         cctxt = client.prepare(server=_compute_host(None, instance),
+                 version=version)
+         return cctxt.cast(ctxt, "trigger_crash_dump", instance=instance)
++
++    def attach_interface_dpu(self, ctxt, instance, port_name, port_id,
++                             port_status, vm_uuid, mac_address):
++        kw = {
++            'instance': instance, 'port_name': port_name, 'port_id': port_id,
++            'port_status': port_status, 'vm_uuid': vm_uuid,
++            'mac_address': mac_address
++        }
++        version = '5.0'
++        hostname = socket.gethostname()
++        cctxt = self.router.client(ctxt).prepare(
++            server=hostname, version=version)
++        return cctxt.call(ctxt, 'attach_interface_dpu', **kw)
++
++    def detach_interface_dpu(self, ctxt, instance, port_id):
++        version = '5.0'
++        hostname = socket.gethostname()
++        cctxt = self.router.client(ctxt).prepare(
++            server=hostname, version=version)
++        return cctxt.call(ctxt, 'detach_interface_dpu', instance=instance,
++                          port_id=port_id)
++
++    def attach_volume_dpu(self, ctxt, instance, connection_info):
++        version = '5.0'
++        hostname = socket.gethostname()
++        cctxt = self.router.client(ctxt).prepare(
++            server=hostname, version=version)
++        return cctxt.call(ctxt, 'attach_volume_dpu', instance=instance,
++                          connection_info=connection_info)
++
++    def detach_volume_dpu(self, ctxt, instance, connection_info):
++        version = '5.0'
++        hostname = socket.gethostname()
++        cctxt = self.router.client(ctxt).prepare(
++            server=hostname, version=version)
++        return cctxt.call(ctxt, 'detach_volume_dpu', instance=instance,
++                          connection_info=connection_info)
++
++    def extend_volume_dpu(self, ctxt, instance, connection_info):
++        version = '5.0'
++        hostname = socket.gethostname()
++        cctxt = self.router.client(ctxt).prepare(
++            server=hostname, version=version)
++        return cctxt.call(ctxt, 'extend_volume_dpu', instance=instance,
++                          connection_info=connection_info)
+diff --git a/nova/exception.py b/nova/exception.py
+index d178034..9ce8ac0 100644
+--- a/nova/exception.py
++++ b/nova/exception.py
+@@ -2553,3 +2553,13 @@ class GetPMEMNamespaceFailed(NovaException):
+ class VPMEMCleanupFailed(NovaException):
+     msg_fmt = _("Failed to clean up the vpmem backend device %(dev)s: "
+                 "%(error)s")
++
++
++class ProcessExecuteException(Invalid):
++    msg_fmt = _("run cmd %(cmd)s failed. "
++                "Reason: %(reason)s")
++
++
++class VolumeExtendFailed(Invalid):
++    msg_fmt = _("Volume %(volume_id)s could not be extended. "
++                "Reason: %(reason)s")
+diff --git a/nova/virt/ironic/__init__.py b/nova/virt/ironic/__init__.py
+index e37d322..a6f3004 100644
+--- a/nova/virt/ironic/__init__.py
++++ b/nova/virt/ironic/__init__.py
+@@ -14,5 +14,7 @@
+ # under the License.
+ 
+ from nova.virt.ironic import driver
++from nova.virt.ironic import dpu_driver
+ 
+ IronicDriver = driver.IronicDriver
++DPUIronicDriver = dpu_driver.DPUIronicDriver
+diff --git a/nova/virt/ironic/dpu_driver.py b/nova/virt/ironic/dpu_driver.py
+new file mode 100644
+index 0000000..e95a8ad
+--- /dev/null
++++ b/nova/virt/ironic/dpu_driver.py
+@@ -0,0 +1,399 @@
++# Copyright 2023 Huawei Technology corp.
++#
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++"""
++A driver wrapping the Ironic API, such that Nova may provision
++bare metal resources.
++"""
++import json
++import logging as ori_logging
++import math
++
++from os_brick import initiator
++from os_brick import exception as os_brick_exception
++from os_brick.initiator import connector
++from oslo_log import log as logging
++from oslo_concurrency import processutils
++
++import nova.conf
++from nova import exception
++from nova import network
++from nova import utils
++from nova.virt.ironic import driver
++from nova.virt.ironic import vif as ironic_vif
++
++LOG = logging.getLogger(__name__)
++
++# disable processutils log
++ori_logging.getLogger('oslo_concurrency.processutils').\
++    setLevel(ori_logging.CRITICAL)
++
++CONF = nova.conf.CONF
++
++STORAGE_MODE = "user"
++USE_MULTIPATH = False
++
++def _run_cmd_by_root(cmd, log_cmd=True):
++    # 基于rootwrap机制运行，以rootwrap配置文件中配置的权限运行
++    try:
++        root_helper = utils.get_root_helper()
++        if log_cmd:
++            LOG.debug('EXECUTE CMD:%s', ' '.join(cmd))
++        return processutils.execute(*cmd, root_helper=root_helper,
++                                    run_as_root=True)
++    except processutils.ProcessExecutionError as e:
++        raise exception.ProcessExecuteException(
++            cmd=(' '.join(cmd) if log_cmd else ""),
++            reason=(e if log_cmd else e.exit_code)
++        ) from None
++
++class DPUIronicDriver(driver.IronicDriver):
++    # rootwrap中的名字，实际以rootwrap中配置的绝对路径运行。
++    spdk_rpc_path = 'hw_dpu_rpc.py'
++    smi_path = 'dpak-smi'
++    qos_bytes_map = dict(total_bytes_sec='--rw_mbytes_per_sec',
++                         read_bytes_sec='--r_mbytes_per_sec',
++                         write_bytes_sec='--w_mbytes_per_sec')
++    qos_iops_map = dict(total_iops_sec='--rw_ios_per_sec',
++                        read_iops_sec='--r_ios_per_sec',
++                        write_iops_sec='--w_ios_per_sec')
++    BYTES_MIN = 1 * 1024 * 1024
++    IOPS_MIN = 1000
++    MiB = 1024 * 1024
++
++    def __init__(self, virtapi, read_only=False):
++        super(DPUIronicDriver, self).__init__(virtapi)
++        self.vif_driver = ironic_vif.IronicVIFDriver()
++        self.volume_driver = \
++            connector.InitiatorConnector.factory(initiator.ISCSI,
++                                                 utils.get_root_helper(),
++                                                 use_multipath=USE_MULTIPATH)
++        self.initiator_iqn = self.volume_driver.get_initiator()
++        self.network_api = network.API()
++
++    def init_host(self, host):
++        """Initialize anything that is necessary for the driver to function.
++
++        :param host: the hostname of the compute host.
++
++        """
++        LOG.debug("init_host.")
++
++    def _get_all_pf_info(self):
++        cmd = [self.smi_path, 'info', '-t', 'dbdf_list']
++        out, err = _run_cmd_by_root(cmd)
++        if err:
++            LOG.error("An exception occurred when got all pf info. "
++                      "err: {}".format(err))
++            raise exception.PciDeviceRequestFailed(
++                "An exception occurred when got all pfs."
++            )
++        try:
++            pf_infos = json.loads("[" + out + "]")
++        except Exception as e:
++            LOG.error("Get pf info error: {}".format(e))
++            return []
++        LOG.debug("pf infos: {}".format(pf_infos))
++        return pf_infos
++
++    def _get_unused_pf(self, type):
++        pf_infos = self._get_all_pf_info()
++        for pf_info in pf_infos:
++            if pf_info['type'] == type and pf_info['used'] == 0:
++                LOG.info("Get unused pf: {}".format(pf_info))
++                return pf_info
++        return None
++
++    def _get_pf_by_mac(self, mac):
++        pf_infos = self._get_all_pf_info()
++        for pf_info in pf_infos:
++            if pf_info['type'] == 'virtio-net' and pf_info['mac'] == mac:
++                if pf_info['used'] == 0:
++                    LOG.info("Get pf by mac: {}".format(pf_info))
++                    return pf_info
++                else:
++                    LOG.warning("Get pf by mac, "
++                                "pf is in use: {}".format(pf_info))
++                    return None
++        return None
++
++    def attach_interface_dpu(self, context, instance, port_name, port_id,
++                             port_status, vm_uuid, mac_address):
++        LOG.info("attach_interface port_name:%s, port_id:%s, port_status:%s,"
++                 "vm_uuid:%s, mac_address:%s",
++                 port_name, port_id, port_status, vm_uuid, mac_address)
++        self.vif_driver.show()
++        pf_info = self._get_pf_by_mac(mac_address)
++        if pf_info is None:
++            LOG.warning("No pf's mac can match {}".format(mac_address))
++            pf_info = self._get_unused_pf('virtio-net')
++            if pf_info is None:
++                LOG.error("Not enough PF devices available for allocation")
++                raise exception.PciDeviceRequestFailed(
++                    "Not enough PF devices available for allocation"
++                )
++        function_id = pf_info['dbdf']
++        port_status = port_status.lower()
++        mac_address = pf_info['mac']
++        self.vif_driver.plug_vif(port_id=port_id, port_name=port_name,
++                                 mac_address=mac_address, uuid=instance.uuid,
++                                 port_status=port_status,
++                                 dpdk_devargs=function_id)
++        LOG.info("attach_interface mac_address:%s", mac_address)
++        self.vif_driver.show()
++        _run_cmd_by_root(["sync"])
++        return mac_address
++
++    def detach_interface_dpu(self, context, port_name):
++        LOG.info("detach_interface_dpu port_name:%s", port_name)
++        self.vif_driver.show()
++        self.vif_driver.unplug_vif(port_name)
++        self.vif_driver.show()
++        _run_cmd_by_root(["sync"])
++
++    def attach_volume(self, context, connection_info, instance, mountpoint,
++                      disk_bus=None, device_type=None, encryption=None):
++        volume_id = connection_info['volume_id']
++        LOG.info("dpu driver attach_volume volume_id {}".format(volume_id))
++
++        pf_info = self._get_unused_pf('virtio-blk')
++        if pf_info is None:
++            # 如果PF资源不够就直接返回异常
++            raise exception.PciDeviceRequestFailed(
++                "Not enough PF devices available for allocation"
++            )
++        function_id = pf_info['dbdf']
++        bdev_name = volume_id
++        data = connection_info['data']
++        if STORAGE_MODE == "user":
++            # 创建用户态bdev
++            if data.get('auth_username'):
++                temp = "iscsi://{username}%{password}@{target_portal}/" \
++                       "{target_iqn}/{target_lun}"
++                url_for_run = temp.format(username=data['auth_username'],
++                                          password=data['auth_password'],
++                                          target_portal=data['target_portal'],
++                                          target_iqn=data['target_iqn'],
++                                          target_lun=data['target_lun'])
++                url_for_log = temp.format(username="username",
++                                          password="xxxxxxxx",
++                                          target_portal=data['target_portal'],
++                                          target_iqn=data['target_iqn'],
++                                          target_lun=data['target_lun'])
++            else:
++                temp = "iscsi://{target_portal}/{target_iqn}/{target_lun}"
++                url_for_run = temp.format(target_portal=data['target_portal'],
++                                          target_iqn=data['target_iqn'],
++                                          target_lun=data['target_lun'])
++                url_for_log = url_for_run
++
++            cmd_for_run = [self.spdk_rpc_path, 'bdev_iscsi_create', '-b',
++                           bdev_name, '-i', self.initiator_iqn,
++                           '--url', url_for_run]
++            cmd_for_log = cmd_for_run[:-1] + [url_for_log]
++            LOG.debug('EXECUTE CMD:%s', ' '.join(cmd_for_log))
++            _run_cmd_by_root(cmd_for_run, log_cmd=False)
++        else:
++            # iscsiadm 连接target
++            self._connect_volume(data)
++            device_path = data['device_path']
++            # 创建内核态bdev
++            cmd = [self.spdk_rpc_path, 'bdev_aio_create', device_path,
++                   bdev_name]
++            _run_cmd_by_root(cmd)
++
++        # 创建控制器
++        serial = volume_id
++        cmd = [self.spdk_rpc_path, 'create_blk_controller', bdev_name,
++               str(function_id), '-s', serial]
++        _run_cmd_by_root(cmd)
++        # 设置qos限速
++        try:
++            self.set_bdev_qos(connection_info)
++        except Exception as ex:
++            LOG.warning('Set qos failed, volume_id %(volume_id)s, '
++                        'reason: %(msg)s', {'volume_id': volume_id,
++                                            'msg': ex})
++
++        # 准备storage
++        storage_ready = connection_info.get('storage_ready')
++        LOG.info('flag storage_ready: {}'.format(storage_ready))
++        if storage_ready:
++            LOG.info('attach_volume done echo storage_ready')
++            cmd = [self.spdk_rpc_path, 'os_ready']
++            _run_cmd_by_root(cmd)
++        _run_cmd_by_root(["sync"])
++
++    def detach_volume(self, context, connection_info, instance, mountpoint,
++                      encryption=None):
++        # 获取function_id
++        volume_id = connection_info['volume_id']
++        LOG.info("dpu driver detach_volume volume_id {}".format(volume_id))
++        function_id = self._get_function_id_by_bdevname(volume_id)
++        if not function_id:
++            LOG.error("detach_volume PF not found")
++            raise exception.PciDeviceNotFound(
++                node_id=volume_id, address=str(function_id)
++            )
++        # 删除控制器
++        cmd = [self.spdk_rpc_path, 'delete_controller', str(function_id)]
++        _run_cmd_by_root(cmd)
++
++        bdev_name = volume_id
++        if STORAGE_MODE == "user":
++            # 删除用户态bdev
++            cmd = [self.spdk_rpc_path, 'bdev_iscsi_delete', bdev_name]
++            _run_cmd_by_root(cmd)
++        else:
++            # 删除内核态bdev
++            cmd = [self.spdk_rpc_path, 'bdev_aio_delete', bdev_name]
++            _run_cmd_by_root(cmd)
++            self._disconnect_volume(connection_info, instance)
++        _run_cmd_by_root(["sync"])
++
++    def extend_volume(self, connection_info, instance, requested_size):
++        LOG.info("driver extend volume "
++                 "requested size {}".format(requested_size))
++        self._extend_volume(connection_info, instance, requested_size)
++        _run_cmd_by_root(["sync"])
++
++    def _get_function_id_by_bdevname(self, bdev_name):
++        get_controllers_cmd = [self.spdk_rpc_path, 'get_controllers']
++        controllers, err = _run_cmd_by_root(get_controllers_cmd)
++        try:
++            controller_info = json.loads(controllers)
++            LOG.debug('controller_info:%s', controller_info)
++            function_id = None
++            for info in controller_info:
++                sessions = info['backend_specific']['session']
++                for session in sessions:
++                    if session['block']['bdev'] == bdev_name:
++                        function_id = session['function_id']
++                        break
++                if function_id:
++                    break
++            return function_id
++        except Exception as e:
++            LOG.error("get_function_id_by_bdevname error: {}".format(e))
++            return None
++
++    def convert_qos_bytes(self, bytes_sec):
++        if bytes_sec < self.BYTES_MIN:
++            LOG.warning("bytes_sec < BYTES_MIN, use %d" % self.BYTES_MIN)
++            bytes_sec = self.BYTES_MIN
++        mbytes_sec = int(bytes_sec / self.MiB)
++        return mbytes_sec
++
++    def convert_qos_iops(self, iops_sec):
++        if iops_sec < self.IOPS_MIN:
++            LOG.warning("iops_sec < IOPS_MIN, use %d" % self.IOPS_MIN)
++            return self.IOPS_MIN
++        iops_sec = math.ceil(iops_sec / 1000) * 1000
++        return iops_sec
++
++    def set_bdev_qos(self, connection_info):
++        volume_id = connection_info['volume_id']
++        qos_info = connection_info['data'].get('qos_specs')
++        LOG.info("set bdev qos volume_id {}, qos_info {}".format(volume_id,
++                                                                 qos_info))
++        if not qos_info:
++            LOG.debug("no qos_info")
++            return
++        qos_cmdline = [self.spdk_rpc_path, 'bdev_set_qos_limit']
++        qos_cmdline_len = len(qos_cmdline)
++        for qos_set in qos_info:
++            if qos_set in self.qos_bytes_map:
++                qos_bytes = int(qos_info[qos_set])
++                qos_mbytes = self.convert_qos_bytes(qos_bytes)
++                qos_cmdline += [self.qos_bytes_map[qos_set], str(qos_mbytes)]
++            if qos_set in self.qos_iops_map:
++                qos_iops = int(qos_info[qos_set])
++                qos_iops = self.convert_qos_iops(qos_iops)
++                qos_cmdline += [self.qos_iops_map[qos_set], str(qos_iops)]
++        if len(qos_cmdline) != qos_cmdline_len:
++            qos_cmdline.append(volume_id)
++            _run_cmd_by_root(qos_cmdline)
++        else:
++            LOG.warning("no valid qos_info")
++
++    def _refresh_cache(self):
++        LOG.debug("_refresh_cache")
++
++    def _connect_volume(self, data):
++        LOG.debug("Calling os-brick to attach iSCSI Volume")
++        device_info = self.volume_driver.connect_volume(data)
++        LOG.debug("Attached iSCSI volume %s", device_info)
++        if USE_MULTIPATH:
++            device_path = '/dev/disk/by-id/dm-uuid-mpath-' + \
++                          device_info['multipath_id']
++        else:
++            device_path = "/dev/disk/by-path/ip-%s-iscsi-%s-lun-%s" % (
++                data['target_portal'],
++                data['target_iqn'],
++                data['target_lun']
++            )
++        LOG.debug("Attached iSCSI volume device_path %s", device_path)
++        data['device_path'] = device_path
++
++    def _disconnect_volume(self, connection_info, instance):
++        LOG.debug("calling os-brick to detach iSCSI Volume", instance=instance)
++        try:
++            self.volume_driver.disconnect_volume(connection_info['data'], None)
++        except os_brick_exception.VolumeDeviceNotFound as exc:
++            LOG.warning('Ignoring VolumeDeviceNotFound: %s', exc)
++            return
++        LOG.debug("Disconnected iSCSI Volume", instance=instance)
++
++    def _extend_volume(self, connection_info, instance, requested_size):
++        volume_id = connection_info['volume_id']
++        function_id = self._get_function_id_by_bdevname(volume_id)
++        if not function_id:
++            LOG.error("extend_volume PF not found")
++            raise exception.PciDeviceNotFound(
++                node_id=volume_id, address=str(function_id)
++            )
++        if STORAGE_MODE == "user":
++            # requested_size is in bytes
++            new_size_in_mb = requested_size // (1024 * 1024)
++            cmd = [self.spdk_rpc_path, 'bdev_resize', str(function_id),
++                   str(new_size_in_mb)]
++            _run_cmd_by_root(cmd)
++        else:
++            # 删除控制器
++            delete_controller_cmd = [self.spdk_rpc_path, 'delete_controller',
++                                     str(function_id)]
++            _run_cmd_by_root(delete_controller_cmd)
++            # 删除bdev
++            delete_bdev_cmd = [self.spdk_rpc_path, 'bdev_aio_delete', volume_id]
++            _run_cmd_by_root(delete_bdev_cmd)
++
++            # 重新创建bdev
++            device_path = connection_info['data']['device_path']
++            bdev_name = volume_id
++            create_bdev_cmd = [self.spdk_rpc_path, 'bdev_aio_create',
++                               device_path, bdev_name]
++            _run_cmd_by_root(create_bdev_cmd)
++            # 重新创建控制器
++            serial = volume_id
++            create_controller_cmd = [self.spdk_rpc_path,
++                                     'create_blk_controller',
++                                     volume_id, str(function_id), '-s', serial]
++            _run_cmd_by_root(create_controller_cmd)
++            # 设置qos限速
++            try:
++                self.set_bdev_qos(connection_info)
++            except Exception as ex:
++                LOG.warning('Set qos failed, volume_id %(volume_id)s, '
++                            'reason: %(msg)s', {'volume_id': volume_id,
++                                                'msg': ex})
+diff --git a/nova/virt/ironic/vif.py b/nova/virt/ironic/vif.py
+new file mode 100644
+index 0000000..6cbb6b4
+--- /dev/null
++++ b/nova/virt/ironic/vif.py
+@@ -0,0 +1,70 @@
++# Copyright 2023 Huawei Technology corp.
++#
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++from oslo_concurrency import processutils
++from oslo_log import log as logging
++
++import nova.conf
++from nova import exception
++from nova import profiler
++from nova import utils
++
++CONF = nova.conf.CONF
++
++LOG = logging.getLogger(__name__)
++MAX_QUEUES = 4
++
++@profiler.trace_cls("ironic_vif_driver")
++class IronicVIFDriver():
++    def _ovs_vsctl(self, args):
++        full_args = ['ovs-vsctl', '--no-wait'] + args
++        try:
++            root_helper = utils.get_root_helper()
++            LOG.debug('EXECUTE CMD:%s', ' '.join(full_args))
++            return processutils.execute(*full_args, root_helper=root_helper,
++                                        run_as_root=True)
++        except Exception as e:
++            LOG.error("Unable to execute %(cmd)s. Exception: %(exception)s",
++                      {'cmd': full_args, 'exception': e})
++            raise exception.OVSConfigurationFailure(inner_exception=e)
++
++    def plug_vif(self, port_id, port_name, mac_address, uuid, port_status,
++                 dpdk_devargs, timeout=120, interface_type='dpdk'):
++        bridge = CONF.neutron.ovs_bridge
++        cmd = [
++            '--timeout=%s' % timeout,
++            '--if-exists', 'del-port', port_name, '--',
++            'add-port', bridge, port_name,
++            '--', 'set', 'Interface', port_name,
++            'external-ids:iface-id=%s' % port_id,
++            'external-ids:iface-status=%s' % port_status,
++            'external-ids:attached-mac=%s' % mac_address,
++            'external-ids:vm-uuid=%s' % uuid,
++            'option:dpdk-devargs=representor=%s,max_queues=%s' %
++            (dpdk_devargs, MAX_QUEUES)
++        ]
++        if interface_type:
++            cmd += ['type=%s' % interface_type]
++        self._ovs_vsctl(cmd)
++
++    def unplug_vif(self, port_name):
++        bridge = CONF.neutron.ovs_bridge
++        cmd = ['--', '--if-exists', 'del-port', bridge, port_name]
++        self._ovs_vsctl(cmd)
++
++    def show(self):
++        cmd = ['show']
++        out, err = self._ovs_vsctl(cmd)
++        LOG.debug("ovs-vsctl show error: {}, out: {}".format(err, out))
++        return out
