@@ -20,5 +20,8 @@
 
 ### 特性
 - 流量分散 neutron为[15.3.4](https://opendev.org/openstack/neutron/src/tag/15.3.4)、neutron-lib为[1.29.2](https://opendev.org/openstack/neutron-lib/src/tag/1.29.2)。neutron还涉及entry point的修改，在子包中完成。特性spec请阅读相关[文档](https://gitee.com/openeuler/openstack/blob/master/docs/spec/distributed-traffic.md)。
-- 支持纳管带DPU卸载的裸金属节点。
+- 支持纳管带DPU卸载的裸金属节点。一共包含3个patch，其中：
+ - nova-offload-support-baremetal-with-dpu-ctrl.patch 应用于裸机管理节点的nova项目
+ - ironic-offload-support-baremetal-with-dpu.patch 应用于裸机管理节点的ironic项目
+ - nova-offload-support-baremetal-with-dpu-agent.patch 应用于DPU上的nova项目
 - 支持纳管网络vDPA设备（virtio-net）。
