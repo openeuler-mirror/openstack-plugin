@@ -1,0 +1,833 @@
+diff --git a/ironic/common/dpu_api.py b/ironic/common/dpu_api.py
+new file mode 100644
+index 0000000..d06883f
+--- /dev/null
++++ b/ironic/common/dpu_api.py
+@@ -0,0 +1,192 @@
++# Copyright 2023 Huawei Technology corp.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#   http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++import json
++import requests
++import time
++
++from oslo_config import cfg
++from oslo_log import log as logging
++
++LOG = logging.getLogger(__name__)
++
++class APIClient(object):
++    def __init__(self, api_url):
++        self.api_url = api_url.rstrip('/')
++        self.api_version = "v2.1"
++
++        # Only keep alive a maximum of 2 connections to the API. More will be
++        # opened if they are needed, but they will be closed immediately after
++        # use.
++        adapter = requests.adapters.HTTPAdapter(pool_connections=2,
++                                                pool_maxsize=2)
++        self.session = requests.Session()
++        self.session.mount(self.api_url, adapter)
++
++        self.encoder = json.JSONEncoder()
++        self._init_auth_conf()
++
++    def _init_auth_conf(self):
++        group = cfg.OptGroup('keystone_authtoken')
++        opts = [
++            cfg.StrOpt('username', default=''),
++            cfg.StrOpt('project_domain_name', default=''),
++            cfg.StrOpt('user_domain_name', default=''),
++            cfg.StrOpt('project_name', default=''),
++            cfg.StrOpt('password', default=''),
++            cfg.StrOpt('auth_url', default=''),
++        ]
++        CONF = cfg.CONF
++        try:
++            CONF.register_group(group)
++            CONF.register_opts(opts, group=group)
++            CONF(default_config_files=['/etc/ironic/ironic.conf'])
++        except cfg.DuplicateOptError:
++            LOG.warning('cfg DuplicateOptError')
++
++        self.token_update_time = 0
++        self.token = ''
++        ka = CONF.keystone_authtoken
++        username = ka.username.lower()
++        project_domain_name = ka.project_domain_name.lower()
++        user_domain_name = ka.user_domain_name.lower()
++        project_name = ka.project_name.lower()
++        password = ka.password
++        self.auth_data = json.dumps({
++            "auth": {
++                "identity": {
++                    "methods": ["password"],
++                    "password": {
++                        "user": {
++                            "name": username,
++                            "domain": {"id": user_domain_name},
++                            "password": password
++                        }
++                    }
++                },
++                "scope": {
++                    "project": {
++                        "name": project_name,
++                        "domain": {"id": project_domain_name}
++                    }
++                }
++            }
++        })
++        self.auth_url = ka.auth_url + "/identity/v3/auth/tokens"
++
++    def _get_token(self):
++        if self.token_update_time < time.time() - 5 * 60:  # 5分钟过期，重新获取
++            headers = {
++                'Content-Type': 'application/json',
++                'Accept': 'application/json',
++            }
++            response = self.session.request('POST',
++                                            self.auth_url,
++                                            headers=headers,
++                                            data=self.auth_data,
++                                            verify=None,
++                                            cert=None)
++            self.token_update_time = time.time()
++            self.token = response.headers['X-Subject-Token']
++            LOG.debug('get token success')
++        return self.token
++
++    def _request(self, method, path, data=None, headers=None, **kwargs):
++        request_url = '{api_url}{path}'.format(api_url=self.api_url, path=path)
++
++        if data is not None:
++            data = self.encoder.encode(data)
++
++        headers = headers or {}
++        token = self._get_token()
++        headers.update({
++            'Content-Type': 'application/json',
++            'Accept': 'application/json',
++            'X-Auth-Token': token,
++        })
++
++        return self.session.request(method,
++                                    request_url,
++                                    headers=headers,
++                                    data=data,
++                                    verify=None,
++                                    cert=None,
++                                    **kwargs)
++
++    def create_interface_dpu(self, server_id, interface):
++        path = '/{}/dpu/{}/os-interface'.format(self.api_version, server_id)
++        try:
++            response = self._request('POST', path, data=interface)
++        except Exception as err:
++            LOG.error('Unhandled error create_interface. Error: %s ', err)
++            raise
++
++        # Got valid content
++        return response
++
++    def delete_interface_dpu(self, server_id, id):
++        path = '/{}/dpu/{}/os-interface/{}'.format(self.api_version, server_id,
++                                                   id)
++        try:
++            response = self._request('DELETE', path)
++        except Exception as err:
++            LOG.error('Unhandled error delete_interface. Error: %s ', err)
++            raise
++
++        # Got valid content
++        return response
++
++    def attach_volume_dpu(self, server_id, data):
++        path = '/{}/dpu/{}/os-volume'.format(self.api_version, server_id)
++        try:
++            response = self._request('POST', path, data=data)
++        except Exception as err:
++            LOG.error('Unhandled error attach_volume_dpu. Error: %s ', err)
++            raise
++
++        # Got valid content
++        return response
++
++    def detach_volume_dpu(self, server_id, volume_id, data):
++        path = '/{}/dpu/{}/os-volume/{}'.format(self.api_version,
++                                                server_id, volume_id)
++        try:
++            response = self._request('POST', path, data=data)
++        except Exception as err:
++            LOG.error('Unhandled error detach_volume_dpu. Error: %s ', err)
++            raise
++
++        # Got valid content
++        return response
++
++    def extend_volume_dpu(self, server_id, data):
++        path = '/{}/dpu/{}/os-volume-extend'.format(self.api_version, server_id)
++        try:
++            response = self._request('POST', path, data=data)
++        except Exception as err:
++            LOG.error('Unhandled error extend_volume_dpu. Error: %s ', err)
++            raise
++
++        # Got valid content
++        return response
++
++    def hello(self):
++        path = '/{}/servers'.format(self.api_version)
++        try:
++            response = self._request('GET', path)
++        except Exception as err:
++            LOG.error('Unhandled error hello. Error: %s ', err)
++            raise
++
++        # Got valid content
++        return response
+diff --git a/ironic/conductor/manager.py b/ironic/conductor/manager.py
+index 5607bd6..dd1ffc2 100644
+--- a/ironic/conductor/manager.py
++++ b/ironic/conductor/manager.py
+@@ -2505,12 +2505,9 @@ class ConductorManager(base_manager.BaseConductorManager):
+                   {'target': target.uuid})
+         with task_manager.acquire(context, target.node_id,
+                                   purpose='volume target deletion') as task:
+-            node = task.node
+-            if node.power_state != states.POWER_OFF:
+-                raise exception.InvalidStateRequested(
+-                    action='volume target deletion',
+-                    node=node.uuid,
+-                    state=node.power_state)
++            # delete power_state limit
++            # we can destroy volume target even if
++            # node.power_state != states.POWER_OFF
+             target.destroy()
+             LOG.info('Successfully deleted volume target %(target)s. '
+                      'The node associated with the target was %(node)s',
+diff --git a/ironic/drivers/generic.py b/ironic/drivers/generic.py
+index 1e7a83c..b84ba42 100644
+--- a/ironic/drivers/generic.py
++++ b/ironic/drivers/generic.py
+@@ -19,10 +19,12 @@ Generic hardware types.
+ from ironic.drivers import hardware_type
+ from ironic.drivers.modules import agent
+ from ironic.drivers.modules.ansible import deploy as ansible_deploy
++from ironic.drivers.modules import dpu as dpu_deploy
+ from ironic.drivers.modules import fake
+ from ironic.drivers.modules import inspector
+ from ironic.drivers.modules import ipxe
+ from ironic.drivers.modules import iscsi_deploy
++from ironic.drivers.modules.network import dpu
+ from ironic.drivers.modules.network import flat as flat_net
+ from ironic.drivers.modules.network import neutron
+ from ironic.drivers.modules.network import noop as noop_net
+@@ -43,13 +45,14 @@ class GenericHardware(hardware_type.AbstractHardwareType):
+     @property
+     def supported_boot_interfaces(self):
+         """List of supported boot interfaces."""
+-        return [ipxe.iPXEBoot, pxe.PXEBoot]
++        return [ipxe.iPXEBoot, pxe.PXEBoot, dpu_deploy.DPUBoot]
+ 
+     @property
+     def supported_deploy_interfaces(self):
+         """List of supported deploy interfaces."""
+         return [iscsi_deploy.ISCSIDeploy, agent.AgentDeploy,
+-                ansible_deploy.AnsibleDeploy, pxe.PXERamdiskDeploy]
++                ansible_deploy.AnsibleDeploy, pxe.PXERamdiskDeploy,
++                fake.FakeDeploy, dpu_deploy.DPUDeploy]
+ 
+     @property
+     def supported_inspect_interfaces(self):
+@@ -62,7 +65,7 @@ class GenericHardware(hardware_type.AbstractHardwareType):
+     def supported_network_interfaces(self):
+         """List of supported network interfaces."""
+         return [flat_net.FlatNetwork, neutron.NeutronNetwork,
+-                noop_net.NoopNetwork]
++                noop_net.NoopNetwork, dpu.DpuNetwork]
+ 
+     @property
+     def supported_raid_interfaces(self):
+diff --git a/ironic/drivers/modules/dpu.py b/ironic/drivers/modules/dpu.py
+new file mode 100644
+index 0000000..08205e0
+--- /dev/null
++++ b/ironic/drivers/modules/dpu.py
+@@ -0,0 +1,286 @@
++# Copyright 2023 Huawei Technology corp.
++#
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#      http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++import requests
++import time
++
++from oslo_log import log
++from oslo_utils import netutils
++
++from ironic.common import dpu_api
++from ironic.common import exception
++from ironic.common import states
++from ironic.conductor import task_manager
++from ironic.conductor import utils as manager_utils
++from ironic.drivers import base
++from ironic.drivers.modules import deploy_utils
++
++LOG = log.getLogger(__name__)
++
++CHECK_DPU_POWERON_WAIT_TIME_S = 90
++CHECK_DPU_RETRY_TIME = 60
++CHECK_DPU_RETRY_INTERVAL_S = 5
++
++class DPUBoot(base.BootInterface):
++    """ DPU boot interface."""
++
++    def get_properties(self):
++        LOG.info('dpu boot get_properties')
++        return {}
++
++    def validate(self, task):
++        LOG.info('dpu boot validate')
++
++    def prepare_ramdisk(self, task, ramdisk_params, mode='deploy'):
++        LOG.info('dpu boot prepare_ramdisk')
++
++    def clean_up_ramdisk(self, task, mode='deploy'):
++        LOG.info('dpu boot clean_up_ramdisk')
++
++    def prepare_instance(self, task):
++        LOG.info('dpu boot prepare_instance')
++
++    def clean_up_instance(self, task):
++        LOG.info('dpu boot clean_up_instance')
++
++class DPUDeploy(base.DeployInterface):
++    """DPU Deploy Interface for deploy-related actions."""
++
++    def get_properties(self):
++        LOG.info('dpu deploy get_properties')
++        return {}
++
++    def validate(self, task):
++        """Validate the deployment information for the task's node.
++
++        :param task: a TaskManager instance containing the node to act on.
++        :raises: InvalidParameterValue
++        :raises: MissingParameterValue
++        """
++        LOG.info('dpu deploy validate')
++        task.driver.boot.validate(task)
++        node = task.node
++
++        # Check the boot_mode, boot_option and disk_label capabilities values.
++        deploy_utils.validate_capabilities(node)
++
++    def _get_dpu_manager_url(self, task):
++        node = task.node
++        dpu_ip = node.extra.get('dpu_ip')
++        if not netutils.is_valid_ipv4(dpu_ip):
++            raise exception.ValidationError("Invalid dpu manager ip address")
++        manager_url = "http://%(dpu_ip)s:8774" % {'dpu_ip': dpu_ip}
++        LOG.debug('dpu manager url: %(manager_url)s.',
++                  {'manager_url': manager_url})
++        return manager_url
++
++    def _check_dpu(self, task, manager_url):
++        node_power_state = task.driver.power.get_power_state(task)
++        if node_power_state == states.POWER_OFF:
++            LOG.info('dpu node power state '
++                     'from {} to {}'.format(node_power_state, states.POWER_ON))
++            manager_utils.node_power_action(task, states.POWER_ON)
++            LOG.info("dpu power on wait "
++                     "{} seconds".format(CHECK_DPU_POWERON_WAIT_TIME_S))
++            time.sleep(CHECK_DPU_POWERON_WAIT_TIME_S)
++
++        LOG.debug("dpu power on begin check")
++        apiclient = None
++        for i in range(CHECK_DPU_RETRY_TIME):
++            if apiclient == None:
++                try:
++                    apiclient = dpu_api.APIClient(manager_url)
++                except Exception as e:
++                    LOG.warning("dpu apiclient init error. node "
++                                "%(node_uuid)s. Error: "
++                                "%(msg)s" % {'node_uuid': task.node.uuid,
++                                             'msg': e})
++                    time.sleep(CHECK_DPU_RETRY_INTERVAL_S)
++                    continue
++            try:
++                response = apiclient.hello()
++                if response.status_code == requests.codes.OK:
++                    LOG.info('dpu hello return success')
++                    return
++                else:
++                    LOG.warning('dpu hello return error response '
++                                'status_code {}; '
++                                'content {}'.format(response.status_code,
++                                                    response.content))
++            except Exception as e:
++                LOG.warning("dpu apiclient hello error. node "
++                            "%(node_uuid)s. Error: "
++                            "%(msg)s" % {'node_uuid': task.node.uuid,
++                                         'msg': e})
++            time.sleep(CHECK_DPU_RETRY_INTERVAL_S)
++        msg = "Check dpu fail, node {}".format(task.node.uuid)
++        LOG.error(msg)
++        raise exception.InstanceDeployFailure(msg)
++
++    @base.deploy_step(priority=100)
++    @task_manager.require_exclusive_lock
++    def deploy(self, task):
++        """Start deployment of the task's node.
++
++        reference to the iscsi_deploy 'Boot to an Storage Volume' branch
++
++        :param task: a TaskManager instance containing the node to act on.
++        :returns: deploy state None
++        """
++        LOG.info('dpu deploy node:{} '.format(task.node.uuid))
++
++        node = task.node
++
++        # 启动时attach_volume
++        if task.volume_targets:
++            self._prepare_volume(task)
++        else:
++            raise exception.InstanceDeployFailure(
++                "Can not found bootable volume, node %(node_uuid)s" %
++                {'node_uuid': node.uuid})
++
++        LOG.debug('dpu deploy remove_provisioning_network')
++        task.driver.network.remove_provisioning_network(task)
++        task.driver.network.configure_tenant_networks(task)
++        task.driver.boot.prepare_instance(task)
++        return None
++
++    @task_manager.require_exclusive_lock
++    def tear_down(self, task):
++        """Tear down a previous deployment on the task's node.
++
++        Detach volumes, power off the node.
++
++        :param task: a TaskManager instance containing the node to act on.
++        :returns: deploy state DELETED.
++        """
++        LOG.info('dpu deploy tear_down node:{} '.format(task.node.uuid))
++        volume_targets = task.volume_targets
++        if volume_targets:
++            manager_url = self._get_dpu_manager_url(task)
++            self._check_dpu(task, manager_url)
++            server_id = task.node.instance_uuid
++            for i in range(len(volume_targets) - 1, -1, -1):
++                volume_target = volume_targets[i]
++                volume_id = volume_target.volume_id
++                response = self._detach_volume_dpu(
++                    server_id=server_id,
++                    volume_id=volume_id,
++                    connection_info={
++                        'data': volume_target.properties,
++                        'volume_id': volume_id
++                    },
++                    manager_url=manager_url
++                )
++                if response.status_code != requests.codes.OK:
++                    raise exception.StorageError(
++                        "Storage error when tear down instance %(server_id)s; "
++                        "volume_id %(volume_id)s; res_msg: %(res_msg)s" %
++                        {'server_id': task.node.instance_uuid,
++                         'volume_id': volume_id,
++                         'res_msg': response.content})
++        else:
++            LOG.warning('dpu deploy tear_down with no volume_targets')
++
++        task.driver.storage.detach_volumes(task)
++        deploy_utils.tear_down_storage_configuration(task)
++        task.driver.network.unconfigure_tenant_networks(task)
++        # NOTE(mgoddard): If the deployment was unsuccessful the node may have
++        # ports on the provisioning network which were not deleted.
++        LOG.debug('dpu deploy tear_down remove_provisioning_network')
++        task.driver.network.remove_provisioning_network(task)
++
++        manage_power = task.node.extra.get('manage_power')
++        LOG.info('dpu deploy tear_down manage_power {}'.format(manage_power))
++        if manage_power:
++            time.sleep(15)  # 不要前面操作结束就立即下电，等15s
++            manager_utils.node_power_action(task, states.POWER_OFF)
++
++        return states.DELETED
++
++    @task_manager.require_exclusive_lock
++    def prepare(self, task):
++        """Prepare the deployment environment for this task's node.
++
++        :param task: a TaskManager instance containing the node to act on.
++        """
++        LOG.info('dpu deploy prepare node:{} '.format(task.node.uuid))
++
++        node = task.node
++        deploy_utils.populate_storage_driver_internal_info(task)
++        if node.provision_state in [states.ACTIVE, states.ADOPTING]:
++            task.driver.boot.prepare_instance(task)
++        else:
++            LOG.info('dpu prepare check dpu is available')
++            manager_url = self._get_dpu_manager_url(task)
++            self._check_dpu(task, manager_url)
++
++    def clean_up(self, task):
++        """Clean up the deployment environment for the task's node.
++
++        :param task: a TaskManager instance containing the node to act on.
++        """
++        LOG.info('dpu deploy clean_up')
++        pass
++
++    def take_over(self, task):
++        """Take over management of this task's node from a dead conductor.
++
++        :param task: A TaskManager instance containing the node to act on.
++        """
++        LOG.info('dpu deploy take_over')
++        pass
++
++    def _prepare_volume(self, task):
++        manager_url = self._get_dpu_manager_url(task)
++        self._check_dpu(task, manager_url)
++        server_id = task.node.instance_uuid
++        volume_targets = task.volume_targets
++        for i in range(len(volume_targets)):
++            volume_target = volume_targets[i]
++            volume_id = volume_target['volume_id']
++            LOG.info('dpu deploy _prepare_volume {} {}'.format(i, volume_id))
++            connection_info = {
++                'data': volume_target.properties,
++                'volume_id': volume_id
++            }
++            if i == len(volume_targets) - 1:
++                # 最后一个盘插完，echo storage ready
++                connection_info['storage_ready'] = True
++            response = self._attach_volume_dpu(server_id, connection_info,
++                                               manager_url)
++            if response.status_code != requests.codes.OK:
++                raise exception.InstanceDeployFailure(
++                    "Instance Deploy fail in node %(server_id)s; "
++                    "volume_id %(volume_id)s; res_msg: %(res_msg)s" %
++                    {'server_id': server_id,
++                     'volume_id': volume_id,
++                     'res_msg': response.content})
++
++    def _attach_volume_dpu(self, server_id, connection_info, manager_url):
++        apiclient = dpu_api.APIClient(manager_url)
++        data = {
++            "connection_info": connection_info,
++        }
++        response = apiclient.attach_volume_dpu(server_id, data)
++        return response
++
++    def _detach_volume_dpu(self, server_id, volume_id, connection_info,
++                           manager_url):
++        apiclient = dpu_api.APIClient(manager_url)
++        data = {
++            "connection_info": connection_info,
++        }
++        response = apiclient.detach_volume_dpu(server_id, volume_id, data)
++        return response
+diff --git a/ironic/drivers/modules/network/dpu.py b/ironic/drivers/modules/network/dpu.py
+new file mode 100644
+index 0000000..3756268
+--- /dev/null
++++ b/ironic/drivers/modules/network/dpu.py
+@@ -0,0 +1,274 @@
++# Copyright 2023 Huawei Technology corp.
++#
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++import json
++import requests
++import time
++
++from oslo_log import log
++from oslo_utils import netutils
++
++from ironic.common import dpu_api
++from ironic.common import exception
++from ironic.common import neutron
++from ironic.common import states
++from ironic.drivers import base
++from ironic.conductor import utils as manager_utils
++
++LOG = log.getLogger(__name__)
++
++NIC_NAME_LEN = 14
++CHECK_DPU_POWERON_WAIT_TIME_S = 90
++CHECK_DPU_RETRY_TIME = 60
++CHECK_DPU_RETRY_INTERVAL_S = 5
++
++class DpuNetwork(base.NetworkInterface):
++    """Dpu network interface."""
++
++    def port_changed(self, task, port_obj):
++        """Handle any actions required when a port changes
++
++        :param task: a TaskManager instance.
++        :param port_obj: a changed Port object.
++        :raises: Conflict, FailedToUpdateDHCPOptOnPort
++        """
++        LOG.info('DpuNetwork port_changed')
++
++    def portgroup_changed(self, task, portgroup_obj):
++        """Handle any actions required when a portgroup changes
++
++        :param task: a TaskManager instance.
++        :param portgroup_obj: a changed Portgroup object.
++        :raises: Conflict, FailedToUpdateDHCPOptOnPort
++        """
++        LOG.info('DpuNetwork portgroup_changed')
++
++    def _get_dpu_manager_url(self, task):
++        node = task.node
++        dpu_ip = node.extra.get('dpu_ip')
++        if not netutils.is_valid_ipv4(dpu_ip):
++            raise exception.ValidationError("Invalid dpu manager ip address")
++        manager_url = "http://%(dpu_ip)s:8774" % {'dpu_ip': dpu_ip}
++        LOG.debug('dpu manager url: %(manager_url)s.',
++                  {'manager_url': manager_url})
++        return manager_url
++
++    def _check_dpu(self, task, manager_url):
++        node_power_state = task.driver.power.get_power_state(task)
++        if node_power_state == states.POWER_OFF:
++            LOG.info('dpu node power state '
++                     'from {} to {}'.format(node_power_state, states.POWER_ON))
++            manager_utils.node_power_action(task, states.POWER_ON)
++            LOG.info("dpu power on wait "
++                     "{} seconds".format(CHECK_DPU_POWERON_WAIT_TIME_S))
++            time.sleep(CHECK_DPU_POWERON_WAIT_TIME_S)
++
++        LOG.debug("dpu power on begin check")
++        apiclient = None
++        for i in range(CHECK_DPU_RETRY_TIME):
++            if apiclient == None:
++                try:
++                    apiclient = dpu_api.APIClient(manager_url)
++                except Exception as e:
++                    LOG.warning("dpu apiclient init error. node "
++                                "%(node_uuid)s. Error: "
++                                "%(msg)s" % {'node_uuid': task.node.uuid,
++                                             'msg': e})
++                    time.sleep(CHECK_DPU_RETRY_INTERVAL_S)
++                    continue
++            try:
++                response = apiclient.hello()
++                if response.status_code == requests.codes.OK:
++                    LOG.info('dpu hello return success')
++                    return
++                else:
++                    LOG.warning('dpu hello return error response '
++                                'status_code {}; '
++                                'content {}'.format(response.status_code,
++                                                    response.content))
++            except Exception as e:
++                LOG.warning("dpu apiclient hello error. node "
++                            "%(node_uuid)s. Error: "
++                            "%(msg)s" % {'node_uuid': task.node.uuid,
++                                         'msg': e})
++            time.sleep(CHECK_DPU_RETRY_INTERVAL_S)
++        msg = "Check dpu fail, node {}".format(task.node.uuid)
++        LOG.error(msg)
++        raise exception.InvalidState(msg)
++
++    def vif_attach(self, task, vif_info):
++        """Attach a virtual network interface to a node
++
++        :param task: A TaskManager instance.
++        :param vif_info: a dictionary of information about a VIF.
++            It must have an 'id' key, whose value is a unique
++            identifier for that VIF.
++        :raises: NetworkError
++        """
++        LOG.info('DpuNetwork vif_attach vif_info: {}'.format(vif_info))
++        vif_id = vif_info['id']
++        client = neutron.get_client()
++        port = neutron._get_port_by_uuid(client, vif_id)
++        LOG.debug('DpuNetwork vif_attach port: {}'.format(port))
++        neutron.unbind_neutron_port(vif_id)
++
++        LOG.info('DpuNetwork vif_attach plug_vif_dpu '
++                 'vif_id: {}'.format(vif_id))
++        response = self._plug_vif_dpu(task, port)
++
++        if response.status_code not in [requests.codes.OK,
++                                        requests.codes.no_content,
++                                        requests.codes.accepted]:
++            raise exception.NetworkError(
++                "Plug vif on dpu error node  %(node_uuid)s; "
++                "res_msg: %(res_msg)s" %
++                {'node_uuid': task.node.uuid, 'res_msg': response.content})
++        port_info = json.loads(response.content)
++        mac_address = port_info["mac_address"]
++        body = {
++            'port': {
++                'binding:vnic_type': 'baremetal',
++                'binding:host_id': task.node.uuid,
++                'mac_address': mac_address
++            }
++        }
++        try:
++            LOG.debug('DpuNetwork vif_attach update_port '
++                      'vif_id: {}'.format(vif_id))
++            client.update_port(vif_id, body)
++        except Exception as e:
++            msg = ('DpuNetwork update_port error. vif %(vif)s '
++                   'node %(node)s, error %(exc)s' %
++                   {'vif': vif_id,
++                    'node': task.node.uuid,
++                    'exc': e})
++            LOG.error(msg)
++            raise exception.NetworkError(msg)
++        LOG.info('DpuNetwork vif_attach done')
++
++    def vif_detach(self, task, vif_id):
++        """Detach a virtual network interface from a node
++
++        :param task: A TaskManager instance.
++        :param vif_id: A VIF ID to detach
++        :raises: NetworkError
++        """
++        LOG.info('DpuNetwork vif_detach vif_id: {}'.format(vif_id))
++        neutron.unbind_neutron_port(vif_id)
++
++        LOG.info('DpuNetwork vif_detach _unplug_vif_dpu '
++                 'vif_id: {}'.format(vif_id))
++        response = self._unplug_vif_dpu(task, vif_id)
++
++        if response.status_code not in [requests.codes.OK,
++                                        requests.codes.no_content,
++                                        requests.codes.accepted]:
++            raise exception.NetworkError(
++                "Unplug vif on dpu error %(node_uuid)s; "
++                "res_msg: %(res_msg)s" %
++                {'node_uuid': task.node.uuid, 'res_msg': response.content})
++        LOG.info('DpuNetwork vif_detach done')
++
++    def _plug_vif_dpu(self, task, port):
++        manager_url = self._get_dpu_manager_url(task)
++        self._check_dpu(task, manager_url)
++        apiclient = dpu_api.APIClient(manager_url)
++        interface = {
++            "interfaceAttachment": {
++                "port_name": ('vhu' + port['id'])[:NIC_NAME_LEN],
++                "port_id": port['id'],
++                "port_status": port['status'],
++                "vm_uuid": port['device_id'],
++                "mac_address": port['mac_address'],
++            }
++        }
++        response = apiclient.create_interface_dpu(task.node.instance_uuid,
++                                                  interface)
++        return response
++
++    def _unplug_vif_dpu(self, task, vif_id):
++        manager_url = self._get_dpu_manager_url(task)
++        self._check_dpu(task, manager_url)
++        apiclient = dpu_api.APIClient(manager_url)
++        port_name = ('vhu' + vif_id)[:NIC_NAME_LEN]
++        response = apiclient.delete_interface_dpu(task.node.instance_uuid,
++                                                  port_name)
++        return response
++
++    def vif_list(self, task):
++        """List attached VIF IDs for a node.
++
++        :param task: A TaskManager instance.
++        :returns: List of VIF dictionaries, each dictionary will have an 'id'
++            entry with the ID of the VIF.
++        """
++        LOG.info('DpuNetwork vif_list')
++        return []
++
++    def get_current_vif(self, task, p_obj):
++        """Returns the currently used VIF associated with port or portgroup
++
++        We are booting the node only in one network at a time, and presence of
++        cleaning_vif_port_id means we're doing cleaning,
++        of provisioning_vif_port_id - provisioning
++        of rescuing_vif_port_id - rescuing.
++        Otherwise it's a tenant network
++
++        :param task: A TaskManager instance.
++        :param p_obj: Ironic port or portgroup object.
++        :returns: VIF ID associated with p_obj or None.
++        """
++        LOG.info('DpuNetwork get_current_vif')
++
++    def add_provisioning_network(self, task):
++        """Add the provisioning network to a node.
++
++        :param task: A TaskManager instance.
++        """
++        LOG.info('DpuNetwork add_provisioning_network')
++
++    def remove_provisioning_network(self, task):
++        """Remove the provisioning network from a node.
++
++        :param task: A TaskManager instance.
++        """
++        LOG.info('DpuNetwork remove_provisioning_network')
++
++    def configure_tenant_networks(self, task):
++        """Configure tenant networks for a node.
++
++        :param task: A TaskManager instance.
++        """
++        LOG.info('DpuNetwork configure_tenant_networks')
++
++    def unconfigure_tenant_networks(self, task):
++        """Unconfigure tenant networks for a node.
++
++        :param task: A TaskManager instance.
++        """
++        LOG.info('DpuNetwork unconfigure_tenant_networks')
++
++    def add_cleaning_network(self, task):
++        """Add the cleaning network to a node.
++
++        :param task: A TaskManager instance.
++        """
++        LOG.info('DpuNetwork add_cleaning_network')
++
++    def remove_cleaning_network(self, task):
++        """Remove the cleaning network from a node.
++
++        :param task: A TaskManager instance.
++        """
++        LOG.info('DpuNetwork remove_cleaning_network')
