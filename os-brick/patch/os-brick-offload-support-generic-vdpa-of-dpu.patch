@@ -1,0 +1,686 @@
+diff --git a/os_brick/initiator/__init__.py b/os_brick/initiator/__init__.py
+index 0192192..d5a14b8 100644
+--- a/os_brick/initiator/__init__.py
++++ b/os_brick/initiator/__init__.py
+@@ -64,3 +64,4 @@ VERITAS_HYPERSCALE = "VERITAS_HYPERSCALE"
+ STORPOOL = "STORPOOL"
+ NVME = "NVME"
+ NVMEOF = "NVMEOF"
++VDPA = "VDPA"
+diff --git a/os_brick/initiator/connector.py b/os_brick/initiator/connector.py
+index 963ee6a..a0b202f 100644
+--- a/os_brick/initiator/connector.py
++++ b/os_brick/initiator/connector.py
+@@ -68,6 +68,7 @@ unix_connector_list = [
+     'os_brick.initiator.connectors.vrtshyperscale.HyperScaleConnector',
+     'os_brick.initiator.connectors.storpool.StorPoolConnector',
+     'os_brick.initiator.connectors.nvmeof.NVMeOFConnector',
++    'os_brick.initiator.connectors.vdpa.VDPAConnector',
+ ]
+ 
+ 
+@@ -131,6 +132,8 @@ _connector_mapping_linux = {
+         'os_brick.initiator.connectors.nvmeof.NVMeOFConnector',
+     initiator.NVMEOF:
+         'os_brick.initiator.connectors.nvmeof.NVMeOFConnector',
++    initiator.VDPA:
++        'os_brick.initiator.connectors.vdpa.VDPAConnector',
+ }
+ 
+ # Mapping for the S390X platform
+diff --git a/os_brick/initiator/connectors/vdpa.py b/os_brick/initiator/connectors/vdpa.py
+new file mode 100644
+index 0000000..ad79519
+--- /dev/null
++++ b/os_brick/initiator/connectors/vdpa.py
+@@ -0,0 +1,291 @@
++# Copyright 2024 Huawei Technology corp.
++#
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++import json
++
++from oslo_concurrency import lockutils
++from oslo_concurrency import processutils as putils
++from oslo_log import log as logging
++import logging as ori_logging
++
++from os_brick import exception
++from os_brick import spdk_lib
++from os_brick import initiator
++from os_brick.initiator import connector
++from os_brick.initiator.connectors import base
++from oslo_concurrency import processutils
++from nova import utils as novautils
++from nova import exception as nova_exception
++
++synchronized = lockutils.synchronized_with_prefix('os-brick-')
++
++LOG = logging.getLogger(__name__)
++
++# disable processutils log
++ori_logging.getLogger('oslo_concurrency.processutils').\
++    setLevel(ori_logging.CRITICAL)
++
++STORAGE_MODE = 'kernel'
++
++def _run_cmd_by_root(cmd, log_cmd=True):
++    # 基于rootwrap机制运行，以rootwrap配置文件中配置的权限运行
++    try:
++        root_helper = novautils.get_root_helper()
++        if log_cmd:
++            LOG.debug('EXECUTE CMD:%s', ' '.join(cmd))
++        return processutils.execute(*cmd, root_helper=root_helper,
++                                    run_as_root=True)
++    except processutils.ProcessExecutionError as e:
++        raise nova_exception.ProcessExecuteException(
++            cmd=(' '.join(cmd) if log_cmd else ""),
++            reason=(e if log_cmd else e.exit_code)
++        ) from None
++
++# 当前不考虑virtio-scsi
++class VDPAConnector(base.BaseLinuxConnector):
++    """Connector class to attach/detach VDPA volumes."""
++    # rootwrap中的名字，实际以rootwrap中配置的绝对路径运行。
++    spdk_rpc_path = 'hw_dpu_rpc.py'
++    smi_path = 'dpak-smi'
++
++    def __init__(self, root_helper, driver=None, execute=putils.execute,
++                 use_multipath=False, *args, **kwargs):
++
++        super(VDPAConnector, self).__init__(root_helper, driver=driver,
++                                            execute=execute, *args, **kwargs)
++        self.use_multipath = use_multipath
++        self.volume_driver = \
++            connector.InitiatorConnector.factory(initiator.ISCSI,
++                                                 novautils.get_root_helper(),
++                                                 use_multipath=self.use_multipath)
++        self.initiator_iqn = self.volume_driver.get_initiator()
++        self.spdk_driver = spdk_lib.BLKVolumeDriver(self.initiator_iqn,
++                                                    storage_mode=STORAGE_MODE)
++
++    def connect_volume(self, connection_info, instance):
++        self.volume_driver.connect_volume(connection_info, instance)
++        LOG.error('ISCSI volume driver has connected the volume!')
++
++    def disconnect_volume(self, connection_info, instance):
++        self.volume_driver.disconnect_volume(connection_info, instance)
++        LOG.error('ISCSI volume driver has disconnected the volume!')
++
++    def get_volume_paths(self, connection_properties):
++        LOG.error('Not implemented')
++        return None
++
++    def get_search_path(self):
++        LOG.error('Not implemented')
++        return None
++
++    def _get_pfs_info_by_type(self, type):
++        cmd = [self.smi_path, 'info', '-t', 'device_pcie_list', '-f', type]
++        out, err = _run_cmd_by_root(cmd)
++        try:
++            pf_infos = json.loads(out)
++        except Exception as e:
++            LOG.error("Get pf info error: {}".format(e))
++            return []
++        LOG.debug("pf infos: {}".format(pf_infos))
++        return pf_infos
++
++    def attach_blk_volume(self, connection_info):
++        vdpa_volume_info = connection_info['data'].get('vdpa_volume_info')
++        # 能够进入这段代码，前面的逻辑已经保证存在vdpa_volume_info字段
++        dbdf = vdpa_volume_info.get('pci')
++        volume_id = connection_info['volume_id']
++        bdev_name = volume_id
++        data = connection_info['data']
++        self.spdk_driver.bdev_create(connection_info)
++        qos_info = data.get('qos_specs')
++        if qos_info:
++            self.spdk_driver.set_bdev_qos(volume_id, qos_info)
++
++        self.spdk_driver.create_blk_controller(dbdf, bdev_name, volume_id)
++
++    def _get_storage_pfs(self):
++        pf_infos = self._get_pfs_info_by_type('storage')
++        pfs = []
++        for pf_info in pf_infos:
++            pfs.append(pf_info['dbdf'])
++
++        return pfs
++
++    def _get_available_slots(self):
++        # get controllers list
++        controllers_info = self.spdk_driver.get_controllers()
++        controllers = self.spdk_driver.parse_controllers_info(controllers_info)
++
++        available_pfs = self._get_storage_pfs()
++        slots = {}
++        max_slots = self.spdk_driver.MAX_SCSI_SLOTS
++
++        for dbdf, scsi_targets in controllers.items():
++            available_pfs.remove(dbdf)
++            if len(scsi_targets) == max_slots:
++                continue
++
++            scsi_targets_unused = list(range(max_slots))
++
++            for scsi_target_num in scsi_targets.keys():
++                scsi_targets_unused.remove(scsi_target_num)
++
++            slots[dbdf] = scsi_targets_unused
++
++        # sort by available slots number
++        if slots:
++            available_controllers = sorted(slots.items(),
++                                           key=lambda item: len(item[1]),
++                                           reverse=True)
++            # return the available pfs and the most idle controller
++            return available_pfs, available_controllers[0]
++
++        return available_pfs, []
++
++    def _get_slots_to_attach(self):
++        available_pfs, available_slots = self._get_available_slots()
++        slots_to_attach = {}
++        if not available_pfs:
++            if not available_slots:
++                # 说明当前系统中所有的PF都被用来创建控制器并且没有可用的槽
++                raise nova_exception.PciDeviceRequestFailed(
++                    "Not enough PF devices available for allocation"
++                )
++            # 说明还有可用的槽，则返回对应的一个控制器及其可用槽位
++            function_id = available_slots[0]
++            scsi_tgt_num = available_slots[1][0]
++        else:
++            function_id = available_pfs[0]
++            scsi_tgt_num = 0
++            self.spdk_driver.create_controller(function_id)
++
++        slots_to_attach['function_id'] = function_id
++        slots_to_attach['scsi_tgt_num'] = scsi_tgt_num
++
++        return slots_to_attach
++
++    def attach_scsi_volume(self, connection_info):
++        volume_id = connection_info['volume_id']
++        bdev_name = volume_id
++        data = connection_info['data']
++
++        self.spdk_driver.bdev_create(connection_info)
++        qos_info = data.get('qos_specs')
++        if qos_info:
++            self.spdk_driver.set_bdev_qos(volume_id, qos_info)
++
++        slots_to_attach = self._get_slots_to_attach()
++        dbdf = slots_to_attach['dbdf']
++        scsi_tgt_num = slots_to_attach['scsi_tgt_num']
++        self.spdk_driver.add_target(bdev_name, dbdf, scsi_tgt_num)
++
++    def _connect_volume(self, data):
++        LOG.debug("Calling os-brick to attach iSCSI Volume")
++        device_info = self.volume_driver.connect_volume(data)
++        LOG.debug("Attached iSCSI volume %s", device_info)
++        if self.use_multipath:
++            device_path = "/dev/disk/by-id/dm-uuid-mpath-" + \
++                          device_info['multipath_id']
++        else:
++            device_path = "/dev/disk/by-path/ip-%s-iscsi-%s-lun-%s" % (
++                data['target_portal'],
++                data['target_iqn'],
++                data['target_lun']
++            )
++        LOG.debug("Attached iSCSI volume device_path %s", device_path)
++        data['device_path'] = device_path
++
++    def _disconnect_volume(self, connection_info):
++        LOG.debug("calling os-brick to detach iSCSI Volume")
++        try:
++            self.volume_driver.disconnect_volume(connection_info['data'], None)
++        except exception.VolumeDeviceNotFound as exc:
++            LOG.warning('Ignoring VolumeDeviceNotFound: %s', exc)
++            return
++        LOG.debug("Disconnected iSCSI Volume")
++
++    def attach_volume(self, connection_info):
++        LOG.info("dpu driver attach_volume volume_id {}".format(connection_info['volume_id']))
++        connection_info['initiator_iqn'] = self.initiator_iqn
++        # iscsiadm connect to target
++        driver_volume_type = connection_info['driver_volume_type']
++        if driver_volume_type == 'iscsi' and self.spdk_driver.STORAGE_MODE == 'kernel':
++            self._connect_volume(connection_info['data'])
++        if not isinstance(self.spdk_driver, spdk_lib.SCSIVolumeDriver):
++            self.attach_blk_volume(connection_info)
++        else:
++            self.attach_scsi_volume(connection_info)
++
++    def detach_blk_volume(self, connection_info):
++        # 获取function_id
++        vdpa_volume_info = connection_info['data'].get('vdpa_volume_info')
++        dbdf = vdpa_volume_info.get('pci')
++
++        volume_id = connection_info['volume_id']
++        # 删除控制器
++        self.spdk_driver.delete_controller(dbdf)
++        # 删除bdev
++        self.spdk_driver.bdev_delete(connection_info, volume_id)
++
++    def _get_scsi_slot_by_bdevname(self, bdev_name):
++        controllers_info = self.spdk_driver.get_controllers()
++        controllers = self.spdk_driver.parse_controllers_info(controllers_info)
++        scsi_tgt_info = {}
++
++        for dbdf, scsi_targets in controllers.items():
++            for scsi_tgt_num, bdev in scsi_targets.items():
++                if bdev == bdev_name:
++                    scsi_tgt_info['scsi_tgt_num'] = scsi_tgt_num
++                    scsi_tgt_info['dbdf'] = dbdf
++                    return scsi_tgt_info
++
++        return None
++
++    def detach_scsi_volume(self, connection_info):
++        volume_id = connection_info['volume_id']
++        bdev_name = volume_id
++        scsi_tgt_info = self._get_scsi_slot_by_bdevname(bdev_name)
++
++        if not scsi_tgt_info:
++            LOG.error('Controller not found')
++            raise exception.PciDeviceNotFound(bdev=str(bdev_name)
++            )
++
++        dbdf = scsi_tgt_info['dbdf']
++        scsi_tgt_num = scsi_tgt_info['scsi_tgt_num']
++        self.spdk_driver.remove_target(bdev_name, dbdf, scsi_tgt_num)
++        delete_controller = self._is_controller_empty(dbdf)
++        self.spdk_driver.bdev_delete(bdev_name)
++
++        # 如果删除了磁盘后，控制器没有磁盘则删除控制器
++        if delete_controller:
++            self.spdk_driver.delete_scsi_controller(dbdf)
++
++    def detach_volume(self, connection_info):
++        # 获取function_id
++        LOG.info("volume driver detach_volume volume_id {}".format(connection_info['volume_id']))
++        if not isinstance(self.spdk_driver, spdk_lib.SCSIVolumeDriver):
++            self.detach_blk_volume(connection_info)
++        else:
++            self.detach_scsi_volume(connection_info)
++
++        driver_volume_type = connection_info['driver_volume_type']
++        if driver_volume_type == 'iscsi' and self.spdk_driver.STORAGE_MODE == 'kernel':
++            self._disconnect_volume(connection_info)
++        _run_cmd_by_root(["sync"])
++
++    def extend_volume(self, connection_info, instance, requested_size):
++        LOG.info("driver extend volume "
++                 "requested size {}".format(requested_size))
++        return  # 当前不支持
+\ No newline at end of file
+diff --git a/os_brick/spdk_lib.py b/os_brick/spdk_lib.py
+new file mode 100644
+index 0000000..6e8d611
+--- /dev/null
++++ b/os_brick/spdk_lib.py
+@@ -0,0 +1,352 @@
++# Copyright 2024 Huawei Technology corp.
++#
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++"""
++A library wrapping the spdk API
++"""
++
++import abc
++import json
++import math
++
++from oslo_log import log as logging
++from oslo_concurrency import processutils
++
++from nova import exception
++from nova import utils
++
++LOG = logging.getLogger(__name__)
++
++def _run_cmd_by_root(cmd, log_cmd=True):
++    # 基于rootwrap机制运行，以rootwrap配置的权限运行
++    try:
++        root_helper = utils.get_root_helper()
++        if log_cmd:
++            LOG.debug('EXECUTE CMD:%s', ' '.join(cmd))
++        return processutils.execute(*cmd, root_helper=root_helper,
++                                    run_as_root=True)
++    except processutils.ProcessExecutionError as e:
++        raise exception.ProcessExecuteException(
++            cmd=(' '.join(cmd) if log_cmd else ""),
++            reason=(e if log_cmd else e.exit_code)
++        ) from None
++
++class BaseSPDKVolumeDriver(object):
++    # rootwrap中的名字，实际以rootwrap中配置的绝对路径运行。
++    spdk_rpc_path = 'hw_dpu_rpc.py'  # '/usr/libexec/spdk/scripts/hw_dpu_rpc.py'
++    rpc_path = 'rpc.py'  # '/usr/libexec/spdk/scripts/rpc.py'
++    smi_path = 'dpak-smi'
++    qos_bytes_map = dict(total_bytes_sec='--rw_mbytes_per_sec',
++                         read_bytes_sec='--r_mbytes_per_sec',
++                         write_bytes_sec='--w_mbytes_per_sec')
++    qos_iops_map = dict(total_iops_sec='--rw_ios_per_sec')
++
++    BYTES_MIN = 1 * 1024 * 1024
++    IOPS_MIN = 1000
++    MiB = 1024 * 1024
++    BDEV_BLOCK_SIZE = 512
++
++    def __init__(self, initiator_iqn, storage_mode='user'):
++        super(BaseSPDKVolumeDriver, self).__init__()
++        self.initiator_iqn = initiator_iqn
++        self.STORAGE_MODE = storage_mode
++
++    def os_ready(self):
++        cmd = [self.spdk_rpc_path, 'os_ready']
++        _run_cmd_by_root(cmd)
++
++    def bdev_create(self, connection_info):
++        driver_volume_type = connection_info['driver_volume_type']
++        if driver_volume_type == 'rbd':
++            self.bdev_rbd_create(connection_info)
++        else:
++            if self.STORAGE_MODE == 'user':
++                self.bdev_user_create(connection_info)
++            elif self.STORAGE_MODE == 'kernel':
++                self.bdev_aio_create(connection_info)
++
++    def bdev_delete(self, connection_info, bdev_name):
++        driver_volume_type = connection_info['driver_volume_type']
++        if driver_volume_type == 'rbd':
++            self.bdev_rbd_delete(bdev_name)
++        else:
++            if self.STORAGE_MODE == 'user':
++                self.bdev_user_delete(bdev_name)
++            elif self.STORAGE_MODE == 'kernel':
++                self.bdev_aio_delete(bdev_name)
++
++    def bdev_rbd_create(self, connection_info):
++        bdev_name = connection_info['volume_id']
++        user = connection_info['data']['auth_username']
++        pool, volume_name = connection_info['data']['name'].split('/')
++        cmd = [self.rpc_path, 'bdev_rbd_create', '--name', bdev_name, '--user',
++               user, pool, volume_name, str(self.BDEV_BLOCK_SIZE)]
++        _run_cmd_by_root(cmd)
++
++    def bdev_rbd_delete(self, bdev_name):
++        cmd = [self.rpc_path, 'bdev_rbd_delete', bdev_name]
++        _run_cmd_by_root(cmd)
++
++    def bdev_aio_create(self, connection_info):
++        device_path = connection_info['data'].get('device_path')
++        bdev_name = connection_info['volume_id']
++        cmd = [self.rpc_path, 'bdev_aio_create', device_path, bdev_name]
++        _run_cmd_by_root(cmd)
++
++    def bdev_aio_delete(self, bdev_name):
++        cmd = [self.rpc_path, 'bdev_aio_delete', bdev_name]
++        _run_cmd_by_root(cmd)
++
++    def bdev_user_create(self, connection_info):
++        data = connection_info['data']
++        bdev_name = connection_info['volume_id']
++
++        # 创建用户态bdev
++        if data.get('auth_username'):
++            temp = 'iscsi://{username}%{password}@{target_portal}/' \
++                   '{target_iqn}/{target_lun}'
++            url_for_run = temp.format(username=data['auth_username'],
++                                      password=data['auth_password'],
++                                      target_portal=data['target_portal'],
++                                      target_iqn=data['target_iqn'],
++                                      target_lun=data['target_lun'])
++            url_for_log = temp.format(username='username',
++                                      password='xxxxxxxx',
++                                      target_portal=data['target_portal'],
++                                      target_iqn=data['target_iqn'],
++                                      target_lun=data['target_lun'])
++        else:
++            temp = 'iscsi://{target_portal}/{target_iqn}/{target_lun}'
++            url_for_run = temp.format(target_portal=data['target_portal'],
++                                      target_iqn=data['target_iqn'],
++                                      target_lun=data['target_lun'])
++            url_for_log = url_for_run
++
++        cmd_for_run = [self.rpc_path, 'bdev_iscsi_create', '-b', bdev_name,
++                       '-i', self.initiator_iqn, '--url', url_for_run]
++        cmd_for_log = cmd_for_run[:-1] + [url_for_log]
++        LOG.debug('EXECUTE CMD:%s', ' '.join(cmd_for_log))
++        _run_cmd_by_root(cmd_for_run, log_cmd=False)
++
++    def bdev_user_delete(self, bdev_name):
++        cmd = [self.rpc_path, 'bdev_iscsi_delete', bdev_name]
++        _run_cmd_by_root(cmd)
++
++    def _convert_qos_bytes(self, bytes_sec):
++        if bytes_sec < self.BYTES_MIN:
++            LOG.warning('bytes_sec < BYTES_MIN, use %d' % self.BYTES_MIN)
++            bytes_sec = self.BYTES_MIN
++        mbytes_sec = int(bytes_sec / self.MiB)
++        return mbytes_sec
++
++    def _convert_qos_iops(self, iops_sec):
++        if iops_sec < self.IOPS_MIN:
++            LOG.warning('iops_sec < IOPS_MIN, use %d' % self.IOPS_MIN)
++            iops_sec = self.IOPS_MIN
++        iops_sec = math.ceil(iops_sec / 1000) * 1000
++        return iops_sec
++
++    def set_bdev_qos(self, volume_id, qos_info):
++        try:
++            self._set_bdev_qos(volume_id, qos_info)
++        except Exception as ex:
++            LOG.warning('Set qos failed, volume_id: %s, reason: %s',
++                        volume_id, ex)
++
++    def _set_bdev_qos(self, volume_id, qos_info):
++        LOG.info('Set bdev volume_id %s, qos_info %s', volume_id, qos_info)
++        if not qos_info:
++            LOG.debug('No qos_info')
++            return
++
++        qos_cmdline = [self.rpc_path, 'bdev_set_qos_limit']
++        qos_cmdline_len = len(qos_cmdline)
++        for qos_set in qos_info:
++            if qos_set in self.qos_bytes_map:
++                qos_bytes = int(qos_info[qos_set])
++                qos_mbytes = self._convert_qos_bytes(qos_bytes)
++                qos_cmdline += [self.qos_bytes_map[qos_set], str(qos_mbytes)]
++            if qos_set in self.qos_iops_map:
++                qos_iops = int(qos_info[qos_set])
++                qos_iops = self._convert_qos_iops(qos_iops)
++                qos_cmdline += [self.qos_iops_map[qos_set], str(qos_iops)]
++        if len(qos_cmdline) != qos_cmdline_len:
++            qos_cmdline.append(volume_id)
++            _run_cmd_by_root(qos_cmdline)
++        else:
++            LOG.warning('No valid qos info')
++
++    def bdev_resize(self, driver_volume_type, bdev_name, requested_size, function_id):
++        """
++        Resize the bdev to the requested_size
++        """
++        if driver_volume_type == 'rbd':
++            new_size_in_mb = requested_size // (1024 * 1024)
++            cmd = [self.rpc_path, 'bdev_rbd_resize', bdev_name, str(new_size_in_mb)]
++            _run_cmd_by_root(cmd)
++        else:
++            if self.STORAGE_MODE == 'user':
++                # requested_size is in bytes
++                new_size_in_mb = requested_size // (1024 * 1024)
++                cmd = [self.spdk_rpc_path, 'bdev_resize', str(function_id),
++                       str(new_size_in_mb)]
++                _run_cmd_by_root(cmd)
++            else:
++                LOG.error('Spdk driver does not support resizing bdev by command')
++                raise NotImplementedError()
++
++    def get_controllers(self, function_id=None):
++        """
++        Execute the command if getting controolers
++
++        returns: The detail information of controllers
++        """
++        # 获取控制器列表
++        get_controllers_cmd = [self.spdk_rpc_path, 'get_controllers']
++        if function_id:
++            get_controllers_cmd.extend(['-f', function_id])
++
++        out, err = _run_cmd_by_root(get_controllers_cmd)
++        controllers_info = json.loads(out)
++
++        return controllers_info
++
++    def delete_controller(self, function_id):
++        """
++        Execute the command of deleting a controller
++        """
++        del_controller_cmd = [self.spdk_rpc_path, 'delete_controller',
++                              str(function_id)]
++        _run_cmd_by_root(del_controller_cmd)
++
++    @abc.abstractmethod
++    def parse_controllers_info(self):
++        """
++        Parse the detail information of controllers and extract the important
++        information such as function_id and the bdev attached.
++
++        :returns: The dict of the important information of controllers
++        """
++
++class SCSIVolumeDriver(BaseSPDKVolumeDriver):
++    def __init__(self, initiator_iqn, storage_mode='kernel'):
++        super(SCSIVolumeDriver, self).__init__(initiator_iqn,
++                                               storage_mode=storage_mode)
++        self.MAX_SCSI_SLOTS = 8
++
++    def create_scsi_controller(self, dbdf):
++        controller_name = 'controller_' + dbdf
++        create_controller_cmd = [self.spdk_rpc_path, 'create_scsi_controller',
++                                 dbdf, controller_name]
++        _run_cmd_by_root(create_controller_cmd)
++
++    def delete_scsi_controller(self, dbdf):
++        controller_name = 'controller_' + dbdf
++        del_controller_cmd = [self.spdk_rpc_path, 'delete_scsi_controller',
++                              controller_name]
++        _run_cmd_by_root(del_controller_cmd)
++
++    def get_scsi_controller(self, name=None):
++        get_controller_cmd = [self.spdk_rpc_path, 'get_scsi_controller']
++        if name:
++            get_controller_cmd.extend(['-n', name])
++
++        _run_cmd_by_root(get_controller_cmd)
++
++    def add_target(self, bdev_name, dbdf, scsi_tgt_num):
++        LOG.debug('Add target to controller %s with scsi_target_num %s',
++                  dbdf, scsi_tgt_num)
++        controller_name = 'controller_' + dbdf
++        add_tgt_cmd = [
++            self.spdk_rpc_path,
++            'scsi_controller_add_target',
++            controller_name,
++            str(scsi_tgt_num),
++            bdev_name
++        ]
++        _run_cmd_by_root(add_tgt_cmd)
++        LOG.debug('Successfully attach the volume %s to controller %s', bdev_name,
++                  controller_name)
++
++    def remove_target(self, bdev_name, dbdf, scsi_tgt_num):
++        LOG.debug('Remove target to controller %s with scsi_target_num %s',
++                  dbdf, scsi_tgt_num)
++        controller_name = 'controller_' + dbdf
++        remove_tgt_cmd = [
++            self.spdk_rpc_path,
++            'scsi_controller_remove_target',
++            controller_name,
++            str(scsi_tgt_num)
++        ]
++
++        _run_cmd_by_root(remove_tgt_cmd)
++        LOG.debug('Successfully detach the volume %s to controller %s', bdev_name,
++                  controller_name)
++
++    def extract_targets_from_controller(self, controller_info):
++        scsi_targets = {}
++        targets = controller_info['scsi_targets']
++
++        for target in targets:
++            scsi_tgt_num = target['scsi_target_num']
++            bdevs_name = target['bdev_name']
++            scsi_targets[scsi_tgt_num] = bdevs_name
++
++        return scsi_targets
++
++    def parse_controllers_info(self, controllers_info):
++        controllers = {}
++        for info in controllers_info:
++            sessions = info['backend_specific']['session']
++            for controller_info in sessions:
++                # multiple controllers in each session
++                dbdf = controller_info['dbdf']
++                scsi_targets = self.extract_targets_from_controller(controller_info)
++                controllers[dbdf] = scsi_targets
++
++        return controllers
++
++    def bdev_resize(self, bdev_name, requested_size, device_path, slot):
++        LOG.error('SPDK driver does not support resizing the bdev by cmd')
++        raise NotImplementedError()
++
++    def scsi_bdev_resize(self, dbdf, scsi_tgt_num, requested_size):
++        # requested_size is in bytes
++        controller_name = 'controller_' + dbdf
++        new_size_in_mb = requested_size // (1024 * 1024)
++        cmd = [self.spdk_rpc_path, 'scsi_bdev_resize', controller_name, str(scsi_tgt_num),
++               str(new_size_in_mb)]
++        _run_cmd_by_root(cmd)
++
++class BLKVolumeDriver(BaseSPDKVolumeDriver):
++    def __init__(self, initiator_iqn, storage_mode='user'):
++        super(BLKVolumeDriver, self).__init__(initiator_iqn,
++                                              storage_mode=storage_mode)
++
++    def create_blk_controller(self, function_id, bdev_name, serial):
++        create_controller_cmd = [self.spdk_rpc_path, 'create_blk_controller',
++                                 bdev_name, str(function_id), '-s', serial]
++        _run_cmd_by_root(create_controller_cmd)
++
++    def parse_controllers_info(self, controllers_info):
++        controllers = {}
++        for info in controllers_info:
++            sessions = info['backend_specific']['session']
++            for controller_info in sessions:
++                # 一个session里面可能有多个控制器
++                function_id = controller_info['function_id']
++                bdev = controller_info['block']['bdev']
++                controllers[function_id] = bdev
++
++        return controllers
