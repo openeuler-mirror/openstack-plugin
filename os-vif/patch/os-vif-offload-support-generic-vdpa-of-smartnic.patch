@@ -150,7 +150,7 @@ index 9516f79..b3ce9e1 100644
 +        elif isinstance(vif, objects.vif.VIFVDPADevice):
 +            self._unplug_vdpa(vif, instance_info)
 diff --git a/vif_plug_ovs/ovsdb/ovsdb_lib.py b/vif_plug_ovs/ovsdb/ovsdb_lib.py
-index 2d5cc15..ae96b81 100644
+index 2d5cc15..85f17df 100644
 --- a/vif_plug_ovs/ovsdb/ovsdb_lib.py
 +++ b/vif_plug_ovs/ovsdb/ovsdb_lib.py
 @@ -41,7 +41,8 @@ class BaseOVS(object):
@@ -163,7 +163,7 @@ index 2d5cc15..ae96b81 100644
              if sys.platform != constants.PLATFORM_WIN32:
                  # Hyper-V with OVS does not support external programming of
                  # virtual interface MTUs via netsh or other Windows tools.
-@@ -60,6 +61,35 @@ class BaseOVS(object):
+@@ -60,6 +61,37 @@ class BaseOVS(object):
          return self.ovsdb.add_br(bridge, may_exist=True,
                                   datapath_type=datapath_type).execute()
  
@@ -171,8 +171,9 @@ index 2d5cc15..ae96b81 100644
 +        cmd = self.ovsdb.db_get('Port', port_name, 'name')
 +        return bool(cmd.execute(check_error=False, log_errors=False))
 +
-+    def create_ovs_vdpa_vif_port(self, bridge, dev, iface_id, mac, instance_id, mtu,
-+                                 interface_type, pci_id, n_rxq=None, max_queues=None, tag=None):
++    def create_ovs_vdpa_vif_port(self, bridge, dev, iface_id, mac, instance_id,
++                                 mtu, interface_type, pci_id, n_rxq=None,
++                                 max_queues=None, tag=None):
 +        LOG.debug("create vdpa vif port")
 +        external_ids = {'iface-id': iface_id,
 +                        'iface-status': 'active',
@@ -182,12 +183,13 @@ index 2d5cc15..ae96b81 100644
 +        if n_rxq:
 +            col_values.append(('options', {'n_rxq': n_rxq}))
 +        if max_queues:
-+            devargs_string = "{PCI_ID},max_queues={MAX_QUEUES_NUM},vf_mac={VF_MAC}".format(
-+                PCI_ID=pci_id, MAX_QUEUES_NUM=max_queues, VF_MAC=mac)
++            devargs_string = "net_hwsp{SUFFIX},pci={PCI}," \
++                             "max_queues={MAX_QUEUES},mac_addr={MAC}".format(
++                SUFFIX=dev, PCI=pci_id, MAX_QUEUES=max_queues, MAC=mac)
 +            col_values.append(('options', {'dpdk-devargs': devargs_string}))
 +        else:
-+            devargs_string = "{PCI_ID},vf_mac={VF_MAC}".format(
-+                PCI_ID=pci_id, VF_MAC=mac)
++            devargs_string = "net_hwsp{SUFFIX},pci={PCI},mac_addr={MAC}".format(
++                SUFFIX=dev, PCI=pci_id, MAC=mac)
 +            col_values.append(('options', {'dpdk-devargs': devargs_string}))
 +        if tag:
 +            col_values.append(('tag', tag))

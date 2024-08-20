@@ -493,6 +493,66 @@ index d82ad6d..97fe063 100644
          evacuate.list_rules(),
          extended_server_attributes.list_rules(),
          extensions.list_rules(),
+diff --git a/nova/policies/dpu.py b/nova/policies/dpu.py
+new file mode 100644
+index 0000000..2ffc403
+--- /dev/null
++++ b/nova/policies/dpu.py
+@@ -0,0 +1,54 @@
++# Copyright 2023 Huawei Technology corp.
++#
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++from oslo_policy import policy
++
++from nova.policies import base
++
++
++BASE_POLICY_NAME = 'os_compute_api:os-dpu'
++
++
++dpu_policies = [
++    policy.DocumentedRuleDefault(
++        BASE_POLICY_NAME,
++        base.RULE_ADMIN_API,
++        "dpu api for an instance",
++        [
++            {
++                'method': 'POST',
++                'path': '/dpu/{server_id}/os-interface'
++            },
++            {
++                'method': 'DELETE',
++                'path': '/dpu/{server_id}/os-interface/{id}'
++            },
++            {
++                'method': 'POST',
++                'path': '/dpu/{server_id}/os-volume'
++            },
++            {
++                'method': 'POST',
++                'path': '/dpu/{server_id}/os-volume/{id}'
++            },
++            {
++                'method': 'POST',
++                'path': '/dpu/{server_id}/os-volume-extend'
++            }
++        ]),
++]
++
++
++def list_rules():
++    return dpu_policies
 diff --git a/nova/virt/ironic/__init__.py b/nova/virt/ironic/__init__.py
 index e37d322..a6f3004 100644
 --- a/nova/virt/ironic/__init__.py
