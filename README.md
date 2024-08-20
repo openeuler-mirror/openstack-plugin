@@ -13,6 +13,7 @@
 - neutron: 15.3.4
 - neutron-lib: 1.29.2
 - nova: 20.6.1
+- os-brick: 2.10.7
 - os-vif: 1.17.0
 - python-neutronclient: 6.14.1
 - python-openstackclient: 4.0.2
