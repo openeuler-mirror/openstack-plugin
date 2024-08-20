@@ -1,0 +1,24 @@
+diff --git a/neutron/plugins/ml2/drivers/openvswitch/mech_driver/mech_openvswitch.py b/neutron/plugins/ml2/drivers/openvswitch/mech_driver/mech_openvswitch.py
+index 422c570..f06f8ac 100644
+--- a/neutron/plugins/ml2/drivers/openvswitch/mech_driver/mech_openvswitch.py
++++ b/neutron/plugins/ml2/drivers/openvswitch/mech_driver/mech_openvswitch.py
+@@ -81,7 +81,8 @@ class OpenvswitchMechanismDriver(mech_agent.SimpleAgentMechanismDriverBase):
+         self.supported_vnic_types = self.blacklist_supported_vnic_types(
+             vnic_types=[portbindings.VNIC_NORMAL,
+                         portbindings.VNIC_DIRECT,
+-                        portbindings.VNIC_SMARTNIC],
++                        portbindings.VNIC_SMARTNIC,
++                        portbindings.VNIC_VHOST_VDPA],
+             blacklist=cfg.CONF.OVS_DRIVER.vnic_type_blacklist
+         )
+         LOG.info("%s's supported_vnic_types: %s",
+@@ -148,6 +149,9 @@ class OpenvswitchMechanismDriver(mech_agent.SimpleAgentMechanismDriverBase):
+         if (context.current.get(portbindings.VNIC_TYPE) ==
+                 portbindings.VNIC_DIRECT):
+             return portbindings.VIF_TYPE_OVS
++        if (context.current.get(portbindings.VNIC_TYPE) ==
++                portbindings.VNIC_VHOST_VDPA):
++            return portbindings.VIF_TYPE_OVS
+         return self.get_supported_vif_type(agent)
+ 
+     def get_vhost_mode(self, iface_types):
