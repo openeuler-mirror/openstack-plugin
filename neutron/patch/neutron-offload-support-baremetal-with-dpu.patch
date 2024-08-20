@@ -1,0 +1,60 @@
+diff --git a/neutron/plugins/ml2/drivers/openvswitch/agent/ovs_neutron_agent.py b/neutron/plugins/ml2/drivers/openvswitch/agent/ovs_neutron_agent.py
+index 1697708..843f37c 100644
+--- a/neutron/plugins/ml2/drivers/openvswitch/agent/ovs_neutron_agent.py
++++ b/neutron/plugins/ml2/drivers/openvswitch/agent/ovs_neutron_agent.py
+@@ -546,8 +546,9 @@ class OVSNeutronAgent(l2population_rpc.L2populationRpcCallBackTunnelMixin,
+         for port_binding in port_data.get('bindings', []):
+             if port_binding['vnic_type'] == portbindings.VNIC_SMARTNIC:
+                 if port_binding['host'] == self.conf.host:
+-                    local_link = (port_binding['profile']
+-                                  ['local_link_information'])
++                    local_link = (port_binding['profile'].get(
++                        'local_link_information'
++                    ))
+                     if local_link:
+                         self._add_port_to_updated_smartnic_ports(
+                             port_data['mac_address'],
+@@ -750,8 +751,9 @@ class OVSNeutronAgent(l2population_rpc.L2populationRpcCallBackTunnelMixin,
+ 
+         def _process_added_ports(smartnic_added_ports):
+             for smartnic_port in smartnic_added_ports:
+-                local_link = (smartnic_port['binding:profile']
+-                              ['local_link_information'])
++                local_link = (smartnic_port['binding:profile'].get(
++                    'local_link_information'
++                ))
+                 if local_link:
+                     self._add_port_to_updated_smartnic_ports(
+                         smartnic_port['mac_address'],
+diff --git a/neutron/plugins/ml2/plugin.py b/neutron/plugins/ml2/plugin.py
+index 2c61f01..15b7c44 100644
+--- a/neutron/plugins/ml2/plugin.py
++++ b/neutron/plugins/ml2/plugin.py
+@@ -557,8 +557,16 @@ class Ml2Plugin(db_base_plugin_v2.NeutronDbPluginV2,
+         # transaction.
+         port = orig_context.current
+         orig_binding = orig_context._binding
++        binding_profile = port.get('binding:profile')
++        hostname = orig_binding.host
++        if orig_binding.vnic_type == 'smart-nic' and binding_profile:
++            dpu_host = binding_profile.get('dpu_host')
++            if dpu_host:
++                hostname = dpu_host
++                LOG.debug('Getting the dpu host to contact with ovs agent')
++
+         new_binding = models.PortBinding(
+-            host=orig_binding.host,
++            host=hostname,
+             vnic_type=orig_binding.vnic_type,
+             profile=orig_binding.profile,
+             vif_type=portbindings.VIF_TYPE_UNBOUND,
+@@ -601,6 +609,9 @@ class Ml2Plugin(db_base_plugin_v2.NeutronDbPluginV2,
+                 port_db = self._get_port(plugin_context, port_id)
+                 cur_binding = p_utils.get_port_binding_by_status_and_host(
+                     port_db.port_bindings, const.ACTIVE)
++                dpu_host = bind_context.host
++                cur_binding.host = dpu_host
++                orig_binding.host = dpu_host
+             except exc.PortNotFound:
+                 port_db, cur_binding = None, None
+             if not port_db or not cur_binding:

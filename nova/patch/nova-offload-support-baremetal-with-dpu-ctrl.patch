@@ -98,6 +98,21 @@ index 6e5d72f..47f66a6 100644
                  try:
                      self.driver.detach_interface(context, instance, vif)
                  except NotImplementedError:
+diff --git a/nova/conf/ironic.py b/nova/conf/ironic.py
+index dc5d241..7d9bc20 100644
+--- a/nova/conf/ironic.py
++++ b/nova/conf/ironic.py
+@@ -89,6 +89,10 @@ Related options:
+              'Nodes matching the partition_key value will be distributed '
+              'between all services specified here. '
+              'If partition_key is unset, this option is ignored.'),
++    cfg.BoolOpt(
++        'volume_use_multipath',
++        default=False,
++        help='Use multipath connection of the iSCSI volume.'),
+ ]
+ 
+ 
 diff --git a/nova/exception.py b/nova/exception.py
 index d178034..5e7aba8 100644
 --- a/nova/exception.py
@@ -293,10 +308,10 @@ index 0000000..78c6224
 +        return response
 diff --git a/nova/virt/ironic/dpu_driver.py b/nova/virt/ironic/dpu_driver.py
 new file mode 100644
-index 0000000..c3785e2
+index 0000000..6b33a6a
 --- /dev/null
 +++ b/nova/virt/ironic/dpu_driver.py
-@@ -0,0 +1,665 @@
+@@ -0,0 +1,672 @@
 +# Copyright 2023 Huawei Technology corp.
 +#
 +#    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -311,6 +326,7 @@ index 0000000..c3785e2
 +#    License for the specific language governing permissions and limitations
 +#    under the License.
 +
++import json
 +import requests
 +import time
 +
@@ -615,6 +631,12 @@ index 0000000..c3785e2
 +            self._clean_up_volume_target(instance, volume_id)
 +            raise exception.VolumeAttachFailed(volume_id=volume_id,
 +                                               reason=response.content)
++        if response.content:
++            dpu_slot_info = json.loads(response.content)
++            LOG.debug('attach_volume response dpu_slot_info %s', dpu_slot_info)
++            connection_info['data']['dpu_slot_info'] = dpu_slot_info
++        else:
++            LOG.warning('attach_volume response content none')
 +
 +    def detach_volume(self, context, connection_info, instance, mountpoint,
 +                      encryption=None):
@@ -962,3 +984,19 @@ index 0000000..c3785e2
 +
 +        LOG.info('finish_revert_migration finished successfully',
 +                 instance=instance)
+diff --git a/nova/virt/ironic/driver.py b/nova/virt/ironic/driver.py
+index 21e62e6..0e7ec05 100644
+--- a/nova/virt/ironic/driver.py
++++ b/nova/virt/ironic/driver.py
+@@ -2108,7 +2108,10 @@ class IronicDriver(virt_driver.ComputeDriver):
+             props['host'] = instance.hostname
+         # Eventually it would be nice to be able to do multipath, but for now
+         # we should at least set the value to False.
+-        props['multipath'] = False
++        props['multipath'] = CONF.ironic.volume_use_multipath
++        LOG.debug('get_volume_connector: %s', props)
++        LOG.debug('my_block_storage_ip: %s', CONF.my_block_storage_ip)
++        LOG.debug('host: %s', CONF.host)
+         return props
+ 
+     def _get_volume_connector_ip(self, instance, node, values):

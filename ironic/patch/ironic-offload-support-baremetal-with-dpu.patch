@@ -553,10 +553,10 @@ index 0000000..08205e0
 +        return response
 diff --git a/ironic/drivers/modules/network/dpu.py b/ironic/drivers/modules/network/dpu.py
 new file mode 100644
-index 0000000..3756268
+index 0000000..c362bbc
 --- /dev/null
 +++ b/ironic/drivers/modules/network/dpu.py
-@@ -0,0 +1,274 @@
+@@ -0,0 +1,285 @@
 +# Copyright 2023 Huawei Technology corp.
 +#
 +#    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -680,24 +680,28 @@ index 0000000..3756268
 +        client = neutron.get_client()
 +        port = neutron._get_port_by_uuid(client, vif_id)
 +        LOG.debug('DpuNetwork vif_attach port: {}'.format(port))
++        binding_profile = port.get('binding:profile')
++        dpu_host = task.node.extra.get('dpu_host')
++        if not dpu_host:
++            msg = ('No dpu host information configured')
++            LOG.error(msg)
++            raise exception.NoValidHost(msg)
++
++        binding_profile['dpu_host'] = dpu_host
++
++        LOG.debug('Updating dpu host %s to port %s', dpu_host, port)
 +        neutron.unbind_neutron_port(vif_id)
 +
 +        LOG.info('DpuNetwork vif_attach plug_vif_dpu '
 +                 'vif_id: {}'.format(vif_id))
 +        response = self._plug_vif_dpu(task, port)
 +
-+        if response.status_code not in [requests.codes.OK,
-+                                        requests.codes.no_content,
-+                                        requests.codes.accepted]:
-+            raise exception.NetworkError(
-+                "Plug vif on dpu error node  %(node_uuid)s; "
-+                "res_msg: %(res_msg)s" %
-+                {'node_uuid': task.node.uuid, 'res_msg': response.content})
 +        port_info = json.loads(response.content)
 +        mac_address = port_info["mac_address"]
 +        body = {
 +            'port': {
-+                'binding:vnic_type': 'baremetal',
++                'binding:vnic_type': 'smart-nic',
++                'binding:profile': binding_profile,
 +                'binding:host_id': task.node.uuid,
 +                'mac_address': mac_address
 +            }
@@ -713,6 +717,7 @@ index 0000000..3756268
 +                    'node': task.node.uuid,
 +                    'exc': e})
 +            LOG.error(msg)
++            self._unplug_vif_dpu(task, vif_id)
 +            raise exception.NetworkError(msg)
 +        LOG.info('DpuNetwork vif_attach done')
 +
@@ -728,15 +733,7 @@ index 0000000..3756268
 +
 +        LOG.info('DpuNetwork vif_detach _unplug_vif_dpu '
 +                 'vif_id: {}'.format(vif_id))
-+        response = self._unplug_vif_dpu(task, vif_id)
-+
-+        if response.status_code not in [requests.codes.OK,
-+                                        requests.codes.no_content,
-+                                        requests.codes.accepted]:
-+            raise exception.NetworkError(
-+                "Unplug vif on dpu error %(node_uuid)s; "
-+                "res_msg: %(res_msg)s" %
-+                {'node_uuid': task.node.uuid, 'res_msg': response.content})
++        self._unplug_vif_dpu(task, vif_id)
 +        LOG.info('DpuNetwork vif_detach done')
 +
 +    def _plug_vif_dpu(self, task, port):
@@ -754,6 +751,13 @@ index 0000000..3756268
 +        }
 +        response = apiclient.create_interface_dpu(task.node.instance_uuid,
 +                                                  interface)
++        if response.status_code not in [requests.codes.OK,
++                                        requests.codes.no_content,
++                                        requests.codes.accepted]:
++            raise exception.NetworkError(
++                "Plug vif on dpu error node  %(node_uuid)s; "
++                "res_msg: %(res_msg)s" %
++                {'node_uuid': task.node.uuid, 'res_msg': response.content})
 +        return response
 +
 +    def _unplug_vif_dpu(self, task, vif_id):
@@ -763,6 +767,13 @@ index 0000000..3756268
 +        port_name = ('vhu' + vif_id)[:NIC_NAME_LEN]
 +        response = apiclient.delete_interface_dpu(task.node.instance_uuid,
 +                                                  port_name)
++        if response.status_code not in [requests.codes.OK,
++                                        requests.codes.no_content,
++                                        requests.codes.accepted]:
++            raise exception.NetworkError(
++                "Unplug vif on dpu error %(node_uuid)s; "
++                "res_msg: %(res_msg)s" %
++                {'node_uuid': task.node.uuid, 'res_msg': response.content})
 +        return response
 +
 +    def vif_list(self, task):
