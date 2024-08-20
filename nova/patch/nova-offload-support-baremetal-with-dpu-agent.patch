@@ -1,0 +1,1678 @@
+diff --git a/nova/api/openstack/compute/dpu.py b/nova/api/openstack/compute/dpu.py
+new file mode 100644
+index 0000000..f649fd7
+--- /dev/null
++++ b/nova/api/openstack/compute/dpu.py
+@@ -0,0 +1,185 @@
++# Copyright 2023 Huawei Technology corp.
++#
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++from webob import exc
++
++from oslo_log import log as logging
++
++from nova.api.openstack import common
++from nova.compute import api as compute
++from nova import exception
++from nova.api.openstack import wsgi
++from nova.policies import dpu as dpu_policies
++
++LOG = logging.getLogger(__name__)
++
++class DPUController(wsgi.Controller):
++    """The DPU API controller for the OpenStack API."""
++
++    def __init__(self, *args, **kwargs):
++        super(DPUController, self).__init__(*args, **kwargs)
++        self.compute_api = compute.API()
++
++    @wsgi.expected_errors((400, 403, 404, 409))
++    def attach_volume(self, req, server_id, body):
++        """Attach a volume to the DPU."""
++        LOG.info("attach_volume server_id:%s", server_id)
++        context = req.environ['nova.context']
++        context.can(dpu_policies.BASE_POLICY_NAME)
++        connection_info = body['connection_info']
++        instance = common.get_instance(self.compute_api, context, server_id)
++
++        try:
++            dpu_slot_info = self.compute_api.attach_volume_dpu(
++                context, instance, connection_info)
++        except exception.VolumeNotFound as e:
++            raise exc.HTTPNotFound(explanation=e.format_message())
++        except (exception.InstanceIsLocked,
++                exception.DevicePathInUse,
++                exception.MultiattachNotSupportedByVirtDriver) as e:
++            raise exc.HTTPConflict(explanation=e.format_message())
++        except exception.InstanceInvalidState as state_error:
++            common.raise_http_conflict_for_instance_invalid_state(
++                state_error, 'attach_volume', server_id)
++        except (exception.InvalidVolume,
++                exception.InvalidDevicePath,
++                exception.InvalidInput,
++                exception.VolumeTaggedAttachNotSupported,
++                exception.MultiattachNotSupportedOldMicroversion,
++                exception.MultiattachToShelvedNotSupported) as e:
++            raise exc.HTTPBadRequest(explanation=e.format_message())
++        except exception.TooManyDiskDevices as e:
++            raise exc.HTTPForbidden(explanation=e.format_message())
++        except exception.VolumeAttachFailed as e:
++            raise exc.HTTPBadRequest(explanation=e.format_message())
++        return dpu_slot_info
++
++    @wsgi.expected_errors((400, 403, 404, 409))
++    def detach_volume(self, req, server_id, id, body):
++        """Detach a volume from the DPU."""
++        LOG.info("Detach_volume server_id:%s, id:%s", server_id, id)
++        context = req.environ['nova.context']
++        context.can(dpu_policies.BASE_POLICY_NAME)
++        connection_info = body['connection_info']
++        volume_id = connection_info['volume_id']
++        if volume_id != id:
++            msg = "detach_volume error, volume_id %s, id %s" % (volume_id, id)
++            LOG.error(msg)
++            raise exc.HTTPBadRequest(msg)
++        instance = common.get_instance(self.compute_api, context, server_id,
++                                       expected_attrs=['device_metadata'])
++
++        try:
++            self.compute_api.detach_volume_dpu(context, instance,
++                                               connection_info)
++        except exception.InvalidVolume as e:
++            raise exc.HTTPBadRequest(explanation=e.format_message())
++        except exception.InvalidInput as e:
++            raise exc.HTTPBadRequest(explanation=e.format_message())
++        except exception.InstanceIsLocked as e:
++            raise exc.HTTPConflict(explanation=e.format_message())
++        except exception.InstanceInvalidState as state_error:
++            common.raise_http_conflict_for_instance_invalid_state(
++                state_error, 'detach_volume', server_id)
++        except exception.VolumeDetachFailed as e:
++            raise exc.HTTPBadRequest(explanation=e.format_message())
++
++    @wsgi.expected_errors((400, 403, 404, 409))
++    def create_interface(self, req, server_id, body):
++        """Attach a port to the DPU."""
++        LOG.info("create_interface server_id:%s", server_id)
++        context = req.environ['nova.context']
++        context.can(dpu_policies.BASE_POLICY_NAME)
++        port_name = body['interfaceAttachment'].get('port_name')
++        port_id = body['interfaceAttachment'].get('port_id')
++        port_status = body['interfaceAttachment'].get('port_status')
++        vm_uuid = body['interfaceAttachment'].get('vm_uuid')
++        mac_address = body['interfaceAttachment'].get('mac_address')
++
++        instance = common.get_instance(self.compute_api, context, server_id)
++
++        try:
++            mac_address = self.compute_api.attach_interface_dpu(
++                context, instance, port_name, port_id, port_status,
++                vm_uuid, mac_address)
++        except (exception.InterfaceAttachFailedNoNetwork,
++                exception.NetworkAmbiguous,
++                exception.NoMoreFixedIps,
++                exception.PortNotUsable,
++                exception.AttachInterfaceNotSupported,
++                exception.SecurityGroupCannotBeApplied,
++                exception.NetworkInterfaceTaggedAttachNotSupported,
++                exception.NetworksWithQoSPolicyNotSupported) as e:
++            raise exc.HTTPBadRequest(explanation=e.format_message())
++        except (exception.InstanceIsLocked,
++                exception.FixedIpAlreadyInUse,
++                exception.PortInUse) as e:
++            raise exc.HTTPConflict(explanation=e.format_message())
++        except (exception.PortNotFound,
++                exception.NetworkNotFound) as e:
++            raise exc.HTTPNotFound(explanation=e.format_message())
++        except exception.PortLimitExceeded as e:
++            raise exc.HTTPForbidden(explanation=e.format_message())
++        except exception.InterfaceAttachFailed as e:
++            raise exc.HTTPInternalServerError(
++                explanation=e.format_message())
++        return {'mac_address': mac_address}
++
++    @wsgi.response(202)
++    @wsgi.expected_errors((400, 403, 404, 409))
++    def delete_interface(self, req, server_id, id):
++        """Detach a port from the DPU."""
++        LOG.info("delete_interface server_id:%s, id:%s", server_id, id)
++        context = req.environ['nova.context']
++        context.can(dpu_policies.BASE_POLICY_NAME)
++        instance = common.get_instance(self.compute_api, context, server_id)
++        try:
++            self.compute_api.detach_interface_dpu(context, instance, id)
++        except exception.InterfaceDetachFailed as e:
++            raise exc.HTTPBadRequest(explanation=e.format_message())
++
++    @wsgi.expected_errors((400, 403, 404, 409))
++    def extend_volume(self, req, server_id, body):
++        """Extend volume size."""
++        LOG.info("extend_volume server_id:%s", server_id)
++        context = req.environ['nova.context']
++        context.can(dpu_policies.BASE_POLICY_NAME)
++        connection_info = body['connection_info']
++        instance = common.get_instance(self.compute_api, context, server_id)
++
++        try:
++            self.compute_api.extend_volume_dpu(context, instance,
++                                               connection_info)
++        except exception.VolumeNotFound as e:
++            raise exc.HTTPNotFound(explanation=e.format_message())
++        except (exception.InstanceIsLocked,
++                exception.DevicePathInUse,
++                exception.MultiattachNotSupportedByVirtDriver) as e:
++            raise exc.HTTPConflict(explanation=e.format_message())
++        except exception.InstanceInvalidState as state_error:
++            common.raise_http_conflict_for_instance_invalid_state(
++                state_error, 'attach_volume', server_id)
++        except (exception.InvalidVolume,
++                exception.InvalidDevicePath,
++                exception.InvalidInput,
++                exception.VolumeTaggedAttachNotSupported,
++                exception.MultiattachNotSupportedOldMicroversion,
++                exception.MultiattachToShelvedNotSupported) as e:
++            raise exc.HTTPBadRequest(explanation=e.format_message())
++        except exception.TooManyDiskDevices as e:
++            raise exc.HTTPForbidden(explanation=e.format_message())
++        except (exception.VolumeExtendFailed,
++                exception.VolumeBDMNotFound,
++                exception.InvalidConnectionInfo) as e:
++            raise exc.HTTPBadRequest(explanation=e.format_message())
+diff --git a/nova/api/openstack/compute/routes.py b/nova/api/openstack/compute/routes.py
+index 763db39..a31c890 100644
+--- a/nova/api/openstack/compute/routes.py
++++ b/nova/api/openstack/compute/routes.py
+@@ -85,6 +85,7 @@ from nova.api.openstack.compute import tenant_networks
+ from nova.api.openstack.compute import versionsV21
+ from nova.api.openstack.compute import virtual_interfaces
+ from nova.api.openstack.compute import volumes
++from nova.api.openstack.compute import dpu
+ from nova.api.openstack import wsgi
+ from nova.api import wsgi as base_wsgi
+ 
+@@ -351,6 +352,8 @@ virtual_interfaces_controller = functools.partial(_create_controller,
+ volumes_controller = functools.partial(_create_controller,
+     volumes.VolumeController, [])
+ 
++dpu_controller = functools.partial(_create_controller,
++    dpu.DPUController, [])
+ 
+ # NOTE(alex_xu): This is structure of this route list as below:
+ # (
+@@ -838,6 +841,22 @@ ROUTE_LIST = (
+     ('/servers/{server_id}/topology', {
+         'GET': [server_topology_controller, 'index']
+     }),
++    ('/dpu/{server_id}/os-interface', {
++        'POST': [dpu_controller, 'create_interface']
++    }),
++    ('/dpu/{server_id}/os-interface/{id}', {
++        'DELETE': [dpu_controller, 'delete_interface']
++    }),
++    ('/dpu/{server_id}/os-volume', {
++        'POST': [dpu_controller, 'attach_volume']
++    }),
++    ('/dpu/{server_id}/os-volume/{id}', {
++        'POST': [dpu_controller, 'detach_volume']
++    }),
++    ('/dpu/{server_id}/os-volume-extend', {
++        'POST': [dpu_controller, 'extend_volume']
++    }),
++
+ )
+ 
+ 
+diff --git a/nova/compute/api.py b/nova/compute/api.py
+index 4fa0cc2..327c423 100644
+--- a/nova/compute/api.py
++++ b/nova/compute/api.py
+@@ -5045,6 +5045,36 @@ class API(base.Base):
+             host_statuses[instance.uuid] = host_status
+         return host_statuses
+ 
++    def attach_interface_dpu(self, context, instance, port_name, port_id,
++                             port_status, vm_uuid, mac_address):
++        LOG.info('attach_interface_dpu id {} '.format(port_id))
++        return self.compute_rpcapi.attach_interface_dpu(
++            context, instance=instance, port_name=port_name, port_id=port_id,
++            port_status=port_status, vm_uuid=vm_uuid, mac_address=mac_address)
++
++    def detach_interface_dpu(self, context, instance, id):
++        LOG.info('detach_interface_dpu id {} '.format(id))
++        return self.compute_rpcapi.detach_interface_dpu(
++            context, instance, id)
++
++    def attach_volume_dpu(self, context, instance, connection_info):
++        volume_id = connection_info['volume_id']
++        LOG.info('attach_volume_dpu volume_id {}'.format(volume_id))
++        return self.compute_rpcapi.attach_volume_dpu(
++            context, instance, connection_info)
++
++    def detach_volume_dpu(self, context, instance, connection_info):
++        volume_id = connection_info['volume_id']
++        LOG.info('detach_volume_dpu volume_id {}'.format(volume_id))
++        return self.compute_rpcapi.detach_volume_dpu(
++            context, instance, connection_info)
++
++    def extend_volume_dpu(self, context, instance, connection_info):
++        volume_id = connection_info['volume_id']
++        LOG.info('extend_volume_dpu volume_id {}'.format(volume_id))
++        return self.compute_rpcapi.extend_volume_dpu(
++            context, instance, connection_info)
++
+ 
+ def target_host_cell(fn):
+     """Target a host-based function to a cell.
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index 6e5d72f..aad77d0 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -9590,3 +9590,95 @@ class ComputeManager(manager.Manager):
+             LOG.debug("Updating migrate VIF profile for port %(port_id)s:"
+                       "%(profile)s", {'port_id': port_id,
+                                       'profile': profile})
++
++    def attach_interface_dpu(self, context, instance, port_name, port_id,
++                             port_status, vm_uuid, mac_address):
++        LOG.info('Handling dpu attach_interface event for port %(port_id)s',
++                 {'port_id': port_id}, instance=instance)
++        try:
++            mac_address = self.driver.attach_interface_dpu(
++                context, instance, port_name, port_id,
++                port_status, vm_uuid, mac_address)
++        except exception.NovaException as ex:
++            LOG.error("attach interface failed, port %(port_id)s, "
++                      "reason: %(msg)s",
++                      {'port_id': port_id, 'msg': ex},
++                      instance=instance)
++            raise exception.InterfaceAttachFailed(instance_uuid=instance.uuid)
++        return mac_address
++
++    def detach_interface_dpu(self, context, instance, port_id):
++        LOG.info('Handling dpu detach_interface event for port %(port_id)s',
++                 {'port_id': port_id}, instance=instance)
++        try:
++            self.driver.detach_interface_dpu(context, instance, port_id)
++        except exception.NovaException as ex:
++            LOG.error("detach interface failed, port %(port_id)s, "
++                      "reason: %(msg)s",
++                      {'port_id': port_id, 'msg': ex},
++                      instance=instance)
++            raise exception.InterfaceDetachFailed(instance_uuid=instance.uuid)
++
++    def attach_volume_dpu(self, context, instance, connection_info):
++        LOG.info('Handling dpu attach_volume event for volume %(vol)s',
++                 {'vol': connection_info['volume_id']}, instance=instance)
++
++        @utils.synchronized(instance.uuid)
++        def do_attach_volume(context, instance, connection_info):
++            volume_id = connection_info['volume_id']
++            try:
++                dpu_slot_info = self.driver.attach_volume(context,
++                                                          connection_info,
++                                                          instance,
++                                                          None)
++            except exception.NovaException as ex:
++                LOG.error('Attach volume failed, '
++                          'volume_id=%(volume_id)s, reason: %(msg)s',
++                          {'volume_id': volume_id, 'msg': ex},
++                          instance=instance)
++                raise exception.VolumeAttachFailed(volume_id=volume_id,
++                                                   reason=ex.format_message())
++            return dpu_slot_info
++
++        return do_attach_volume(context, instance, connection_info)
++
++    def detach_volume_dpu(self, context, instance, connection_info):
++        LOG.info('Handling dpu detach_volume event for volume %(vol)s',
++                 {'vol': connection_info['volume_id']}, instance=instance)
++
++        @utils.synchronized(instance.uuid)
++        def do_detach_volume(context, instance, connection_info):
++            volume_id = connection_info['volume_id']
++            try:
++                self.driver.detach_volume(context, connection_info, instance,
++                                          None)
++            except exception.NovaException as ex:
++                LOG.error('Detach volume failed, '
++                          'volume_id=%(volume_id)s, reason: %(msg)s',
++                          {'volume_id': volume_id, 'msg': ex},
++                          instance=instance)
++                raise exception.VolumeDetachFailed(volume_id=volume_id,
++                                                   reason=ex.format_message())
++
++        do_detach_volume(context, instance, connection_info)
++
++    def extend_volume_dpu(self, context, instance, connection_info):
++        LOG.info('Handling dpu extend_volume event for volume %(vol)s',
++                 {'vol': connection_info['volume_id']}, instance=instance)
++
++        @utils.synchronized(instance.uuid)
++        def do_extend_volume(context, instance, connection_info):
++            volume_id = connection_info['volume_id']
++            requested_size = connection_info['requested_size']
++            try:
++                self.driver.extend_volume(context, connection_info, instance,
++                                          requested_size)
++            except exception.NovaException as ex:
++                LOG.error('Extend volume failed, '
++                          'volume_id=%(volume_id)s, reason: %(msg)s',
++                          {'volume_id': volume_id, 'msg': ex},
++                          instance=instance)
++                raise exception.VolumeExtendFailed(volume_id=volume_id,
++                                                   reason=ex.format_message())
++
++        do_extend_volume(context, instance, connection_info)
+diff --git a/nova/compute/rpcapi.py b/nova/compute/rpcapi.py
+index f37241c..ea2e4b0 100644
+--- a/nova/compute/rpcapi.py
++++ b/nova/compute/rpcapi.py
+@@ -14,6 +14,7 @@
+ """
+ Client side of the compute RPC API.
+ """
++import socket
+ 
+ from oslo_concurrency import lockutils
+ from oslo_log import log as logging
+@@ -1237,3 +1238,48 @@ class ComputeAPI(object):
+         cctxt = client.prepare(server=_compute_host(None, instance),
+                 version=version)
+         return cctxt.cast(ctxt, "trigger_crash_dump", instance=instance)
++
++    def attach_interface_dpu(self, ctxt, instance, port_name, port_id,
++                             port_status, vm_uuid, mac_address):
++        kw = {
++            'instance': instance, 'port_name': port_name, 'port_id': port_id,
++            'port_status': port_status, 'vm_uuid': vm_uuid,
++            'mac_address': mac_address
++        }
++        version = '5.0'
++        hostname = socket.gethostname()
++        cctxt = self.router.client(ctxt).prepare(
++            server=hostname, version=version)
++        return cctxt.call(ctxt, 'attach_interface_dpu', **kw)
++
++    def detach_interface_dpu(self, ctxt, instance, port_id):
++        version = '5.0'
++        hostname = socket.gethostname()
++        cctxt = self.router.client(ctxt).prepare(
++            server=hostname, version=version)
++        return cctxt.call(ctxt, 'detach_interface_dpu', instance=instance,
++                          port_id=port_id)
++
++    def attach_volume_dpu(self, ctxt, instance, connection_info):
++        version = '5.0'
++        hostname = socket.gethostname()
++        cctxt = self.router.client(ctxt).prepare(
++            server=hostname, version=version)
++        return cctxt.call(ctxt, 'attach_volume_dpu', instance=instance,
++                          connection_info=connection_info)
++
++    def detach_volume_dpu(self, ctxt, instance, connection_info):
++        version = '5.0'
++        hostname = socket.gethostname()
++        cctxt = self.router.client(ctxt).prepare(
++            server=hostname, version=version)
++        return cctxt.call(ctxt, 'detach_volume_dpu', instance=instance,
++                          connection_info=connection_info)
++
++    def extend_volume_dpu(self, ctxt, instance, connection_info):
++        version = '5.0'
++        hostname = socket.gethostname()
++        cctxt = self.router.client(ctxt).prepare(
++            server=hostname, version=version)
++        return cctxt.call(ctxt, 'extend_volume_dpu', instance=instance,
++                          connection_info=connection_info)
+diff --git a/nova/conf/ironic.py b/nova/conf/ironic.py
+index dc5d241..8a4bfbf 100644
+--- a/nova/conf/ironic.py
++++ b/nova/conf/ironic.py
+@@ -89,6 +89,15 @@ Related options:
+              'Nodes matching the partition_key value will be distributed '
+              'between all services specified here. '
+              'If partition_key is unset, this option is ignored.'),
++    cfg.BoolOpt(
++        'volume_use_multipath',
++        default=False,
++        help='Use multipath connection of the iSCSI volume.'),
++    cfg.StrOpt(
++        'iscsi_mode',
++        default='kernel',
++        choices=('user', 'kernel'),
++        help='Use user mode or kernel mode when connect to iscsi target.'),
+ ]
+ 
+ 
+diff --git a/nova/exception.py b/nova/exception.py
+index d178034..9ce8ac0 100644
+--- a/nova/exception.py
++++ b/nova/exception.py
+@@ -2553,3 +2553,13 @@ class GetPMEMNamespaceFailed(NovaException):
+ class VPMEMCleanupFailed(NovaException):
+     msg_fmt = _("Failed to clean up the vpmem backend device %(dev)s: "
+                 "%(error)s")
++
++
++class ProcessExecuteException(Invalid):
++    msg_fmt = _("run cmd %(cmd)s failed. "
++                "Reason: %(reason)s")
++
++
++class VolumeExtendFailed(Invalid):
++    msg_fmt = _("Volume %(volume_id)s could not be extended. "
++                "Reason: %(reason)s")
+diff --git a/nova/policies/__init__.py b/nova/policies/__init__.py
+index d82ad6d..97fe063 100644
+--- a/nova/policies/__init__.py
++++ b/nova/policies/__init__.py
+@@ -27,6 +27,7 @@ from nova.policies import console_output
+ from nova.policies import consoles
+ from nova.policies import create_backup
+ from nova.policies import deferred_delete
++from nova.policies import dpu
+ from nova.policies import evacuate
+ from nova.policies import extended_server_attributes
+ from nova.policies import extensions
+@@ -90,6 +91,7 @@ def list_rules():
+         consoles.list_rules(),
+         create_backup.list_rules(),
+         deferred_delete.list_rules(),
++        dpu.list_rules(),
+         evacuate.list_rules(),
+         extended_server_attributes.list_rules(),
+         extensions.list_rules(),
+diff --git a/nova/virt/ironic/__init__.py b/nova/virt/ironic/__init__.py
+index e37d322..a6f3004 100644
+--- a/nova/virt/ironic/__init__.py
++++ b/nova/virt/ironic/__init__.py
+@@ -14,5 +14,7 @@
+ # under the License.
+ 
+ from nova.virt.ironic import driver
++from nova.virt.ironic import dpu_driver
+ 
+ IronicDriver = driver.IronicDriver
++DPUIronicDriver = dpu_driver.DPUIronicDriver
+diff --git a/nova/virt/ironic/dpu_driver.py b/nova/virt/ironic/dpu_driver.py
+new file mode 100644
+index 0000000..949bb38
+--- /dev/null
++++ b/nova/virt/ironic/dpu_driver.py
+@@ -0,0 +1,716 @@
++# Copyright 2023 Huawei Technology corp.
++#
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++"""
++A driver wrapping the Ironic API, such that Nova may provision
++bare metal resources.
++"""
++import json
++import logging as ori_logging
++
++from os_brick import initiator
++from os_brick import exception as os_brick_exception
++from os_brick.initiator import connector
++from oslo_log import log as logging
++from oslo_concurrency import processutils
++from oslo_serialization import jsonutils
++
++from nova.compute import task_states
++import nova.conf
++from nova import exception
++from nova import network
++from nova import context as nova_context
++from nova import objects
++from nova import utils
++from nova.virt.ironic import driver
++from nova.virt.ironic import vif as ironic_vif
++from nova.virt.ironic import spdk_lib
++
++LOG = logging.getLogger(__name__)
++
++# disable processutils log
++ori_logging.getLogger('oslo_concurrency.processutils').\
++    setLevel(ori_logging.CRITICAL)
++
++CONF = nova.conf.CONF
++
++STORAGE_MODE = 'kernel'
++USE_MULTIPATH = True
++
++def _run_cmd_by_root(cmd, log_cmd=True):
++    # 基于rootwrap机制运行，以rootwrap配置文件中配置的权限运行
++    try:
++        root_helper = utils.get_root_helper()
++        if log_cmd:
++            LOG.debug('EXECUTE CMD:%s', ' '.join(cmd))
++        return processutils.execute(*cmd, root_helper=root_helper,
++                                    run_as_root=True)
++    except processutils.ProcessExecutionError as e:
++        raise exception.ProcessExecuteException(
++            cmd=(' '.join(cmd) if log_cmd else ""),
++            reason=(e if log_cmd else e.exit_code)
++        ) from None
++
++class DPUIronicDriver(driver.IronicDriver):
++    # rootwrap中的名字，实际以rootwrap中配置的绝对路径运行。
++    smi_path = 'dpak-smi'
++
++    def __init__(self, virtapi, read_only=False):
++        super(DPUIronicDriver, self).__init__(virtapi)
++        self.vif_driver = ironic_vif.IronicVIFDriver()
++        self.volume_driver = \
++            connector.InitiatorConnector.factory(initiator.ISCSI,
++                                                 utils.get_root_helper(),
++                                                 use_multipath=USE_MULTIPATH)
++        self.initiator_iqn = self.volume_driver.get_initiator()
++        self.network_api = network.API()
++        self.spdk_driver = self.get_spdk_driver()
++
++    def _check_dpu_slot_info(self, dpu_slot_info, volume_id):
++        if not dpu_slot_info:
++            LOG.error('volume %s dpu_slot_info not exist', volume_id)
++            return False
++        type = dpu_slot_info.get('type')
++        if type == 'blk':
++            function_id = dpu_slot_info.get('function_id')
++            if not function_id:
++                LOG.error('volume %s function_id not exist', volume_id)
++                return False
++        elif type == 'scsi':
++            dbdf = dpu_slot_info.get('dbdf')
++            scsi_tgt_num = dpu_slot_info.get('scsi_tgt_num')
++            if not dbdf or scsi_tgt_num is None: # scsi_tgt_num可能为0
++                LOG.error(
++                    'volume %s dpu_slot_info error. dbdf %s scsi_tgt_num %s',
++                    volume_id, dbdf, scsi_tgt_num)
++                return False
++        else:
++            LOG.error('unsupport volume type %s', type)
++            return False
++        return True
++
++    def _recover_volume(self, context, instance):
++        LOG.debug('_recover_volume begine', instance=instance)
++
++        @utils.synchronized(instance.uuid)
++        def _do_recover_volume(context, instance):
++            LOG.debug('_do_recover_volume begine', instance=instance)
++
++            bdms = objects.BlockDeviceMappingList.get_by_instance_uuid(
++                context, instance.uuid)
++            need_os_ready = False
++            for bdm in bdms:
++                if bdm.connection_info is None:
++                    LOG.warning('bdm connection_info is none %s', bdm.volume_id,
++                                instance=instance)
++                    continue
++                connection_info = jsonutils.loads(bdm.connection_info)
++                volume_id = connection_info.get('volume_id')
++                LOG.debug('_recover_volume. volume_id %s', volume_id)
++                data = connection_info.get('data')
++                if not data:
++                    LOG.error('volume_id %s data none', volume_id)
++                    continue
++
++                dpu_slot_info = data.get('dpu_slot_info')
++                if not self._check_dpu_slot_info(dpu_slot_info, volume_id):
++                    continue
++
++                if self.spdk_driver.STORAGE_MODE == 'kernel':
++                    disk_paths = self.volume_driver.get_volume_paths(data)
++                    # lvm下获取的是单路径，oc下的待观察
++                    LOG.debug('disk_paths %s', disk_paths)
++                    if len(disk_paths) == 0:
++                        self._connect_volume(data)  # 今年只搞内核态
++                    else:
++                        # 考虑可能是残留引起的。理论上这个就是自动恢复的
++                        LOG.warning('volume %s disk_paths exist', volume_id)
++                        data['device_path'] = disk_paths[0]
++
++                type = dpu_slot_info.get('type')
++                if type == 'blk':
++                    function_id = dpu_slot_info.get('function_id')
++                    bdevs_info = self.spdk_driver.get_bdevs()
++                    bdev_name = volume_id
++                    if bdev_name in bdevs_info:
++                        LOG.warning('volume %s bdev exist', volume_id)
++                        continue # 控制器也不搞了
++
++                    controllers_info = self.spdk_driver.get_controllers()
++                    controllers = self.spdk_driver.parse_controllers_info(
++                        controllers_info)
++                    if function_id in controllers:
++                        LOG.warning(
++                            'volume %s controller exist function_id %s',
++                            volume_id, function_id)
++                        continue
++
++                    # 插入bdev
++                    self.spdk_driver.bdev_create(connection_info)
++                    qos_info = data.get('qos_specs')
++                    if qos_info:
++                        self.spdk_driver.set_bdev_qos(volume_id, qos_info)
++                    # 插入控制器
++                    self.spdk_driver.create_blk_controller(function_id,
++                                                           bdev_name, volume_id)
++                    # os_ready
++                    need_os_ready = True
++                elif type == 'scsi':
++                    dbdf = dpu_slot_info.get('dbdf')
++                    scsi_tgt_num = dpu_slot_info.get('scsi_tgt_num')
++                    bdevs_info = self.spdk_driver.get_bdevs()
++                    bdev_name = volume_id
++                    if bdev_name in bdevs_info:
++                        LOG.warning('volume %s bdev exist', volume_id)
++                        continue  # 控制器也不搞了
++
++                    controllers_info = self.spdk_driver.get_controllers()
++                    controllers = self.spdk_driver.parse_controllers_info(
++                        controllers_info)
++
++                    # 这里不能只看控制器，考虑一次恢复多个盘，控制器可能是存在的。
++                    controller_exist = dbdf in controllers
++                    if controller_exist and scsi_tgt_num in controllers[dbdf]:
++                        LOG.warning('scsi volume %s target exist '
++                                    'dbdf %s scsi_tgt_num %s',
++                                    volume_id, dbdf, scsi_tgt_num)
++                        continue
++
++                    # 插入bdev
++                    self.spdk_driver.bdev_create(connection_info)
++                    qos_info = data.get('qos_specs')
++                    if qos_info:
++                        self.spdk_driver.set_bdev_qos(volume_id, qos_info)
++                    # 插入控制器
++                    if not controller_exist:
++                        self.spdk_driver.create_scsi_controller(dbdf)
++                    self.spdk_driver.add_target(bdev_name, dbdf, scsi_tgt_num)
++                    # os_ready
++                    need_os_ready = True
++                else:
++                    LOG.error('unsupport volume type %s', type)
++
++            if need_os_ready: # 永远echo好像也没啥问题
++                LOG.info('recover volume done echo storage ready')
++                self.spdk_driver.os_ready()
++            _run_cmd_by_root(['sync'])
++            LOG.debug('_do_recover_volume. end', instance=instance)
++
++        return _do_recover_volume(context, instance)
++
++    def init_host(self, host):
++        """Initialize anything that is necessary for the driver to function.
++
++        :param host: the hostname of the compute host.
++
++        """
++        LOG.debug('init_host.')
++        nodes = self.ironic_connection.nodes()
++        instance_uuid = None
++        for node in nodes:
++            LOG.debug('init host node: {}'.format(node))
++            node_info = self._get_node(node.id)
++            LOG.debug('init host node_info: {}'.format(node_info))
++            LOG.debug('init host node_info extra: {}'.format(node_info.extra))
++            if node_info.extra.get('dpu_host') == CONF.host:
++                instance_uuid = node_info.instance_id
++        LOG.debug('init host instance_uuid: {}'.format(instance_uuid))
++        if not instance_uuid:
++            # 该节点没有绑定instance
++            LOG.info('init_host: no instance')
++            return
++
++        admin_context = nova_context.get_admin_context()
++        try:
++            instance = objects.Instance.get_by_uuid(admin_context, instance_uuid)
++        except exception.InstanceNotFound:
++            LOG.error('init host instance %s not found', instance_uuid)
++            return
++        LOG.debug('vm_state: %s task_state: %s', instance.vm_state,
++                  instance.task_state, instance=instance)
++        resize_states = task_states.resizing_states + (task_states.RESIZE_REVERTING, task_states.RESIZE_CONFIRMING)
++        # 如果在迁移过程中，不恢复
++        if instance.task_state not in resize_states:
++            self._recover_volume(admin_context, instance)
++
++    def _get_storage_type(self):
++        pf_infos = self._get_pfs_info_by_type('storage')
++        if not pf_infos:
++            LOG.error('Can not access to storage pfs')
++            raise exception.PciDeviceRequestFailed(
++                'An exception occurred when got storage pfs.'
++            )
++        # 从第一个pf获取对应的类型
++        storage_type = pf_infos[0]['type']
++
++        return storage_type
++
++    def get_spdk_driver(self):
++        storage_type = self._get_storage_type()
++        if storage_type == 'virtio-blk':
++            return spdk_lib.BLKVolumeDriver(self.initiator_iqn,
++                                            CONF.ironic.iscsi_mode)
++        elif storage_type == 'virtio-scsi':
++            return spdk_lib.SCSIVolumeDriver(self.initiator_iqn,
++                                             CONF.ironic.iscsi_mode)
++        else:
++            raise NotImplementedError('Spdk driver only supports virtio-blk '
++                                      'and virtio-scsi. Type: %s', storage_type)
++
++    def _get_all_pf_info(self):
++        cmd = [self.smi_path, 'info', '-t', 'dbdf_list']
++        out, err = _run_cmd_by_root(cmd)
++        if err:
++            LOG.error('An exception occurred when got all pf info. '
++                      'err: {}'.format(err))
++            raise exception.PciDeviceRequestFailed(
++                'An exception occurred when got all pfs.'
++            )
++        try:
++            pf_infos = json.loads(out)
++        except Exception as e:
++            LOG.error('Get pf info error: {}'.format(e))
++            return []
++        LOG.debug('pf infos: {}'.format(pf_infos))
++        return pf_infos
++
++    def _get_pfs_info_by_type(self, type):
++        cmd = [self.smi_path, 'info', '-t', 'device_pcie_list', '-f', type]
++        out, err = _run_cmd_by_root(cmd)
++        if err:
++            LOG.error('An exception occurred when got all pf info. '
++                      'err: {}'.format(err))
++            raise exception.PciDeviceRequestFailed(
++                'An exception occurred when got all pfs.'
++            )
++        try:
++            pf_infos = json.loads(out)
++        except Exception as e:
++            LOG.error('Get pf info error: {}'.format(e))
++            return []
++        LOG.debug('pf infos: {}'.format(pf_infos))
++        return pf_infos
++
++    def _get_unused_pf(self, type):
++        pf_infos = self._get_pfs_info_by_type(type)
++        for pf_info in pf_infos:
++            if pf_info['used'] == 0:
++                LOG.info('Get unused pf: {}'.format(pf_info))
++                return pf_info
++        return None
++
++    def _get_pf_by_mac(self, mac):
++        pf_infos = self._get_pfs_info_by_type('net')
++        for pf_info in pf_infos:
++            if pf_info['mac'] == mac:
++                if pf_info['used'] == 0:
++                    LOG.info('Get pf by mac: {}'.format(pf_info))
++                    return pf_info
++                else:
++                    LOG.warning('Get pf by mac, '
++                                'pf is in use: {}'.format(pf_info))
++                    return None
++        return None
++
++    def attach_interface_dpu(self, context, instance, port_name, port_id,
++                             port_status, vm_uuid, mac_address):
++        LOG.info('attach_interface port_name:%s, port_id:%s, port_status:%s,'
++                 'vm_uuid:%s, mac_address:%s',
++                 port_name, port_id, port_status, vm_uuid, mac_address)
++        self.vif_driver.show()
++        pf_info = self._get_pf_by_mac(mac_address)
++        if pf_info is None:
++            LOG.warning("No pf's mac can match {}".format(mac_address))
++            pf_info = self._get_unused_pf('net')
++            if pf_info is None:
++                LOG.error('Not enough PF devices available for allocation')
++                raise exception.PciDeviceRequestFailed(
++                    'Not enough PF devices available for allocation'
++                )
++        function_id = pf_info['index']
++        port_status = port_status.lower()
++        mac_address = pf_info['mac']
++        self.vif_driver.plug_vif(port_id=port_id, port_name=port_name,
++                                 mac_address=mac_address,
++                                 instance_uuid=instance.uuid,
++                                 port_status=port_status,
++                                 representor=function_id)
++        LOG.info('attach_interface mac_address:%s', mac_address)
++        self.vif_driver.show()
++        _run_cmd_by_root(["sync"])
++        return mac_address
++
++    def detach_interface_dpu(self, context, instance, port_name):
++        LOG.info('detach_interface_dpu port_name:%s', port_name)
++        self.vif_driver.show()
++        self.vif_driver.unplug_vif(port_name, instance.uuid)
++        self.vif_driver.show()
++        _run_cmd_by_root(['sync'])
++
++    def attach_blk_volume(self, context, connection_info, instance, mountpoint,
++                      disk_bus=None, device_type=None, encryption=None):
++        volume_id = connection_info['volume_id']
++        LOG.info('dpu driver attach_volume volume_id {}'.format(volume_id))
++
++        pf_info = self._get_unused_pf('storage')
++        if pf_info is None:
++            # 如果PF资源不够就直接返回异常
++            raise exception.PciDeviceRequestFailed(
++                'Not enough PF devices available for allocation'
++            )
++        function_id = pf_info['index']
++        bdev_name = volume_id
++        data = connection_info['data']
++        self.spdk_driver.bdev_create(connection_info)
++        qos_info = data.get('qos_specs')
++        if qos_info:
++            self.spdk_driver.set_bdev_qos(volume_id, qos_info)
++        self.spdk_driver.create_blk_controller(function_id, bdev_name,
++                                               volume_id)
++        connection_info['data']['dpu_slot_info'] = {
++            'type': 'blk',
++            'function_id': function_id
++        }
++
++    def _get_storage_pfs(self):
++        pf_infos = self._get_pfs_info_by_type('storage')
++        pfs = []
++        for pf_info in pf_infos:
++            pfs.append(pf_info['dbdf'])
++
++        return pfs
++
++    def _get_available_slots(self):
++        # get controllers list
++        controllers_info = self.spdk_driver.get_controllers()
++        controllers = self.spdk_driver.parse_controllers_info(controllers_info)
++
++        available_pfs = self._get_storage_pfs()
++        slots = {}
++        max_slots = self.spdk_driver.MAX_SCSI_SLOTS
++
++        for dbdf, scsi_targets in controllers.items():
++            available_pfs.remove(dbdf)
++            if len(scsi_targets) == max_slots:
++                continue
++
++            scsi_targets_unused = list(range(max_slots))
++
++            for scsi_target_num in scsi_targets.keys():
++                scsi_targets_unused.remove(scsi_target_num)
++
++            slots[dbdf] = scsi_targets_unused
++
++        # sort by available slots number
++        if slots:
++            available_controllers = sorted(slots.items(),
++                                           key=lambda item: len(item[1]),
++                                           reverse=True)
++            # return the available pfs and the most idle controller
++            return available_pfs, available_controllers[0]
++
++        return available_pfs, []
++
++    def _get_slots_to_attach(self):
++        available_pfs, available_slots = self._get_available_slots()
++        slots_to_attach = {}
++
++        if not available_pfs:
++            if not available_slots:
++                # there is no more slots for creating a controller
++                raise exception.PciDeviceRequestFailed(
++                    'Not enough PF devices available for allocation'
++                )
++            # No more pf but some slots still available
++            dbdf = available_slots[0]
++            scsi_tgt_num = available_slots[1][0]
++        else:
++            dbdf = available_pfs[0]
++            scsi_tgt_num = 0
++            self.spdk_driver.create_scsi_controller(dbdf)
++
++        slots_to_attach['dbdf'] = dbdf
++        slots_to_attach['scsi_tgt_num'] = scsi_tgt_num
++
++        return slots_to_attach
++
++    def attach_scsi_volume(self, context, connection_info, instance, mountpoint,
++                      disk_bus=None, device_type=None, encryption=None):
++        volume_id = connection_info['volume_id']
++        bdev_name = volume_id
++        data = connection_info['data']
++
++        self.spdk_driver.bdev_create(connection_info)
++        qos_info = data.get('qos_specs')
++        if qos_info:
++            self.spdk_driver.set_bdev_qos(volume_id, qos_info)
++
++        slots_to_attach = self._get_slots_to_attach()
++        dbdf = slots_to_attach['dbdf']
++        scsi_tgt_num = slots_to_attach['scsi_tgt_num']
++        self.spdk_driver.add_target(bdev_name, dbdf, scsi_tgt_num)
++        connection_info['data']['dpu_slot_info'] = {
++            'type': 'scsi',
++            'dbdf': dbdf,
++            'scsi_tgt_num': scsi_tgt_num,
++        }
++
++    def _update_volume_pci_info(self, context, connection_info, instance):
++        volume_id = connection_info.get('volume_id')
++        LOG.debug('dpu driver _update_volume_pci_info volume_id %s', volume_id)
++
++        dpu_slot_info = connection_info['data'].get('dpu_slot_info')
++        LOG.debug('dpu driver _update_volume_pci_info dpu_slot_info %s',
++                  dpu_slot_info)
++        if not dpu_slot_info:
++            LOG.warning('_update_volume_pci_info failed, no dpu_slot_info')
++            return
++
++        try:
++            bdm = objects.BlockDeviceMapping.get_by_volume_and_instance(
++                context, volume_id, instance.uuid)
++        except exception.NotFound:
++            LOG.warning('_update_volume_pci_info failed, '
++                        'volume %(vol)s is not attached to instance.',
++                        {'vol': volume_id},
++                        instance=instance)
++            return
++
++        if not bdm.connection_info:
++            LOG.warning('update_volume_pci_info failed, no bdm.connection_info')
++            return
++        bdm_connection_info = jsonutils.loads(bdm.connection_info)
++        bdm_connection_info['data']['dpu_slot_info'] = dpu_slot_info
++        bdm.connection_info = jsonutils.dumps(bdm_connection_info)
++        bdm.save()
++
++    def attach_volume(self, context, connection_info, instance, mountpoint,
++                      disk_bus=None, device_type=None, encryption=None):
++        LOG.info('dpu driver attach_volume volume_id %s',
++                 connection_info['volume_id'])
++        connection_info['initiator_iqn'] = self.initiator_iqn
++        data = connection_info['data']
++        # iscsiadm connect to target
++        self._connect_volume(data)   # 今年只搞内核态
++        if not isinstance(self.spdk_driver, spdk_lib.SCSIVolumeDriver):
++            self.attach_blk_volume(context, connection_info, instance,
++                                   mountpoint, disk_bus=None, device_type=None,
++                                   encryption=None)
++        else:
++            self.attach_scsi_volume(context, connection_info, instance,
++                                    mountpoint, disk_bus=None, device_type=None,
++                                    encryption=None)
++        # update pci slot to db
++        self._update_volume_pci_info(context, connection_info, instance)
++
++        # prepare storage
++        storage_ready = connection_info.get('storage_ready')
++        LOG.info('flag storage_ready: {}'.format(storage_ready))
++        if storage_ready:
++            LOG.info('attach_volume done echo storage ready')
++            self.spdk_driver.os_ready()
++        _run_cmd_by_root(['sync'])
++        dpu_slot_info = connection_info['data'].get('dpu_slot_info')
++        LOG.debug('dpu driver attach_volume dpu_slot_info %s', dpu_slot_info)
++        return dpu_slot_info
++
++    def detach_blk_volume(self, context, connection_info, instance, mountpoint,
++                      encryption=None):
++        # 获取function_id
++        volume_id = connection_info['volume_id']
++        LOG.info('dpu driver detach_volume volume_id {}'.format(volume_id))
++        function_id = self._get_function_id_by_bdevname(volume_id)
++        if not function_id:
++            LOG.error('detach_volume PF not found')
++            raise exception.PciDeviceNotFound(
++                node_id=volume_id, address=str(function_id)
++            )
++        # 删除控制器
++        self.spdk_driver.delete_controller(function_id)
++        self.spdk_driver.bdev_delete(volume_id)
++
++    def _is_controller_empty(self, controller_dbdf):
++        controllers_info = self.spdk_driver.get_controllers()
++        controllers = self.spdk_driver.parse_controllers_info(controllers_info)
++        for dbdf, scsi_targets in controllers.items():
++            if dbdf == controller_dbdf:
++                if scsi_targets:
++                    return False
++                else:
++                    return True
++
++        raise exception.PciDeviceNotFound(
++                address=dbdf
++        )
++
++    def _get_scsi_slot_by_bdevname(self, bdev_name):
++        controllers_info = self.spdk_driver.get_controllers()
++        controllers = self.spdk_driver.parse_controllers_info(controllers_info)
++        scsi_tgt_info = {}
++
++        for dbdf, scsi_targets in controllers.items():
++            for scsi_tgt_num, bdev in scsi_targets.items():
++                if bdev == bdev_name:
++                    scsi_tgt_info['scsi_tgt_num'] = scsi_tgt_num
++                    scsi_tgt_info['dbdf'] = dbdf
++                    return scsi_tgt_info
++
++        return None
++
++    def detach_scsi_volume(self, context, connection_info, instance, mountpoint,
++                      encryption=None):
++        volume_id = connection_info['volume_id']
++        bdev_name = volume_id
++        scsi_tgt_info = self._get_scsi_slot_by_bdevname(bdev_name)
++
++        if not scsi_tgt_info:
++            LOG.error('Controller not found')
++            raise exception.PciDeviceNotFound(
++                node_id=instance.uuid, bdev=str(bdev_name)
++            )
++
++        dbdf = scsi_tgt_info['dbdf']
++        scsi_tgt_num = scsi_tgt_info['scsi_tgt_num']
++        self.spdk_driver.remove_target(bdev_name, dbdf, scsi_tgt_num)
++        delete_controller = self._is_controller_empty(dbdf)
++        self.spdk_driver.bdev_delete(bdev_name)
++
++        # 如果删除了磁盘后，控制器没有磁盘则删除控制器
++        if delete_controller:
++            self.spdk_driver.delete_scsi_controller(dbdf)
++
++    def detach_volume(self, context, connection_info, instance, mountpoint,
++                      encryption=None):
++        LOG.info('dpu driver detach_volume volume_id %s',
++                 connection_info['volume_id'])
++        if not isinstance(self.spdk_driver, spdk_lib.SCSIVolumeDriver):
++            self.detach_blk_volume(context,
++                                   connection_info,
++                                   instance,
++                                   mountpoint,
++                                   encryption=None)
++        else:
++            self.detach_scsi_volume(context,
++                                   connection_info,
++                                   instance,
++                                   mountpoint,
++                                   encryption=None)
++        self._disconnect_volume(connection_info, instance)
++        _run_cmd_by_root(['sync'])
++
++    def extend_volume(self, context, connection_info, instance, requested_size):
++        LOG.info('driver extend volume '
++                 'requested size {}'.format(requested_size))
++
++        if not isinstance(self.spdk_driver, spdk_lib.SCSIVolumeDriver):
++            self._extend_blk_volume(context, connection_info, instance,
++                                    requested_size)
++        else:
++            self._extend_scsi_volume(context, connection_info, instance,
++                                     requested_size)
++        _run_cmd_by_root(['sync'])
++
++    def _get_function_id_by_bdevname(self, bdev_name):
++        # get controllers list
++        controllers_info = self.spdk_driver.get_controllers()
++        controllers = self.spdk_driver.parse_controllers_info(controllers_info)
++
++        for function_id, bdev in controllers.items():
++            if bdev == bdev_name:
++                return function_id
++
++        return None
++
++    def set_bdev_qos(self, connection_info):
++        volume_id = connection_info['volume_id']
++        qos_info = connection_info['data'].get('qos_specs')
++        if qos_info:
++            self.spdk_driver.set_bdev_qos(volume_id, qos_info)
++        LOG.info('Set bdev qos volume_id {}, qos_info {}'.format(volume_id,
++                                                                 qos_info))
++
++    def _refresh_cache(self):
++        LOG.debug('_refresh_cache')
++
++    def _connect_volume(self, data):
++        LOG.debug('Calling os-brick to attach iSCSI Volume')
++        device_info = self.volume_driver.connect_volume(data)
++        if USE_MULTIPATH:
++            device_path = '/dev/disk/by-id/dm-uuid-mpath-' + \
++                          device_info['multipath_id']
++        else:
++            device_path = '/dev/disk/by-path/ip-%s-iscsi-%s-lun-%s' % (
++                data['target_portal'],
++                data['target_iqn'],
++                data['target_lun']
++            )
++        LOG.debug('Attached iSCSI volume device_path %s', device_path)
++        data['device_path'] = device_path
++
++    def _disconnect_volume(self, connection_info, instance):
++        LOG.debug('calling os-brick to detach iSCSI Volume', instance=instance)
++        try:
++            self.volume_driver.disconnect_volume(connection_info['data'], None,
++                                                 True, True)
++        except os_brick_exception.VolumeDeviceNotFound as exc:
++            LOG.warning('Ignoring VolumeDeviceNotFound: %s', exc)
++            return
++        LOG.debug('Disconnected iSCSI Volume', instance=instance)
++
++    def _ob_extend_volume(self, connection_info, instance, requested_size):
++        """Extend the volume."""
++        LOG.debug('calling os-brick to extend iSCSI Volume', instance=instance)
++        new_size = self.volume_driver.extend_volume(connection_info['data'])
++        LOG.debug('Extend iSCSI Volume %s; new_size=%s',
++                  connection_info['volume_id'],
++                  new_size, instance=instance)
++        return new_size
++
++    def _extend_blk_volume(self, context, connection_info, instance,
++                           requested_size):
++        volume_id = connection_info['volume_id']
++        bdev_name = volume_id
++        data = connection_info.get('data')
++        function_id = self._get_function_id_by_bdevname(volume_id)
++        if not function_id:
++            LOG.error('extend_volume PF not found')
++            raise exception.PciDeviceNotFound(
++                node_id=volume_id, address=str(function_id)
++            )
++        if STORAGE_MODE == 'user':
++            self.spdk_driver.bdev_resize(bdev_name, requested_size, function_id)
++        else:
++            self._ob_extend_volume(connection_info, instance, requested_size)
++            self.spdk_driver.bdev_resize(bdev_name, requested_size, function_id)
++
++    def _extend_scsi_volume(self, context, connection_info, instance,
++                            requested_size):
++        volume_id = connection_info['volume_id']
++        bdev_name = volume_id
++        if STORAGE_MODE == 'user':
++            scsi_tgt_info = self._get_scsi_slot_by_bdevname(bdev_name)
++
++            if not scsi_tgt_info:
++                LOG.error('_extend_scsi_volume Controller not found')
++                raise exception.PciDeviceNotFound(
++                    node_id=instance.uuid, bdev=str(bdev_name)
++                )
++
++            dbdf = scsi_tgt_info['dbdf']
++            scsi_tgt_num = scsi_tgt_info['scsi_tgt_num']
++            self.spdk_driver.scsi_bdev_resize(self, dbdf, scsi_tgt_num,
++                                              requested_size)
++        else:
++            self._ob_extend_volume(connection_info, instance, requested_size)
++            self.spdk_driver.bdev_resize(bdev_name, requested_size, None)
+diff --git a/nova/virt/ironic/driver.py b/nova/virt/ironic/driver.py
+index 21e62e6..98653d7 100644
+--- a/nova/virt/ironic/driver.py
++++ b/nova/virt/ironic/driver.py
+@@ -82,7 +82,8 @@ _UNPROVISION_STATES = (ironic_states.ACTIVE, ironic_states.DEPLOYFAIL,
+ 
+ _NODE_FIELDS = ('uuid', 'power_state', 'target_power_state', 'provision_state',
+                 'target_provision_state', 'last_error', 'maintenance',
+-                'properties', 'instance_uuid', 'traits', 'resource_class')
++                'properties', 'instance_uuid', 'traits', 'resource_class',
++                'extra')
+ 
+ # Console state checking interval in seconds
+ _CONSOLE_STATE_CHECKING_INTERVAL = 1
+diff --git a/nova/virt/ironic/spdk_lib.py b/nova/virt/ironic/spdk_lib.py
+new file mode 100644
+index 0000000..a4b1f21
+--- /dev/null
++++ b/nova/virt/ironic/spdk_lib.py
+@@ -0,0 +1,346 @@
++# Copyright 2024 Huawei Technology corp.
++#
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++"""
++A library wrapping the spdk API
++"""
++
++import abc
++import json
++import math
++
++from oslo_log import log as logging
++from oslo_concurrency import processutils
++
++from nova import exception
++from nova import utils
++
++LOG = logging.getLogger(__name__)
++
++def _run_cmd_by_root(cmd, log_cmd=True):
++    # 基于rootwrap机制运行，以rootwrap配置的权限运行
++    try:
++        root_helper = utils.get_root_helper()
++        if log_cmd:
++            LOG.debug('EXECUTE CMD:%s', ' '.join(cmd))
++        return processutils.execute(*cmd, root_helper=root_helper,
++                                    run_as_root=True)
++    except processutils.ProcessExecutionError as e:
++        raise exception.ProcessExecuteException(
++            cmd=(' '.join(cmd) if log_cmd else ""),
++            reason=(e if log_cmd else e.exit_code)
++        ) from None
++
++class BaseSPDKVolumeDriver(object):
++    # rootwrap中的名字，实际以rootwrap中配置的绝对路径运行。
++    spdk_rpc_path = 'hw_dpu_rpc.py'
++    rpc_path = 'rpc.py'
++    smi_path = 'dpak-smi'
++    qos_bytes_map = dict(total_bytes_sec='--rw_mbytes_per_sec',
++                         read_bytes_sec='--r_mbytes_per_sec',
++                         write_bytes_sec='--w_mbytes_per_sec')
++    qos_iops_map = dict(total_iops_sec='--rw_ios_per_sec')
++
++    BYTES_MIN = 1 * 1024 * 1024
++    IOPS_MIN = 1000
++    MiB = 1024 * 1024
++
++    def __init__(self, initiator_iqn, storage_mode='user'):
++        super(BaseSPDKVolumeDriver, self).__init__()
++        self.initiator_iqn = initiator_iqn
++        self.STORAGE_MODE = storage_mode
++
++    def os_ready(self):
++        cmd = [self.spdk_rpc_path, 'os_ready']
++        _run_cmd_by_root(cmd)
++
++    def bdev_create(self, connection_info):
++        if self.STORAGE_MODE == 'user':
++            self.bdev_user_create(connection_info)
++        elif self.STORAGE_MODE == 'kernel':
++            self.bdev_aio_create(connection_info)
++
++    def bdev_delete(self, bdev_name):
++        if self.STORAGE_MODE == 'user':
++            self.bdev_user_delete(bdev_name)
++        elif self.STORAGE_MODE == 'kernel':
++            self.bdev_aio_delete(bdev_name)
++
++    def bdev_aio_create(self, connection_info):
++        device_path = connection_info['data'].get('device_path')
++        bdev_name = connection_info['volume_id']
++        cmd = [self.rpc_path, 'bdev_aio_create', device_path, bdev_name]
++        _run_cmd_by_root(cmd)
++
++    def bdev_aio_delete(self, bdev_name):
++        cmd = [self.rpc_path, 'bdev_aio_delete', bdev_name]
++        _run_cmd_by_root(cmd)
++
++    def bdev_user_create(self, connection_info):
++        data = connection_info['data']
++        bdev_name = connection_info['volume_id']
++
++        # 创建用户态bdev
++        if data.get('auth_username'):
++            temp = 'iscsi://{username}%{password}@{target_portal}/' \
++                   '{target_iqn}/{target_lun}'
++            url_for_run = temp.format(username=data['auth_username'],
++                                      password=data['auth_password'],
++                                      target_portal=data['target_portal'],
++                                      target_iqn=data['target_iqn'],
++                                      target_lun=data['target_lun'])
++            url_for_log = temp.format(username='username',
++                                      password='xxxxxxxx',
++                                      target_portal=data['target_portal'],
++                                      target_iqn=data['target_iqn'],
++                                      target_lun=data['target_lun'])
++        else:
++            temp = 'iscsi://{target_portal}/{target_iqn}/{target_lun}'
++            url_for_run = temp.format(target_portal=data['target_portal'],
++                                      target_iqn=data['target_iqn'],
++                                      target_lun=data['target_lun'])
++            url_for_log = url_for_run
++
++        cmd_for_run = [self.rpc_path, 'bdev_iscsi_create', '-b', bdev_name,
++                       '-i', self.initiator_iqn, '--url', url_for_run]
++        cmd_for_log = cmd_for_run[:-1] + [url_for_log]
++        LOG.debug('EXECUTE CMD:%s', ' '.join(cmd_for_log))
++        _run_cmd_by_root(cmd_for_run, log_cmd=False)
++
++    def bdev_user_delete(self, bdev_name):
++        cmd = [self.rpc_path, 'bdev_iscsi_delete', bdev_name]
++        _run_cmd_by_root(cmd)
++
++    def _convert_qos_bytes(self, bytes_sec):
++        if bytes_sec < self.BYTES_MIN:
++            LOG.warning('bytes_sec < BYTES_MIN, use %d' % self.BYTES_MIN)
++            bytes_sec = self.BYTES_MIN
++        mbytes_sec = int(bytes_sec / self.MiB)
++        return mbytes_sec
++
++    def _convert_qos_iops(self, iops_sec):
++        if iops_sec < self.IOPS_MIN:
++            LOG.warning('iops_sec < IOPS_MIN, use %d' % self.IOPS_MIN)
++            iops_sec = self.IOPS_MIN
++        iops_sec = math.ceil(iops_sec / 1000) * 1000
++        return iops_sec
++
++    def set_bdev_qos(self, volume_id, qos_info):
++        try:
++            self._set_bdev_qos(volume_id, qos_info)
++        except Exception as ex:
++            LOG.warning('Set qos failed, volume_id: %s, reason: %s',
++                        volume_id, ex)
++
++    def _set_bdev_qos(self, volume_id, qos_info):
++        LOG.info('Set bdev volume_id %s, qos_info %s', volume_id, qos_info)
++        if not qos_info:
++            LOG.debug('No qos_info')
++            return
++
++        qos_cmdline = [self.rpc_path, 'bdev_set_qos_limit']
++        qos_cmdline_len = len(qos_cmdline)
++        for qos_set in qos_info:
++            if qos_set in self.qos_bytes_map:
++                qos_bytes = int(qos_info[qos_set])
++                qos_mbytes = self._convert_qos_bytes(qos_bytes)
++                qos_cmdline += [self.qos_bytes_map[qos_set], str(qos_mbytes)]
++            if qos_set in self.qos_iops_map:
++                qos_iops = int(qos_info[qos_set])
++                qos_iops = self._convert_qos_iops(qos_iops)
++                qos_cmdline += [self.qos_iops_map[qos_set], str(qos_iops)]
++        if len(qos_cmdline) != qos_cmdline_len:
++            qos_cmdline.append(volume_id)
++            _run_cmd_by_root(qos_cmdline)
++        else:
++            LOG.warning('No valid qos info')
++
++    def bdev_resize(self, bdev_name, requested_size, function_id):
++        """
++        Resize the bdev to the requested_size
++        """
++        new_size_in_mb = requested_size // (1024 * 1024)
++        if self.STORAGE_MODE == 'user':
++            # requested_size is in bytes
++            cmd = [self.spdk_rpc_path, 'bdev_resize', str(function_id),
++                   str(new_size_in_mb)]
++            _run_cmd_by_root(cmd)
++        elif self.STORAGE_MODE == 'kernel':
++            cmd = [self.spdk_rpc_path, 'bdev_aio_resize', bdev_name,
++                   str(new_size_in_mb)]
++            _run_cmd_by_root(cmd)
++        else:
++            LOG.error('bdev_resize unknow STORAGE_MODE')
++            raise NotImplementedError()
++
++    def get_controllers(self, function_id=None):
++        """
++        Execute the command if getting controllers
++
++        returns: The detail information of controllers
++        """
++        # 获取控制器列表
++        get_controllers_cmd = [self.spdk_rpc_path, 'get_controllers']
++        # 如果functionid不存在，spdk会直接报错，而不是返回空。处理起来很麻烦
++        if function_id:
++            get_controllers_cmd.extend(['-f', function_id])
++
++        out, err = _run_cmd_by_root(get_controllers_cmd)
++        controllers_info = json.loads(out)
++
++        return controllers_info
++
++    def get_bdevs(self, bdev_name=None):
++        """
++        Execute the command if getting bdevs
++
++        returns: The detail information of bdevs
++        """
++        cmd = [self.rpc_path, 'bdev_get_bdevs']
++        # 如果bdev_name不存在，spdk会直接报错，而不是返回空。处理起来很麻烦
++        if bdev_name:
++            cmd.extend(['-b', bdev_name])
++        out, err = _run_cmd_by_root(cmd)
++        bdevs_info = json.loads(out)
++        bdevs = {}
++        for info in bdevs_info:
++            bdev_name = info.get('name')
++            if bdev_name:
++                bdevs[bdev_name] = info
++        return bdevs
++
++    def delete_controller(self, function_id):
++        """
++        Execute the command of deleting a controller
++        """
++        del_controller_cmd = [self.spdk_rpc_path, 'delete_controller',
++                              str(function_id)]
++        _run_cmd_by_root(del_controller_cmd)
++
++    @abc.abstractmethod
++    def parse_controllers_info(self):
++        """
++        Parse the detail information of controllers and extract the important
++        information such as function_id and the bdev attached.
++
++        :returns: The dict of the important information of controllers
++        """
++
++class SCSIVolumeDriver(BaseSPDKVolumeDriver):
++    def __init__(self, initiator_iqn, storage_mode='kernel'):
++        super(SCSIVolumeDriver, self).__init__(initiator_iqn,
++                                               storage_mode=storage_mode)
++        self.MAX_SCSI_SLOTS = 8
++
++    def create_scsi_controller(self, dbdf):
++        controller_name = 'controller_' + dbdf
++        create_controller_cmd = [self.spdk_rpc_path, 'create_scsi_controller',
++                                 dbdf, controller_name]
++        _run_cmd_by_root(create_controller_cmd)
++
++    def delete_scsi_controller(self, dbdf):
++        controller_name = 'controller_' + dbdf
++        del_controller_cmd = [self.spdk_rpc_path, 'delete_scsi_controller',
++                              controller_name]
++        _run_cmd_by_root(del_controller_cmd)
++
++    def get_scsi_controller(self, name=None):
++        get_controller_cmd = [self.spdk_rpc_path, 'get_scsi_controller']
++        if name:
++            get_controller_cmd.extend(['-n', name])
++
++        _run_cmd_by_root(get_controller_cmd)
++
++    def add_target(self, bdev_name, dbdf, scsi_tgt_num):
++        LOG.debug('Add target to controller %s with scsi_target_num %s',
++                  dbdf, scsi_tgt_num)
++        controller_name = 'controller_' + dbdf
++        add_tgt_cmd = [
++            self.spdk_rpc_path,
++            'scsi_controller_add_target',
++            controller_name,
++            str(scsi_tgt_num),
++            bdev_name
++        ]
++        _run_cmd_by_root(add_tgt_cmd)
++        LOG.debug('Successfully attach the volume %s to controller %s', bdev_name,
++                  controller_name)
++
++    def remove_target(self, bdev_name, dbdf, scsi_tgt_num):
++        LOG.debug('Remove target to controller %s with scsi_target_num %s',
++                  dbdf, scsi_tgt_num)
++        controller_name = 'controller_' + dbdf
++        remove_tgt_cmd = [
++            self.spdk_rpc_path,
++            'scsi_controller_remove_target',
++            controller_name,
++            str(scsi_tgt_num)
++        ]
++
++        _run_cmd_by_root(remove_tgt_cmd)
++        LOG.debug('Successfully detach the volume %s to controller %s', bdev_name,
++                  controller_name)
++
++    def extract_targets_from_controller(self, controller_info):
++        scsi_targets = {}
++        targets = controller_info['scsi_targets']
++
++        for target in targets:
++            scsi_tgt_num = target['scsi_target_num']
++            bdevs_name = target['bdev_name']
++            scsi_targets[scsi_tgt_num] = bdevs_name
++
++        return scsi_targets
++
++    def parse_controllers_info(self, controllers_info):
++        controllers = {}
++        for info in controllers_info:
++            sessions = info['backend_specific']['session']
++            for controller_info in sessions:
++                # multiple controllers in each session
++                dbdf = controller_info['dbdf']
++                scsi_targets = self.extract_targets_from_controller(controller_info)
++                controllers[dbdf] = scsi_targets
++
++        return controllers
++
++    def scsi_bdev_resize(self, dbdf, scsi_tgt_num, requested_size):
++        # requested_size is in bytes
++        controller_name = 'controller_' + dbdf
++        new_size_in_mb = requested_size // (1024 * 1024)
++        cmd = [self.spdk_rpc_path, 'scsi_bdev_resize', controller_name,
++               str(scsi_tgt_num), str(new_size_in_mb)]
++        _run_cmd_by_root(cmd)
++
++class BLKVolumeDriver(BaseSPDKVolumeDriver):
++    def __init__(self, initiator_iqn, storage_mode='kernel'):
++        super(BLKVolumeDriver, self).__init__(initiator_iqn,
++                                              storage_mode=storage_mode)
++
++    def create_blk_controller(self, function_id, bdev_name, serial):
++        create_controller_cmd = [self.spdk_rpc_path, 'create_blk_controller',
++                                 bdev_name, str(function_id), '-s', serial]
++        _run_cmd_by_root(create_controller_cmd)
++
++    def parse_controllers_info(self, controllers_info):
++        controllers = {}
++        for info in controllers_info:
++            sessions = info['backend_specific']['session']
++            for controller_info in sessions:
++                # 一个session里面可能有多个控制器
++                function_id = controller_info['function_id']
++                bdev = controller_info['block']['bdev']
++                controllers[function_id] = bdev
++
++        return controllers
+diff --git a/nova/virt/ironic/vif.py b/nova/virt/ironic/vif.py
+new file mode 100644
+index 0000000..e8045ee
+--- /dev/null
++++ b/nova/virt/ironic/vif.py
+@@ -0,0 +1,77 @@
++# Copyright 2023 Huawei Technology corp.
++#
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++from oslo_concurrency import processutils
++from oslo_log import log as logging
++
++import nova.conf
++from nova import exception
++from nova import profiler
++from nova import utils
++
++CONF = nova.conf.CONF
++
++LOG = logging.getLogger(__name__)
++MAX_QUEUES = 4
++
++@profiler.trace_cls("ironic_vif_driver")
++class IronicVIFDriver():
++    def _ovs_vsctl(self, args):
++        full_args = ['ovs-vsctl'] + args
++        try:
++            root_helper = utils.get_root_helper()
++            LOG.debug('EXECUTE CMD:%s', ' '.join(full_args))
++            return processutils.execute(*full_args, root_helper=root_helper,
++                                        run_as_root=True)
++        except Exception as e:
++            LOG.error("Unable to execute %(cmd)s. Exception: %(exception)s",
++                      {'cmd': full_args, 'exception': e})
++            raise exception.OVSConfigurationFailure(inner_exception=e)
++
++    def plug_vif(self, port_id, port_name, mac_address, instance_uuid,
++                 port_status, representor, timeout=120, interface_type='dpdk'):
++        bridge = CONF.neutron.ovs_bridge
++        cmd = [
++            '--timeout=%s' % timeout,
++            '--if-exists', 'del-port', port_name, '--',
++            'add-port', bridge, port_name,
++            '--', 'set', 'Interface', port_name,
++            'external-ids:iface-id=%s' % port_id,
++            'external-ids:iface-status=%s' % port_status,
++            'external-ids:attached-mac=%s' % mac_address,
++            'external-ids:vm-uuid=%s' % instance_uuid,
++            'option:dpdk-devargs=%s,representor=%s,max_queues=%s' %
++            ("net_hwsp" + port_name, representor, MAX_QUEUES),
++            'options:n_rxq=4',
++        ]
++        if interface_type:
++            cmd += ['type=%s' % interface_type]
++        out, err = self._ovs_vsctl(cmd)
++        if err:
++            LOG.error("plug_vif fail: %s", err)
++            raise exception.InterfaceAttachFailed(instance_uuid)
++
++    def unplug_vif(self, port_name, instance_uuid, timeout=60):
++        bridge = CONF.neutron.ovs_bridge
++        cmd = ['--timeout=%s' % timeout, '--if-exists', 'del-port', bridge, port_name]
++        out, err = self._ovs_vsctl(cmd)
++        if err:
++            LOG.error("unplug_vif fail: %s", err)
++            raise exception.InterfaceDetachFailed(instance_uuid)
++
++    def show(self, timeout=20):
++        cmd = ['--timeout=%s' % timeout, 'show']
++        out, err = self._ovs_vsctl(cmd)
++        LOG.debug("ovs-vsctl show error: {}, out: {}".format(err, out))
++        return out

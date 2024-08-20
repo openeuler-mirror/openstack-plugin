@@ -24,7 +24,7 @@
   - nova-offload-support-baremetal-with-dpu-ctrl.patch 应用于裸机管理节点的nova项目
   - ironic-offload-support-baremetal-with-dpu.patch 应用于裸机管理节点的ironic项目
   - nova-offload-support-baremetal-with-dpu-agent.patch 应用于DPU上的nova项目
-  - neutron-offload-support-baremetal-with-dpu.patch 应用于裸机管理节点的neutron项目
+  - neutron-offload-support-baremetal-with-dpu.patch 应用于裸机管理节点以及DPU上的neutron项目
 - 支持纳管网络vDPA设备（virtio-net）。一共包含6个patch，其中：
   - nova-offload-support-generic-vdpa-of-smartnic-20231129.patch 应用于控制节点和计算节点的nova项目
   - os-vif-offload-support-generic-vdpa-of-smartnic-20231129.patch 应用于控制节点和计算节点的os-vif项目
