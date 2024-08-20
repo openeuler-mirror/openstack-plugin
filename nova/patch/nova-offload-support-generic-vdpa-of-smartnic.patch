@@ -1,5 +1,5 @@
 diff --git a/nova/compute/manager.py b/nova/compute/manager.py
-index 6e5d72f..c9a5cff 100644
+index 6e5d72f..a356f22 100644
 --- a/nova/compute/manager.py
 +++ b/nova/compute/manager.py
 @@ -5552,7 +5552,7 @@ class ComputeManager(manager.Manager):
@@ -161,7 +161,7 @@ index 6e5d72f..c9a5cff 100644
 +        try:
 +            pci_device = self._claim_pci_device_for_interface_attach(
 +                context, instance, pci_reqs)
-+        except exception.InterfaceAttachPciClaimFailed:
++        except exception.PciDeviceRequestFailed:
 +            raise exception.InterfaceAttachFailed(
 +                instance_uuid=instance.uuid)
 +
@@ -257,14 +257,14 @@ index b2ba014..4106ed7 100644
      def allocate_pci_devices_for_instance(self, context, instance):
          """Allocate instance claimed PCI resources
 diff --git a/nova/exception.py b/nova/exception.py
-index d178034..6ec5f79 100644
+index d178034..64b4ee9 100644
 --- a/nova/exception.py
 +++ b/nova/exception.py
 @@ -690,6 +690,11 @@ class VolumeBDMPathNotFound(VolumeBDMNotFound):
      msg_fmt = _("No volume Block Device Mapping at path: %(path)s")
  
  
-+class InterfaceAttachPciClaimFailed():
++class InterfaceAttachPciClaimFailed(Invalid):
 +    msg_fmt = _("Failed to claim PCI device for %(instance_uuid)s during "
 +                "interface attach")
 +
@@ -798,7 +798,7 @@ index 5b0a082..6e809c5 100644
 +        #             {'vfaddress': vfaddress})
          return
 diff --git a/nova/virt/libvirt/config.py b/nova/virt/libvirt/config.py
-index 39c4da8..a9d35d8 100644
+index 39c4da8..aad5ecc 100644
 --- a/nova/virt/libvirt/config.py
 +++ b/nova/virt/libvirt/config.py
 @@ -2042,6 +2042,35 @@ class LibvirtConfigGuestHostdevPCI(LibvirtConfigGuestHostdev):
@@ -825,19 +825,38 @@ index 39c4da8..a9d35d8 100644
 +    def parse_dom(self, xmldoc):
 +        childs = super(LibvirtConfigGuestHostdevPCI, self).parse_dom(xmldoc)
 +        for c in childs:
-+            if c.tag == "source":
-+                for sub in c:
-+                    if sub.tag == 'address':
-+                        self.domain = sub.get('domain')
-+                        self.bus = sub.get('bus')
-+                        self.slot = sub.get('slot')
-+                        self.function = sub.get('function')
++            if c.tag == 'source':
++                self.source_dev = c.get('dev')
++            elif c.tag == 'address':
++                self.domain = c.get('domain')
++                self.bus = c.get('bus')
++                self.slot = c.get('slot')
++                self.function = c.get('function')
 +
 +
  class LibvirtConfigGuestHostdevMDEV(LibvirtConfigGuestHostdev):
      def __init__(self, **kwargs):
          super(LibvirtConfigGuestHostdevMDEV, self).__init__(
-@@ -2886,9 +2915,12 @@ class LibvirtConfigNodeDevice(LibvirtConfigObject):
+@@ -2783,6 +2812,7 @@ class LibvirtConfigGuest(LibvirtConfigObject):
+         # Note: This cover only for: LibvirtConfigGuestDisks
+         #                            LibvirtConfigGuestFilesys
+         #                            LibvirtConfigGuestHostdevPCI
++        #                            LibvirtConfigGuestVDPAPCI
+         #                            LibvirtConfigGuestHostdevMDEV
+         #                            LibvirtConfigGuestInterface
+         #                            LibvirtConfigGuestUidMap
+@@ -2804,6 +2834,10 @@ class LibvirtConfigGuest(LibvirtConfigObject):
+                         obj = LibvirtConfigGuestHostdevPCI()
+                         obj.parse_dom(d)
+                         self.devices.append(obj)
++                    elif d.tag == 'hostdev' and d.get('type') == 'vdpa':
++                        obj = LibvirtConfigGuestVDPAPCI()
++                        obj.parse_dom(d)
++                        self.devices.append(obj)
+                     elif d.tag == 'hostdev' and d.get('type') == 'mdev':
+                         obj = LibvirtConfigGuestHostdevMDEV()
+                         obj.parse_dom(d)
+@@ -2886,9 +2920,12 @@ class LibvirtConfigNodeDevice(LibvirtConfigObject):
          super(LibvirtConfigNodeDevice, self).__init__(root_name="device",
                                                  **kwargs)
          self.name = None
@@ -850,7 +869,7 @@ index 39c4da8..a9d35d8 100644
  
      def parse_dom(self, xmldoc):
          super(LibvirtConfigNodeDevice, self).parse_dom(xmldoc)
-@@ -2896,6 +2928,8 @@ class LibvirtConfigNodeDevice(LibvirtConfigObject):
+@@ -2896,6 +2933,8 @@ class LibvirtConfigNodeDevice(LibvirtConfigObject):
          for c in xmldoc:
              if c.tag == "name":
                  self.name = c.text
@@ -859,7 +878,7 @@ index 39c4da8..a9d35d8 100644
              elif c.tag == "parent":
                  self.parent = c.text
              elif c.tag == "capability" and c.get("type") in ['pci', 'net']:
-@@ -2906,6 +2940,23 @@ class LibvirtConfigNodeDevice(LibvirtConfigObject):
+@@ -2906,6 +2945,23 @@ class LibvirtConfigNodeDevice(LibvirtConfigObject):
                  mdev_info = LibvirtConfigNodeDeviceMdevInformation()
                  mdev_info.parse_dom(c)
                  self.mdev_information = mdev_info
@@ -883,7 +902,7 @@ index 39c4da8..a9d35d8 100644
  
  
  class LibvirtConfigNodeDevicePciCap(LibvirtConfigObject):
-@@ -2925,6 +2976,7 @@ class LibvirtConfigNodeDevicePciCap(LibvirtConfigObject):
+@@ -2925,6 +2981,7 @@ class LibvirtConfigNodeDevicePciCap(LibvirtConfigObject):
          self.numa_node = None
          self.fun_capability = []
          self.mdev_capability = []
@@ -891,7 +910,7 @@ index 39c4da8..a9d35d8 100644
          self.interface = None
          self.address = None
          self.link_state = None
-@@ -2967,6 +3019,9 @@ class LibvirtConfigNodeDevicePciCap(LibvirtConfigObject):
+@@ -2967,6 +3024,9 @@ class LibvirtConfigNodeDevicePciCap(LibvirtConfigObject):
                  mdevcap = LibvirtConfigNodeDeviceMdevCapableSubFunctionCap()
                  mdevcap.parse_dom(c)
                  self.mdev_capability.append(mdevcap)
@@ -901,7 +920,7 @@ index 39c4da8..a9d35d8 100644
  
  
  class LibvirtConfigNodeDevicePciSubFunctionCap(LibvirtConfigObject):
-@@ -3026,6 +3081,101 @@ class LibvirtConfigNodeDeviceMdevInformation(LibvirtConfigObject):
+@@ -3026,6 +3086,101 @@ class LibvirtConfigNodeDeviceMdevInformation(LibvirtConfigObject):
                  self.iommu_group = int(c.get('number'))
  
  
@@ -1004,7 +1023,7 @@ index 39c4da8..a9d35d8 100644
  
      def __init__(self, **kwargs):
 diff --git a/nova/virt/libvirt/driver.py b/nova/virt/libvirt/driver.py
-index f51463f..3379ace 100644
+index f51463f..d0c4eda 100644
 --- a/nova/virt/libvirt/driver.py
 +++ b/nova/virt/libvirt/driver.py
 @@ -366,7 +366,7 @@ class LibvirtDriver(driver.ComputeDriver):
@@ -1081,7 +1100,81 @@ index f51463f..3379ace 100644
              ]
  
              # use detach_pci_devices to avoid failure in case of
-@@ -6782,27 +6794,45 @@ class LibvirtDriver(driver.ComputeDriver):
+@@ -6315,6 +6327,61 @@ class LibvirtDriver(driver.ComputeDriver):
+                           cleanup_instance_dir=cleanup_instance_dir,
+                           cleanup_instance_disks=cleanup_instance_disks)
+ 
++    def _get_vdpa_device_map(self, network_info):
++        """Create the map from old device path to new device path of vdpa"""
++        vdpa_device_map = {}
++
++        for vif in network_info:
++            if vif.get('vnic_type') == 'vdpa':
++                old_vdpa_device = vif['profile']['old_dev_path']
++                vdpa_device_map[old_vdpa_device] = vif
++
++        return vdpa_device_map
++
++    def _update_guest_vdpa(self, xml, vdpa_device_map, instance):
++        xml_doc = etree.fromstring(xml)
++        instance_uuid = xml_doc.findtext('uuid')
++        parser = etree.XMLParser(remove_blank_text=True)
++        hostdev_nodes = xml_doc.findall('./devices/hostdev')
++
++        if hostdev_nodes is None:
++            return xml
++
++        for host_dev in hostdev_nodes:
++            dev_type = host_dev.get('type')
++            if dev_type != 'vdpa':
++                continue
++
++            source = host_dev.find('source')
++            if source is None:
++                continue
++
++            dev_path = source.get('dev')
++            vif = vdpa_device_map.get(dev_path)
++            vif_config = self.vif_driver.get_config(
++                instance=instance,
++                vif=vif,
++                image_meta=instance.image_meta,
++                inst_type=instance.flavor,
++                virt_type=CONF.libvirt.virt_type,
++                host=self._host
++            )
++
++            conf_xml = vif_config.to_xml()
++            LOG.debug('Updating guest XML with vif config: %s', conf_xml,
++                      instance_uuid=instance_uuid)
++
++            new_hostdev_elem = etree.XML(conf_xml, parser)
++            host_dev.clear()
++            # Insert attributes.
++            for attr_name, attr_value in new_hostdev_elem.items():
++                host_dev.set(attr_name, attr_value)
++            # Insert sub-elements
++            for index, dest_interface_subelem in enumerate(new_hostdev_elem):
++                host_dev.insert(index, dest_interface_subelem)
++
++        return etree.tostring(xml_doc, encoding='unicode')
++
+     def _create_domain_and_network(self, context, xml, instance, network_info,
+                                    block_device_info=None, power_on=True,
+                                    vifs_already_plugged=False,
+@@ -6339,6 +6406,11 @@ class LibvirtDriver(driver.ComputeDriver):
+                     instance, events, deadline=timeout,
+                     error_callback=self._neutron_failed_callback):
+                 self.plug_vifs(instance, network_info)
++                # if existing vdpa device, update the guest xml
++                vdpa_device_map = self._get_vdpa_device_map(network_info)
++                if vdpa_device_map:
++                    xml = self._update_guest_vdpa(xml, vdpa_device_map, instance)
++
+                 self.firewall_driver.setup_basic_filtering(instance,
+                                                            network_info)
+                 self.firewall_driver.prepare_instance_filter(instance,
+@@ -6782,27 +6854,45 @@ class LibvirtDriver(driver.ComputeDriver):
          """
          # Bail early if we know we can't support `listDevices` to avoid
          # repeated warnings within a periodic task
@@ -1114,7 +1207,7 @@ index f51463f..3379ace 100644
 +            dev.name(): dev for dev in
 +            self._host.list_all_devices(flags=dev_flags)
 +        }
- 
++
 +        # NOTE(mnaser): The listCaps() function can raise an exception if the
 +        #               device disappeared while we're looping, this method
 +        #               returns an empty list rather than raising an exception
@@ -1125,7 +1218,7 @@ index f51463f..3379ace 100644
 +                return dev.listCaps()
 +            except libvirt.libvirtError:
 +                return []
-+
+ 
 +        net_devs = [
 +            dev for dev in devices.values() if "net" in _safe_list_caps(dev)
 +        ]
@@ -1145,7 +1238,7 @@ index f51463f..3379ace 100644
          return jsonutils.dumps(pci_info)
  
      def _get_mdev_capabilities_for_dev(self, devname, types=None):
-@@ -8587,7 +8617,14 @@ class LibvirtDriver(driver.ComputeDriver):
+@@ -8587,7 +8677,14 @@ class LibvirtDriver(driver.ComputeDriver):
              if vif['vnic_type'] in direct_vnics:
                  LOG.info("Detaching vif %s from instnace "
                           "%s for live migration", vif['id'], instance.id)
@@ -1161,7 +1254,7 @@ index f51463f..3379ace 100644
  
      def _live_migration_operation(self, context, instance, dest,
                                    block_migration, migrate_data, guest,
-@@ -8630,10 +8667,9 @@ class LibvirtDriver(driver.ComputeDriver):
+@@ -8630,10 +8727,9 @@ class LibvirtDriver(driver.ComputeDriver):
              migrate_uri = None
              if ('target_connect_addr' in migrate_data and
                      migrate_data.target_connect_addr is not None):
@@ -1173,7 +1266,7 @@ index f51463f..3379ace 100644
  
              new_xml_str = None
              if CONF.libvirt.virt_type != "parallels":
-@@ -9144,8 +9180,12 @@ class LibvirtDriver(driver.ComputeDriver):
+@@ -9144,8 +9240,12 @@ class LibvirtDriver(driver.ComputeDriver):
                  if vif['vnic_type'] in direct_vnics:
                      LOG.info("Attaching vif %s to instance %s",
                               vif['id'], instance.id)
@@ -1188,7 +1281,7 @@ index f51463f..3379ace 100644
  
      def rollback_live_migration_at_source(self, context, instance,
                                            migrate_data):
-@@ -9217,6 +9257,17 @@ class LibvirtDriver(driver.ComputeDriver):
+@@ -9217,6 +9317,19 @@ class LibvirtDriver(driver.ComputeDriver):
                                  instance=instance)
                      greenthread.sleep(1)
  
@@ -1196,9 +1289,11 @@ index f51463f..3379ace 100644
 +        for index in range(len(migrate_data.vifs)):
 +            migrate_vif = migrate_data.vifs[index]
 +            profile = jsonutils.loads(migrate_vif.profile_json)
-+            dev_path = self._host.get_vdpa_device_path(profile['pci_slot'])
-+            dev_path_dict = {"dev_path": dev_path}
-+            profile.update(dev_path_dict)
++
++            if profile.get('pci_slot'):
++                dev_path = self._host.get_vdpa_device_path(profile['pci_slot'])
++                dev_path_dict = {'dev_path': dev_path}
++                profile.update(dev_path_dict)
 +            migrate_vif.profile_json = jsonutils.dumps(profile)
 +            migrate_data.vifs[index] = migrate_vif
 +        return migrate_data
@@ -1206,7 +1301,7 @@ index f51463f..3379ace 100644
      def pre_live_migration(self, context, instance, block_device_info,
                             network_info, disk_info, migrate_data):
          """Preparation live migration."""
-@@ -9315,6 +9366,8 @@ class LibvirtDriver(driver.ComputeDriver):
+@@ -9315,6 +9428,8 @@ class LibvirtDriver(driver.ComputeDriver):
          self._pre_live_migration_plug_vifs(
              instance, network_info, migrate_data)
  
@@ -1216,16 +1311,22 @@ index f51463f..3379ace 100644
          if not migrate_data:
              migrate_data = objects.LibvirtLiveMigrateData(bdms=[])
 diff --git a/nova/virt/libvirt/guest.py b/nova/virt/libvirt/guest.py
-index a7fbc50..a606abf 100644
+index a7fbc50..8963c11 100644
 --- a/nova/virt/libvirt/guest.py
 +++ b/nova/virt/libvirt/guest.py
-@@ -234,21 +234,30 @@ class Guest(object):
+@@ -234,21 +234,35 @@ class Guest(object):
          """
  
          if cfg:
 -            interfaces = self.get_all_devices(
 -                vconfig.LibvirtConfigGuestInterface)
--            for interface in interfaces:
++            LOG.debug(f'looking for interface given config: {cfg}')
++            interfaces = self.get_all_devices(type(cfg))
++            if not interfaces:
++                LOG.debug(f'No interface of type: {type(cfg)} found in domain')
++                return None
++
+             for interface in interfaces:
 -                # NOTE(leehom) LibvirtConfigGuestInterface get from domain and
 -                # LibvirtConfigGuestInterface generated by
 -                # nova.virt.libvirt.vif.get_config must be identical.
@@ -1238,18 +1339,10 @@ index a7fbc50..a606abf 100644
 -                            interface.target_dev == cfg.target_dev) and
 -                        interface.vhostuser_path == cfg.vhostuser_path):
 -                    return interface
-+            if isinstance(cfg, vconfig.LibvirtConfigGuestVDPAPCI):
-+                hostdevs = self.get_all_devices(vconfig.LibvirtConfigGuestHostdevPCI)
-+                for hostdev in hostdevs:
-+                    if (int(hostdev.domain, 16) == int(cfg.domain, 16) and
-+                        int(hostdev.bus, 16) == int(cfg.bus, 16) and
-+                        int(hostdev.slot, 16) == int(cfg.slot, 16) and
-+                        int(hostdev.function, 16) == int(cfg.function, 16)):
-+                        return cfg
-+            else:
-+                interfaces = self.get_all_devices(
-+                    vconfig.LibvirtConfigGuestInterface)
-+                for interface in interfaces:
++                if isinstance(interface, vconfig.LibvirtConfigGuestVDPAPCI):
++                    if interface.source_dev == cfg.source_dev:
++                        return interface
++                else:
 +                    # NOTE(leehom) LibvirtConfigGuestInterface get from domain and
 +                    # LibvirtConfigGuestInterface generated by
 +                    # nova.virt.libvirt.vif.get_config must be identical.
@@ -1262,9 +1355,25 @@ index a7fbc50..a606abf 100644
 +                                interface.target_dev == cfg.target_dev) and
 +                            interface.vhostuser_path == cfg.vhostuser_path):
 +                        return interface
++            else:
++                LOG.debug(
++                    f'interface for config: {cfg}'
++                    f'not found in domain: {self._domain.XMLDesc(0)}'
++                )
++        return None
  
      def get_vcpus_info(self):
          """Returns virtual cpus information of guest.
+@@ -453,6 +467,9 @@ class Guest(object):
+                   alternative_device_name)
+         try:
+             _try_detach_device(conf, persistent, live)
++            # The second times to detach the device cant execute immediately,
++            # otherwise, an libvirt.InternalError will occur
++            time.sleep(5)
+         except exception.DeviceNotFound:
+             # NOTE(melwitt): There are effectively two configs for an instance.
+             # The persistent config (affects instance upon next boot) and the
 diff --git a/nova/virt/libvirt/host.py b/nova/virt/libvirt/host.py
 index d8078dd..ccd7851 100644
 --- a/nova/virt/libvirt/host.py
@@ -1714,7 +1823,7 @@ index 7b72147..c0a2faa 100644
  def find_job_type(guest, instance, logging_ok=True):
      """Determine the (likely) current migration job type
 diff --git a/nova/virt/libvirt/vif.py b/nova/virt/libvirt/vif.py
-index c03548d..a985cf7 100644
+index c03548d..1415c1a 100644
 --- a/nova/virt/libvirt/vif.py
 +++ b/nova/virt/libvirt/vif.py
 @@ -19,6 +19,7 @@
@@ -1733,7 +1842,7 @@ index c03548d..a985cf7 100644
  from nova.virt.libvirt import utils as libvirt_utils
  from nova.virt import osinfo
  
-@@ -60,6 +62,20 @@ MIN_LIBVIRT_TX_QUEUE_SIZE = (3, 7, 0)
+@@ -60,6 +62,21 @@ MIN_LIBVIRT_TX_QUEUE_SIZE = (3, 7, 0)
  MIN_QEMU_TX_QUEUE_SIZE = (2, 10, 0)
  
  
@@ -1745,7 +1854,8 @@ index c03548d..a985cf7 100644
 +        root_helper = utils.get_root_helper()
 +        return execute(*cmd, root_helper=root_helper, run_as_root=True)
 +    except processutils.ProcessExecutionError as e:
-+        reason = _('Please check the cmd, an unexpected exception occurs because {}'.format(e))
++        reason = _('Please check the cmd, an unexpected exception occurs '
++                   'because {}'.format(e))
 +        raise exception.ProcessExecuteException(
 +            cmd=' '.join(cmd),
 +            reason=reason
@@ -1754,7 +1864,7 @@ index c03548d..a985cf7 100644
  def is_vif_model_valid_for_virt(virt_type, vif_model):
      valid_models = {
          'qemu': [network_model.VIF_MODEL_VIRTIO,
-@@ -121,6 +137,10 @@ def set_vf_interface_vlan(pci_addr, mac_addr, vlan=0):
+@@ -121,6 +138,10 @@ def set_vf_interface_vlan(pci_addr, mac_addr, vlan=0):
  class LibvirtGenericVIFDriver(object):
      """Generic VIF driver for libvirt networking."""
  
@@ -1765,7 +1875,7 @@ index c03548d..a985cf7 100644
      def get_vif_devname(self, vif):
          if 'devname' in vif:
              return vif['devname']
-@@ -512,6 +532,22 @@ class LibvirtGenericVIFDriver(object):
+@@ -512,6 +533,19 @@ class LibvirtGenericVIFDriver(object):
          designer.set_vif_host_backend_vhostuser_config(
              conf, vif.mode, vif.path, rx_queue_size, tx_queue_size)
  
@@ -1779,16 +1889,13 @@ index c03548d..a985cf7 100644
 +        conf.source_dev = dev_path
 +        vif.dev_path = dev_path
 +
-+        # only kvm support managed mode
-+        if CONF.libvirt.virt_type in ('xen', 'parallels',):
-+            conf.managed = 'no'
-+        if CONF.libvirt.virt_type in ('kvm', 'qemu'):
-+            conf.managed = 'yes'
++        # do not allow libvirt to manage vdpa drivers automally
++        conf.managed = 'no'
 +
      def _set_config_VIFHostDevice(self, instance, vif, conf, host=None):
          if vif.dev_type == osv_fields.VIFHostDeviceDevType.ETHERNET:
              # This sets the required fields for an <interface type='hostdev'>
-@@ -542,6 +578,36 @@ class LibvirtGenericVIFDriver(object):
+@@ -542,6 +576,36 @@ class LibvirtGenericVIFDriver(object):
              raise exception.InternalError(
                  _('Unsupported VIF port profile type %s') % profile_name)
  
@@ -1825,7 +1932,7 @@ index c03548d..a985cf7 100644
      def _get_config_os_vif(self, instance, vif, image_meta, inst_type,
                             virt_type, host, vnic_type):
          """Get the domain config for a VIF
-@@ -558,9 +624,12 @@ class LibvirtGenericVIFDriver(object):
+@@ -558,9 +622,12 @@ class LibvirtGenericVIFDriver(object):
          """
  
          # Do the config that's common to all vif types
@@ -1841,7 +1948,7 @@ index c03548d..a985cf7 100644
  
          # Do the VIF type specific config
          if isinstance(vif, osv_vifs.VIFGeneric):
-@@ -573,6 +642,9 @@ class LibvirtGenericVIFDriver(object):
+@@ -573,6 +640,9 @@ class LibvirtGenericVIFDriver(object):
              self._set_config_VIFVHostUser(instance, vif, conf, host)
          elif isinstance(vif, osv_vifs.VIFHostDevice):
              self._set_config_VIFHostDevice(instance, vif, conf, host)
@@ -1851,11 +1958,13 @@ index c03548d..a985cf7 100644
          else:
              raise exception.InternalError(
                  _("Unsupported VIF type %s") % vif.obj_name())
-@@ -758,6 +830,8 @@ class LibvirtGenericVIFDriver(object):
+@@ -758,6 +828,10 @@ class LibvirtGenericVIFDriver(object):
          vif_obj = os_vif_util.nova_to_osvif_vif(vif)
          if vif_obj is not None:
              self._plug_os_vif(instance, vif_obj)
 +            if isinstance(vif_obj, osv_vifs.VIFVDPADevice):
++                pci_id = vif_obj.pci_id
++                vif['profile']['old_dev_path'] = self._get_vdpa_dev_path(pci_id)
 +                self._update_vdpa_device(vif_obj)
              return
  
