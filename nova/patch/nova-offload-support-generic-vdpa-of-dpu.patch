@@ -1,0 +1,945 @@
+diff --git a/nova/compute/api.py b/nova/compute/api.py
+index 4fa0cc2..43a4400 100644
+--- a/nova/compute/api.py
++++ b/nova/compute/api.py
+@@ -975,6 +975,8 @@ class API(base.Base):
+             context, requested_networks, pci_request_info)
+         network_metadata, port_resource_requests = result
+ 
++        for request in pci_request_info.requests:
++            LOG.debug('_validate_and_build_base_options3 request spec %s', request.spec)
+         # Creating servers with ports that have resource requests, like QoS
+         # minimum bandwidth rules, is only supported in a requested minimum
+         # microversion.
+@@ -3754,6 +3756,23 @@ class API(base.Base):
+ 
+         request_spec = objects.RequestSpec.get_by_instance_uuid(
+             context, instance.uuid)
++        try:
++            LOG.debug("extra_instance_updates %s", extra_instance_updates)
++            for request in instance.pci_requests.requests:
++                LOG.debug('api resize instance request spec %s', request.spec)
++
++            LOG.debug("request_spec %s", request_spec)
++            for request in request_spec.pci_requests.requests:
++                LOG.debug('api resize request_spec request spec %s', request.spec)
++
++            request_spec._from_instance_pci_requests(instance.pci_requests)
++            request_spec.save()
++
++            for request in request_spec.pci_requests.requests:
++                LOG.debug('api resize new_request_spec request spec %s', request.spec)
++        except Exception as e:
++            import traceback
++            LOG.debug("resize test error %s", traceback.format_exc())
+         request_spec.ignore_hosts = filter_properties['ignore_hosts']
+ 
+         # don't recalculate the NUMA topology unless the flavor has changed
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index 6e5d72f..de81bdb 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -34,6 +34,7 @@ import inspect
+ import sys
+ import time
+ import traceback
++import json
+ 
+ from cinderclient import exceptions as cinder_exception
+ from cursive import exception as cursive_exception
+@@ -2375,6 +2376,71 @@ class ComputeManager(manager.Manager):
+         if modified:
+             instance.save()
+ 
++    def _request_vdpa_vol_pci_device(self, context, instance, vendor_id,
++                                     product_id, volume_id):
++
++        pci_reqs = objects.InstancePCIRequests(
++            requests=[], instance_uuid=instance.uuid)
++        cn_id = objects.ComputeNode.get_by_host_and_nodename(
++            context,
++            instance.host,
++            instance.node).id
++
++        request_spec = [{
++            'vendor_id': vendor_id,
++            'product_id': product_id,
++            'dev_type': 'vdpa'
++        }]
++        request = objects.InstancePCIRequest(count=1,
++                                             spec=request_spec,
++                                             request_id=volume_id,
++                                             requester_id=cn_id)
++        pci_reqs.requests.append(request)
++
++        try:
++            pci_device = self._claim_pci_device_for_interface_attach(
++                context, instance, pci_reqs)
++        except exception.PciDeviceRequestFailed:
++            raise exception.VolumeAttachFailed(instance_uuid=instance.uuid)
++
++        instance.pci_requests.requests.extend(pci_reqs.requests)
++        instance.save()
++
++        LOG.debug('_request_vdpa_vol_pci_device done: %s', pci_device,
++                  instance=instance)
++        return pci_device
++
++    # 逻辑可以优化，不是每个人都要进入分配vDPA设备的分支的
++    def _alloc_vdpa_device(self, context, instance, block_device_info):
++        block_devices = block_device_info['block_device_mapping']
++
++        for block_device in block_devices:
++            connection_info = block_device['connection_info']
++            volume_id = driver_block_device.get_volume_id(connection_info)
++            volume = self.volume_api.get(context, volume_id)
++            volume_metadata = volume.get('volume_metadata')
++            offload_vdpa = volume_metadata.get('offload:generic-vdpa', None)
++            # 如果不是vDPA类型的存储，不需要进行分配和设置
++            if offload_vdpa != 'blk':
++                continue
++
++            queues = volume_metadata.get('virtio:queues', 2) # 默认2q，当前不支持设置
++            vendor_id = '1af4'
++            product_id = '1001' # virtio-blk设备号为1001，目前仅支持blk
++            pci_device = self._request_vdpa_vol_pci_device(context,
++                                                           instance,
++                                                           vendor_id,
++                                                           product_id,
++                                                           volume_id)
++            # 只能保存pci设备的address，如果是pci devices的对象无法存入数据库
++            vdpa_volume_info = dict(type=offload_vdpa, pci=pci_device.address,
++                                    queues=queues)
++            # 将vdpa pci设备的信息保存到connection_info当中
++            connection_info['data']['vdpa_volume_info'] = vdpa_volume_info
++            self.rt.allocate_pci_devices_for_instance(context, instance)
++
++        instance.save()
++
+     def _build_and_run_instance(self, context, instance, image, injected_files,
+             admin_password, requested_networks, security_groups,
+             block_device_mapping, node, limits, filter_properties,
+@@ -2434,6 +2500,8 @@ class ComputeManager(manager.Manager):
+                     instance.save(expected_task_state=
+                             task_states.BLOCK_DEVICE_MAPPING)
+                     block_device_info = resources['block_device_info']
++                    # claim和设置vdpa信息最好分开。
++                    self._alloc_vdpa_device(context, instance, block_device_info)
+                     network_info = resources['network_info']
+                     LOG.debug('Start spawning the instance on the hypervisor.',
+                               instance=instance)
+@@ -4554,6 +4622,7 @@ class ComputeManager(manager.Manager):
+ 
+             block_device_info = self._get_instance_block_device_info(
+                     context, instance, refresh_conn_info=True, bdms=bdms)
++            self._add_vdpa_volume_info(context, instance, block_device_info)
+ 
+             power_on = old_vm_state != vm_states.STOPPED
+             self.driver.finish_revert_migration(
+@@ -4705,6 +4774,7 @@ class ComputeManager(manager.Manager):
+         limits = filter_properties.get('limits', {})
+         allocs = self.reportclient.get_allocations_for_consumer(
+             context, instance.uuid)
++        LOG.debug('Migrating resize_claim', instance=instance)
+         with self.rt.resize_claim(context, instance, instance_type, node,
+                                   migration, allocs, image_meta=image,
+                                   limits=limits) as claim:
+@@ -5043,6 +5113,46 @@ class ComputeManager(manager.Manager):
+                     self.volume_api.attachment_complete(
+                         context, bdm.attachment_id)
+ 
++    def _add_vdpa_volume_info(self, context, instance, block_device_info):
++        block_devices = block_device_info['block_device_mapping']
++
++        for block_device in block_devices:
++            connection_info = block_device['connection_info']
++            volume_id = driver_block_device.get_volume_id(connection_info)
++            volume = self.volume_api.get(context, volume_id)
++            volume_metadata = volume.get('volume_metadata')
++            offload_vdpa = volume_metadata.get('offload:generic-vdpa', None)
++            # 如果不是vDPA类型的存储，不需要进行分配和设置
++            if offload_vdpa != 'blk':
++                continue
++
++            queues = volume_metadata.get('virtio:queues', 2)
++
++            try:
++                cn_id = objects.ComputeNode.get_by_host_and_nodename(
++                    context,
++                    instance.host,
++                    instance.node).id
++            except exception.NotFound:
++                LOG.warning("expected to find compute node with host %s "
++                            "and node %s when getting instance PCI request "
++                            "from volume", instance.host, instance.node)
++                break
++
++            found_pci_dev = None
++            for pci_dev in instance.pci_devices:
++                if (pci_dev.compute_node_id == cn_id and
++                        pci_dev.request_id == volume_id):
++                    found_pci_dev = pci_dev
++                    break
++            if not found_pci_dev:
++                LOG.warning("not found_pci_dev volume %s ", volume_id)
++                continue
++
++            vdpa_volume_info = dict(type=offload_vdpa, pci=found_pci_dev.address,
++                                    queues=queues)
++            connection_info['data']['vdpa_volume_info'] = vdpa_volume_info
++
+     def _finish_resize(self, context, instance, migration, disk_info,
+                        image_meta, bdms, request_spec):
+         resize_instance = False  # indicates disks have been resized
+@@ -5098,6 +5208,8 @@ class ComputeManager(manager.Manager):
+         block_device_info = self._get_instance_block_device_info(
+             context, instance, refresh_conn_info=True, bdms=bdms)
+ 
++        self._add_vdpa_volume_info(context, instance, block_device_info)
++
+         # NOTE(mriedem): If the original vm_state was STOPPED, we don't
+         # automatically power on the instance after it's migrated
+         power_on = old_vm_state != vm_states.STOPPED
+@@ -5552,7 +5664,7 @@ class ComputeManager(manager.Manager):
+         instance.system_metadata['shelved_host'] = self.host
+         instance.vm_state = vm_states.SHELVED
+         instance.task_state = None
+-        if CONF.shelved_offload_time == 0:
++        if offload:
+             instance.task_state = task_states.SHELVING_OFFLOADING
+         instance.power_state = self._get_power_state(context, instance)
+         instance.save(expected_task_state=[
+@@ -5677,7 +5789,7 @@ class ComputeManager(manager.Manager):
+         @utils.synchronized(instance.uuid)
+         def do_unshelve_instance():
+             self._unshelve_instance(context, instance, image,
+-                                    filter_properties, node)
++                                    filter_properties, node, request_spec)
+         do_unshelve_instance()
+ 
+     def _unshelve_instance_key_scrub(self, instance):
+@@ -5694,7 +5806,7 @@ class ComputeManager(manager.Manager):
+         instance.update(keys)
+ 
+     def _unshelve_instance(self, context, instance, image, filter_properties,
+-                           node):
++                           node, request_spec):
+         LOG.info('Unshelving', instance=instance)
+         bdms = objects.BlockDeviceMappingList.get_by_instance_uuid(
+                 context, instance.uuid)
+@@ -5727,13 +5839,25 @@ class ComputeManager(manager.Manager):
+                 utils.get_image_from_system_metadata(
+                     instance.system_metadata))
+ 
++        provider_mappings = self._get_request_group_mapping(request_spec)
++
+         try:
+-            self.network_api.setup_instance_network_on_host(context, instance,
+-                                                            self.host)
+-            network_info = self.network_api.get_instance_nw_info(
+-                context, instance)
++            if provider_mappings:
++                self._update_pci_request_spec_with_allocated_interface_name(
++                    context,
++                    instance,
++                    provider_mappings)
++
+             with self.rt.instance_claim(context, instance, node, allocations,
+                                         limits):
++                self.network_api.setup_instance_network_on_host(
++                    context,
++                    instance,
++                    self.host,
++                    provider_mappings=provider_mappings)
++                network_info = self.network_api.get_instance_nw_info(
++                    context, instance)
++
+                 self.driver.spawn(context, instance, image_meta,
+                                   injected_files=[],
+                                   admin_password=None,
+@@ -5744,6 +5868,10 @@ class ComputeManager(manager.Manager):
+             with excutils.save_and_reraise_exception(logger=LOG):
+                 LOG.exception('Instance failed to spawn',
+                               instance=instance)
++                # Set the image_ref back to initial image_ref because instance
++                # object might have been saved with image['id']
++                # https://bugs.lauchpad.net/nova/+bugs/1934094
++                instance.image_ref = shelved_image_ref
+                 # Cleanup allocations created by the scheduler on this host
+                 # since we failed to spawn the instance. We do this both if
+                 # the instance claim failed with ComputeResourcesUnavailable
+@@ -6136,6 +6264,28 @@ class ComputeManager(manager.Manager):
+             action=fields.NotificationAction.VOLUME_ATTACH,
+             phase=fields.NotificationPhase.START,
+             volume_id=bdm.volume_id)
++
++        volume = self.volume_api.get(context, bdm.volume_id)
++        vdpa_volume_type = volume.get('volume_metadata').get('offload:generic-vdpa')
++
++        pci_device = None
++        if vdpa_volume_type == 'blk':
++            product_id = '1001' # virtio-blk设备号为1001，目前仅支持blk
++            pci_device = self._request_vdpa_vol_pci_device(context,
++                                                           instance,
++                                                           '1af4',
++                                                           product_id,
++                                                           bdm.volume_id)
++
++            queues = volume.get('volume_metadata').get('virtio:queues', 2)
++            bdm['vdpa_volume_info'] = dict(type=vdpa_volume_type, pci=pci_device.address)
++
++            if queues:
++                bdm['vdpa_volume_info']['queues'] = queues
++        else:
++            bdm['vdpa_volume_info'] = None
++            pci_device = None
++
+         try:
+             bdm.attach(context, instance, self.volume_api, self.driver,
+                        do_driver_attach=True)
+@@ -6159,6 +6309,10 @@ class ComputeManager(manager.Manager):
+                                   exc, instance=instance)
+                 else:
+                     self.volume_api.unreserve_volume(context, bdm.volume_id)
++
++                if pci_device:
++                    self._unclaim_and_remove_pci_devices(context, instance, pci_device)
++
+                 tb = traceback.format_exc()
+                 compute_utils.notify_about_volume_attach_detach(
+                     context, instance, self.host,
+@@ -6167,6 +6321,11 @@ class ComputeManager(manager.Manager):
+                     exception=e,
+                     volume_id=bdm.volume_id, tb=tb)
+ 
++        if pci_device:
++            self.rt.allocate_pci_devices_for_instance(context, instance)
++        instance.save()
++        LOG.debug('allocate_pci_devices done: %s', pci_device, instance=instance)
++
+         info = {'volume_id': bdm.volume_id}
+         self._notify_about_instance_usage(
+             context, instance, "volume.attach", extra_usage_info=info)
+@@ -6235,6 +6394,25 @@ class ComputeManager(manager.Manager):
+         driver_bdm = driver_block_device.convert_volume(bdm)
+         driver_bdm.detach(context, instance, self.volume_api, self.driver,
+                           attachment_id=attachment_id, destroy_bdm=destroy_bdm)
++        try:
++            pci_req = pci_req_module.get_instance_pci_request_from_volume(
++                context, instance, driver_bdm)
++
++            pci_device = None
++            if pci_req:
++                pci_devices = [pci_device
++                               for pci_device in instance.pci_devices.objects
++                               if pci_device.request_id == pci_req.request_id]
++
++                if not pci_devices:
++                    raise exception.InterfaceDetachFailed(
++                        instance_uuid=instance.uuid)
++
++                pci_device = pci_devices[0]
++            self._unclaim_and_remove_pci_devices(context, instance, pci_device)
++            instance.save()
++        except Exception as e:
++            LOG.debug("_detach_volume test error %s", traceback.format_exc())
+ 
+         info = dict(volume_id=volume_id)
+         self._notify_about_instance_usage(
+@@ -6611,6 +6789,11 @@ class ComputeManager(manager.Manager):
+             # cinder v3 api flow
+             self.volume_api.attachment_delete(context, bdm.attachment_id)
+ 
++    def _unclaim_and_remove_pci_devices(self, context, instance, pci_device):
++        if pci_device:
++            self.rt.unclaim_pci_devices(context, pci_device, instance)
++            instance.remove_pci_device_and_request(pci_device)
++
+     def _deallocate_port_for_instance(self, context, instance, port_id,
+                                       raise_on_failure=False):
+         try:
+@@ -6645,6 +6828,49 @@ class ComputeManager(manager.Manager):
+                                     {'port_id': port_id, 'error': ex},
+                                     instance=instance)
+ 
++    def _claim_pci_device_for_interface_attach(
++            self,
++            context: nova.context.RequestContext,
++            instance: 'objects.Instance',
++            pci_reqs: 'objects.InstancePCIRequests',
++    ):
++        """Claim PCI devices if there are PCI requests
++
++        :param context: nova.context.RequestContext
++        :param instance: the objects.Instance to where the interface is being
++            attached
++        :param pci_reqs: A InstancePCIRequests object describing the
++            needed PCI devices
++        :raises InterfaceAttachPciClaimFailed: if the PCI device claim fails
++        :returns: An objects.PciDevice describing the claimed PCI device for
++            the interface or None if no device is requested
++        """
++
++        if not pci_reqs.requests:
++            return None
++
++        for request in pci_reqs.requests:
++            LOG.debug('_claim_pci_device_for_interface_attach request spec %s',
++                      request.spec)
++
++        devices = self.rt.claim_pci_devices(context, pci_reqs)
++
++        if not devices:
++            LOG.info('Failed to claim PCI devices during interface attach '
++                     'for PCI request %s', pci_reqs, instance=instance)
++            raise exception.InterfaceAttachPciClaimFailed(
++                instance_uuid=instance.uuid)
++
++        # NOTE(gibi): We assume that maximum one PCI devices is attached per
++        # interface attach request.
++        device = devices[0]
++        for dev in devices:
++            LOG.debug('_claim_pci_device_for_interface_attach dev %s', dev)
++        LOG.debug('_claim_pci_device_for_interface_attach device0 %s', device)
++        instance.pci_devices.objects.append(device)
++
++        return device
++
+     # TODO(mriedem): There are likely race failures which can result in
+     # NotFound and QuotaError exceptions getting traced as well.
+     @messaging.expected_exceptions(
+@@ -6680,9 +6906,50 @@ class ComputeManager(manager.Manager):
+             phase=fields.NotificationPhase.START)
+ 
+         bind_host_id = self.driver.network_binding_host_id(context, instance)
+-        network_info = self.network_api.allocate_port_for_instance(
+-            context, instance, port_id, network_id, requested_ip,
+-            bind_host_id=bind_host_id, tag=tag)
++
++        requested_networks = objects.NetworkRequestList(
++            objects=[
++                objects.NetworkRequest(
++                    network_id=network_id,
++                    port_id=port_id,
++                    address=requested_ip,
++                    tag=tag,
++                )
++            ]
++        )
++
++        if len(requested_networks) != 1:
++            LOG.warning(
++                "Interface attach only supports one interface per attach "
++                "request", instance=instance)
++            raise exception.InterfaceAttachFailed(instance_uuid=instance.uuid)
++
++        pci_reqs = objects.InstancePCIRequests(
++            requests=[], instance_uuid=instance.uuid)
++
++        self.network_api.create_resource_requests(
++            context,
++            requested_networks,
++            pci_reqs)
++
++        try:
++            pci_device = self._claim_pci_device_for_interface_attach(
++                context, instance, pci_reqs)
++        except exception.PciDeviceRequestFailed:
++            raise exception.InterfaceAttachFailed(
++                instance_uuid=instance.uuid)
++
++        instance.pci_requests.requests.extend(pci_reqs.requests)
++
++        network_info = self.network_api.allocate_for_instance(
++            context,
++            instance,
++            False,
++            requested_networks,
++            bind_host_id=bind_host_id,
++            attach=True,
++        )
++
+         if len(network_info) != 1:
+             LOG.error('allocate_port_for_instance returned %(ports)s '
+                       'ports', {'ports': len(network_info)})
+@@ -6702,6 +6969,7 @@ class ComputeManager(manager.Manager):
+                         {'port_id': port_id, 'msg': ex},
+                         instance=instance)
+             self._deallocate_port_for_instance(context, instance, port_id)
++            self._unclaim_and_remove_pci_devices(context, instance, pci_device)
+ 
+             tb = traceback.format_exc()
+             compute_utils.notify_about_instance_action(
+@@ -6712,6 +6980,10 @@ class ComputeManager(manager.Manager):
+ 
+             raise exception.InterfaceAttachFailed(
+                 instance_uuid=instance.uuid)
++        if pci_device:
++            self.rt.allocate_pci_devices_for_instance(context, instance)
++
++        instance.save()
+ 
+         compute_utils.notify_about_instance_action(
+             context, instance, self.host,
+@@ -6734,6 +7006,24 @@ class ComputeManager(manager.Manager):
+         if condemned is None:
+             raise exception.PortNotFound(_("Port %s is not "
+                                            "attached") % port_id)
++        pci_req = pci_req_module.get_instance_pci_request_from_vif(
++            context, instance, condemned)
++
++        pci_device = None
++        if pci_req:
++            pci_devices = [pci_device
++                           for pci_device in instance.pci_devices.objects
++                           if pci_device.request_id == pci_req.request_id]
++
++            if not pci_devices:
++                LOG.warning(
++                    "Detach interface failed, port_id=%(port_id)s, "
++                    "reason: PCI device not found for PCI request %(pci_req)s",
++                    {'port_id': port_id, 'pci_req': pci_req})
++                raise exception.InterfaceDetachFailed(
++                    instance_uuid=instance.uuid)
++
++            pci_device = pci_devices[0]
+ 
+         compute_utils.notify_about_instance_action(
+             context, instance, self.host,
+@@ -6756,6 +7046,9 @@ class ComputeManager(manager.Manager):
+         else:
+             self._deallocate_port_for_instance(
+                 context, instance, port_id, raise_on_failure=True)
++            self._unclaim_and_remove_pci_devices(context, instance, pci_device)
++
++        instance.save()
+ 
+         compute_utils.notify_about_instance_action(
+             context, instance, self.host,
+@@ -6986,10 +7279,22 @@ class ComputeManager(manager.Manager):
+ 
+                     # update the bdm with the new attachment_id.
+                     bdm.attachment_id = attach_ref['id']
++                    connection_info = json.loads(bdm['connection_info'])
++                    connection_data = connection_info.get('data')
++                    vdpa_volume_info = connection_data.get('vdpa_volume_info')
++                    # 在目的端申请pci设备，并且将新旧pci设备信息按顺序保存在vdpa_volume_info当中
++                    if vdpa_volume_info:
++                        product_id = '1001'
++                        new_pci_dev = self._request_vdpa_vol_pci_device(
++                            context, instance, '1af4', product_id, bdm.volume_id)
++                        vdpa_volume_info['old_dev'] = {'pci_slot': vdpa_volume_info['pci'],
++                                                        'dev_path': vdpa_volume_info['dev_path']}
++                        vdpa_volume_info['pci'] = new_pci_dev.address
++                    bdm['connection_info'] = json.dumps(connection_info)
+                     bdm.save()
+ 
+             block_device_info = self._get_instance_block_device_info(
+-                                context, instance, refresh_conn_info=True,
++                                context, instance, refresh_conn_info=False,
+                                 bdms=bdms)
+ 
+             # The driver pre_live_migration will plug vifs on the host. We call
+@@ -7023,6 +7328,10 @@ class ComputeManager(manager.Manager):
+             # onto destination host.
+             self.driver.ensure_filtering_rules_for_instance(instance,
+                                                 network_info)
++
++            for driver_bdm in block_device_info['block_device_mapping']:
++                driver_bdm.save()
++
+         except Exception:
+             # If we raise, migrate_data with the updated attachment ids
+             # will not be returned to the source host for rollback.
+diff --git a/nova/compute/resource_tracker.py b/nova/compute/resource_tracker.py
+index b2ba014..b7c493f 100644
+--- a/nova/compute/resource_tracker.py
++++ b/nova/compute/resource_tracker.py
+@@ -215,6 +215,9 @@ class ResourceTracker(object):
+         instance.numa_topology = instance_numa_topology
+         self._set_instance_host_and_node(instance, nodename)
+ 
++        for request in pci_requests.requests:
++            LOG.debug('instance_claim request spec %s', request.spec)
++
+         if self.pci_tracker:
+             # NOTE(jaypipes): ComputeNode.pci_device_pools is set below
+             # in _update_usage_from_instance().
+@@ -327,7 +330,12 @@ class ResourceTracker(object):
+         # with the new instance flavor pci_requests.
+         if instance.pci_requests:
+             for request in instance.pci_requests.requests:
+-                if request.source == objects.InstancePCIRequest.NEUTRON_PORT:
++                LOG.debug('request: %s source: %s spec: %s is_new: %s '
++                          'request_id: %s', request, request.source,
++                          request.spec, request.is_new, request.request_id)
++                dev_type = request.spec[0].get('dev_type') if request.spec else None
++                if request.source == objects.InstancePCIRequest.NEUTRON_PORT or \
++                        (migration.migration_type != 'live-migration' and dev_type == 'vdpa'):
+                     new_pci_requests.requests.append(request)
+         claim = claims.MoveClaim(context, instance, nodename,
+                                  new_instance_type, image_meta, self, cn,
+@@ -355,6 +363,9 @@ class ResourceTracker(object):
+         # TODO(jaypipes): Move claimed_numa_topology out of the Claim's
+         # constructor flow so the Claim constructor only tests whether
+         # resources can be claimed, not consume the resources directly.
++        LOG.debug(
++            'mig_context old_pci_devices: %s new_pci_devices: %s old_pci_requests: %s new_pci_requests: %s old_resources: %s claimed_resources: %s',
++            instance.pci_devices, claimed_pci_devices, instance.pci_requests, new_pci_requests, old_resources, claimed_resources)
+         mig_context = objects.MigrationContext(
+             context=context, instance_uuid=instance.uuid,
+             migration_id=migration.id,
+@@ -1772,6 +1783,18 @@ class ResourceTracker(object):
+         self.pci_tracker.save(context)
+         return result
+ 
++    @utils.synchronized(COMPUTE_RESOURCE_SEMAPHORE, fair=True)
++    def unclaim_pci_devices(self, context, pci_device, instance):
++        """Deallocate PCI devices
++
++        :param context: security context
++        :param pci_device: the objects.PciDevice describing the PCI device to
++            be freed
++        :param instance: the objects.Instance the PCI resources are freed from
++        """
++        self.pci_tracker.free_device(pci_device, instance)
++        self.pci_tracker.save(context)
++
+     @utils.synchronized(COMPUTE_RESOURCE_SEMAPHORE)
+     def allocate_pci_devices_for_instance(self, context, instance):
+         """Allocate instance claimed PCI resources
+diff --git a/nova/compute/rpcapi.py b/nova/compute/rpcapi.py
+index f37241c..ecedfae 100644
+--- a/nova/compute/rpcapi.py
++++ b/nova/compute/rpcapi.py
+@@ -532,7 +532,9 @@ class ComputeAPI(object):
+         version = '5.0'
+         client = self.router.client(ctxt)
+         cctxt = client.prepare(server=_compute_host(None, instance),
+-                               version=version)
++                               version=version,
++                               call_monitor_timeout=CONF.rpc_response_timeout,
++                               timeout=CONF.rpc_response_timeout)
+         return cctxt.call(ctxt, 'attach_interface', **kw)
+ 
+     def attach_volume(self, ctxt, instance, bdm):
+diff --git a/nova/exception.py b/nova/exception.py
+index d178034..fd6acd7 100644
+--- a/nova/exception.py
++++ b/nova/exception.py
+@@ -690,6 +690,10 @@ class VolumeBDMPathNotFound(VolumeBDMNotFound):
+     msg_fmt = _("No volume Block Device Mapping at path: %(path)s")
+ 
+ 
++class InterfaceAttachPciClaimFailed(Invalid):
++    msg_fmt = _("Failed to claim PCI device for %(instance_uuid)s during "
++                "interface attach")
++
+ class DeviceDetachFailed(NovaException):
+     msg_fmt = _("Device detach failed for %(device)s: %(reason)s")
+ 
+@@ -1793,6 +1797,9 @@ class PciRequestFromVIFNotFound(NotFound):
+     msg_fmt = _("Failed to locate PCI request associated with the given VIF "
+                 "PCI address: %(pci_slot)s on compute node: %(node_id)s")
+ 
++class PciRequestFromVolumeNotFound(NotFound):
++    msg_fmt = _("Failed to locate PCI request associated with the given Volume "
++                "PCI address: %(pci_slot)s on compute node: %(node_id)s")
+ 
+ # Cannot be templated, msg needs to be constructed when raised.
+ class InternalError(NovaException):
+@@ -2553,3 +2560,8 @@ class GetPMEMNamespaceFailed(NovaException):
+ class VPMEMCleanupFailed(NovaException):
+     msg_fmt = _("Failed to clean up the vpmem backend device %(dev)s: "
+                 "%(error)s")
++
++
++class ProcessExecuteException(Invalid):
++    msg_fmt = _("Run cmd %(cmd)s failed. "
++                "Reason: %(reason)s")
+\ No newline at end of file
+diff --git a/nova/network/model.py b/nova/network/model.py
+index d8119fa..71accf2 100644
+--- a/nova/network/model.py
++++ b/nova/network/model.py
+@@ -104,19 +104,23 @@ VNIC_TYPE_MACVTAP = 'macvtap'
+ VNIC_TYPE_DIRECT_PHYSICAL = 'direct-physical'
+ VNIC_TYPE_BAREMETAL = 'baremetal'
+ VNIC_TYPE_VIRTIO_FORWARDER = 'virtio-forwarder'
++VNIC_TYPE_VDPA = 'vdpa'
+ 
+ # Define list of ports which needs pci request.
+ # Note: The macvtap port needs a PCI request as it is a tap interface
+ # with VF as the lower physical interface.
+ # Note: Currently, VNIC_TYPE_VIRTIO_FORWARDER assumes a 1:1
+ # relationship with a VF. This is expected to change in the future.
+-VNIC_TYPES_SRIOV = (VNIC_TYPE_DIRECT, VNIC_TYPE_MACVTAP,
+-                    VNIC_TYPE_DIRECT_PHYSICAL, VNIC_TYPE_VIRTIO_FORWARDER)
++VNIC_TYPES_SRIOV = (
++    VNIC_TYPE_DIRECT, VNIC_TYPE_MACVTAP, VNIC_TYPE_DIRECT_PHYSICAL,
++    VNIC_TYPE_VIRTIO_FORWARDER, VNIC_TYPE_VDPA
++)
+ 
+ # Define list of ports which are passthrough to the guest
+ # and need a special treatment on snapshot and suspend/resume
+ VNIC_TYPES_DIRECT_PASSTHROUGH = (VNIC_TYPE_DIRECT,
+-                                 VNIC_TYPE_DIRECT_PHYSICAL)
++                                 VNIC_TYPE_DIRECT_PHYSICAL,
++                                 VNIC_TYPE_VDPA)
+ 
+ # Constants for the 'vif_model' values
+ VIF_MODEL_VIRTIO = 'virtio'
+diff --git a/nova/network/neutronv2/api.py b/nova/network/neutronv2/api.py
+index 8f85a74..045ce09 100644
+--- a/nova/network/neutronv2/api.py
++++ b/nova/network/neutronv2/api.py
+@@ -341,32 +341,42 @@ class API(base_api.NetworkAPI):
+                 # the current instance.host.
+                 has_binding_ext = self.supports_port_binding_extension(context)
+                 if port_migrating and has_binding_ext:
+-                    # Attempt to delete all port bindings on the host and raise
+-                    # any errors at the end.
+-                    failed_port_ids = []
+-                    for port in ports:
+-                        # This call is safe in that 404s for non-existing
+-                        # bindings are ignored.
+-                        try:
+-                            self.delete_port_binding(
+-                                context, port['id'], host)
+-                        except exception.PortBindingDeletionFailed:
+-                            # delete_port_binding will log an error for each
+-                            # failure but since we're iterating a list we want
+-                            # to keep track of all failures to build a generic
+-                            # exception to raise
+-                            failed_port_ids.append(port['id'])
+-                    if failed_port_ids:
+-                        msg = (_("Failed to delete binding for port(s) "
+-                                 "%(port_ids)s and host %(host)s.") %
+-                               {'port_ids': ','.join(failed_port_ids),
+-                                'host': host})
+-                        raise exception.PortBindingDeletionFailed(msg)
++                    self._delete_port_bindings(context, ports, host)
+             elif port_migrating:
+                 # Setup the port profile
+                 self._setup_migration_port_profile(
+                     context, instance, host, admin_client, ports)
+ 
++    def _delete_port_bindings(self, context, ports, host):
++        """Attempt to delete all port bindings on the host
++
++        :param context: The user request context.
++        :param ports: list of port dicts to cleanup; the 'id' field is required
++            per port dict in the list
++        :param host: host from which to delete port bindings
++        :raises: PortBindingDeletionFailed if port binding deletion fails.
++        """
++        failed_port_ids = []
++
++        for port in ports:
++            # This call is safe in that 404s for non-existing
++            # bindings are ignored.
++            try:
++                self.delete_port_binding(context, port['id'], host)
++            except exception.PortBindingDeletionFailed:
++                # delete_port_binding will log an error for each
++                # failure but since we're iterating a list we want
++                # to keep track of all failures to build a generic
++                # exception to raise
++                failed_port_ids.append(port['id'])
++
++        if failed_port_ids:
++            msg = (_("Failed to delete binding for port(s) "
++                     "%(port_ids)s and host %(host)s.") %
++                   {'port_ids': ','.join(failed_port_ids),
++                    'host': host})
++            raise exception.PortBindingDeletionFailed(msg)
++
+     def _get_available_networks(self, context, project_id,
+                                 net_ids=None, neutron=None,
+                                 auto_allocate=False):
+@@ -693,10 +703,15 @@ class API(base_api.NetworkAPI):
+                         # SR-IOV port attach is not supported.
+                         vnic_type = port.get('binding:vnic_type',
+                                              network_model.VNIC_TYPE_NORMAL)
++                        profile = port.get('binding:profile', None)
++                        vdpa_type = None
++                        if profile:
++                            vdpa_type = profile.get('vdpa_type', None)
+                         if vnic_type in network_model.VNIC_TYPES_SRIOV:
+-                            raise exception.AttachSRIOVPortNotSupported(
+-                                port_id=port['id'],
+-                                instance_uuid=instance.uuid)
++                            if vdpa_type != 'generic':
++                                raise exception.AttachSRIOVPortNotSupported(
++                                    port_id=port['id'],
++                                    instance_uuid=instance.uuid)
+ 
+                     # If requesting a specific port, automatically process
+                     # the network for that port as if it were explicitly
+@@ -1999,6 +2014,7 @@ class API(base_api.NetworkAPI):
+         resource_requests = []
+ 
+         for request_net in requested_networks:
++            LOG.debug('request_net: %s', request_net)
+             physnet = None
+             trusted = None
+             tunneled_ = False
+@@ -2007,16 +2023,17 @@ class API(base_api.NetworkAPI):
+             requester_id = None
+ 
+             if request_net.port_id:
++                # InstancePCIRequest.requester_id is semantically linked
++                # to a port with a resource_request.
++                requester_id = request_net.port_id
+                 result = self._get_port_vnic_info(
+                     context, neutron, request_net.port_id)
+                 vnic_type, trusted, network_id, resource_request = result
++                LOG.debug('result: %s', result)
+                 physnet, tunneled_ = self._get_physnet_tunneled_info(
+                     context, neutron, network_id)
+ 
+                 if resource_request:
+-                    # InstancePCIRequest.requester_id is semantically linked
+-                    # to a port with a resource_request.
+-                    requester_id = request_net.port_id
+                     # NOTE(gibi): explicitly orphan the RequestGroup by setting
+                     # context=None as we never intended to save it to the DB.
+                     resource_requests.append(
+@@ -2050,8 +2067,12 @@ class API(base_api.NetworkAPI):
+                 # SR-IOV modes (legacy and ovs) in the same deployment.
+                 spec = {pci_request.PCI_NET_TAG: physnet}
+                 dev_type = pci_request.DEVICE_TYPE_FOR_VNIC_TYPE.get(vnic_type)
++                LOG.debug('vnic_type: %s dev_type: %s', vnic_type, dev_type)
+                 if dev_type:
+                     spec[pci_request.PCI_DEVICE_TYPE_TAG] = dev_type
++                    if vnic_type == network_model.VNIC_TYPE_VDPA:
++                        spec['vendor_id'] = '1af4'
++                        spec['product_id'] = '1000'
+                 if trusted is not None:
+                     # We specifically have requested device on a pool
+                     # with a tag trusted set to true or false. We
+@@ -2064,6 +2085,8 @@ class API(base_api.NetworkAPI):
+                     request_id=uuidutils.generate_uuid(),
+                     requester_id=requester_id)
+                 pci_requests.requests.append(request)
++                LOG.debug('create_resource_requests append request spec %s',
++                          request.spec)
+                 pci_request_id = request.request_id
+ 
+             # Add pci_request_id into the requested network
+@@ -3284,10 +3307,10 @@ class API(base_api.NetworkAPI):
+         raise NotImplementedError()
+ 
+     def setup_instance_network_on_host(self, context, instance, host,
+-                                       migration=None):
++                                       migration=None, provider_mappings=None):
+         """Setup network for specified instance on host."""
+         self._update_port_binding_for_instance(context, instance, host,
+-                                               migration)
++                                               migration, provider_mappings)
+ 
+     def cleanup_instance_network_on_host(self, context, instance, host):
+         """Cleanup network for specified instance on host."""
+@@ -3300,6 +3323,38 @@ class API(base_api.NetworkAPI):
+         # device_id field on the port which is not what we'd want for shelve.
+         pass
+ 
++    def _get_port_pci_dev(self, instance, port):
++        """Find the PCI device corresponding to the port.
++        Assumes the port is an SRIOV one.
++
++        :param instance: The instance to which the port is attached.
++        :param port: The Neutron port, as obtained from the Neutron API
++            JSON form.
++        :return: The PciDevice object, or None if unable to find.
++        """
++        # Find the port's PCIRequest, or return None
++        for r in instance.pci_requests.requests:
++            if r.requester_id == port['id']:
++                request = r
++                break
++        else:
++            LOG.debug('No PCI request found for port %s', port['id'],
++                      instance=instance)
++            return None
++        # Find the request's device, or return None
++        for d in instance.pci_devices:
++            if d.request_id == request.request_id:
++                device = d
++                break
++        else:
++            LOG.debug('No PCI device found for request %s',
++                      request.request_id, instance=instance)
++            return None
++
++        LOG.debug('Get the pci device %s corresponding to the port %s',
++                  device, port)
++        return device
++
+     def _get_pci_mapping_for_migration(self, instance, migration):
+         if not instance.migration_context:
+             return {}
+@@ -3350,27 +3405,43 @@ class API(base_api.NetworkAPI):
+             # that this function is called without a migration object, such
+             # as in an unshelve operation.
+             vnic_type = p.get('binding:vnic_type')
+-            if (vnic_type in network_model.VNIC_TYPES_SRIOV and
+-                    migration is not None and
+-                    migration['migration_type'] != constants.LIVE_MIGRATION):
+-                # Note(adrianc): for live migration binding profile was already
+-                # updated in conductor when calling bind_ports_to_host()
+-                if not pci_mapping:
+-                    pci_mapping = self._get_pci_mapping_for_migration(
+-                        instance, migration)
+-
+-                pci_slot = binding_profile.get('pci_slot')
+-                new_dev = pci_mapping.get(pci_slot)
+-                if new_dev:
+-                    binding_profile.update(
+-                        self._get_pci_device_profile(new_dev))
+-                    updates[constants.BINDING_PROFILE] = binding_profile
++            if vnic_type in network_model.VNIC_TYPES_SRIOV:
++                if migration is not None:
++                    if migration['migration_type'] != constants.LIVE_MIGRATION:
++                        # Note(adrianc): for live migration binding profile
++                        # was already updated in conductor when calling
++                        # bind_ports_to_host()
++                        if not pci_mapping:
++                            pci_mapping = self._get_pci_mapping_for_migration(
++                                instance, migration)
++
++                        pci_slot = binding_profile.get('pci_slot')
++                        new_dev = pci_mapping.get(pci_slot)
++                        if new_dev:
++                            binding_profile.update(
++                                self._get_pci_device_profile(new_dev))
++                            updates[constants.BINDING_PROFILE] = binding_profile
++                        else:
++                            raise exception.PortUpdateFailed(port_id=p['id'],
++                                reason=_("Unable to correlate PCI slot %s") %
++                                         pci_slot)
++                # NOTE(artom) If migration is None, this is an unshelve, and we
++                # need to figure out the pci related binding information from
++                # the InstancePCIRequest and PciDevice objects.
+                 else:
+-                    raise exception.PortUpdateFailed(port_id=p['id'],
+-                        reason=_("Unable to correlate PCI slot %s") %
+-                                 pci_slot)
+-
+-            if p.get('resource_request'):
++                    pci_dev = self._get_port_pci_dev(instance, p)
++                    if pci_dev:
++                        binding_profile.update(
++                            self._get_pci_device_profile(pci_dev))
++                        updates[constants.BINDING_PROFILE] = binding_profile
++
++            # NOTE(gibi): during live migration the conductor already sets the
++            # allocation key in the port binding. However during resize, cold
++            # migrate, evacuate and unshelve we have to set the binding here.
++            # Also note that during unshelve no migration object is created.
++            if p.get('resource_request') and (
++                migration is None or not migration.is_live_migration
++            ):
+                 if not provider_mappings:
+                     # TODO(gibi): Remove this check when compute RPC API is
+                     # bumped to 6.0
