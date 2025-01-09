@@ -1,0 +1,2897 @@
+diff --git a/nova/compute/api.py b/nova/compute/api.py
+index 4fa0cc2..43a4400 100644
+--- a/nova/compute/api.py
++++ b/nova/compute/api.py
+@@ -975,6 +975,8 @@ class API(base.Base):
+             context, requested_networks, pci_request_info)
+         network_metadata, port_resource_requests = result
+ 
++        for request in pci_request_info.requests:
++            LOG.debug('_validate_and_build_base_options3 request spec %s', request.spec)
+         # Creating servers with ports that have resource requests, like QoS
+         # minimum bandwidth rules, is only supported in a requested minimum
+         # microversion.
+@@ -3754,6 +3756,23 @@ class API(base.Base):
+ 
+         request_spec = objects.RequestSpec.get_by_instance_uuid(
+             context, instance.uuid)
++        try:
++            LOG.debug("extra_instance_updates %s", extra_instance_updates)
++            for request in instance.pci_requests.requests:
++                LOG.debug('api resize instance request spec %s', request.spec)
++
++            LOG.debug("request_spec %s", request_spec)
++            for request in request_spec.pci_requests.requests:
++                LOG.debug('api resize request_spec request spec %s', request.spec)
++
++            request_spec._from_instance_pci_requests(instance.pci_requests)
++            request_spec.save()
++
++            for request in request_spec.pci_requests.requests:
++                LOG.debug('api resize new_request_spec request spec %s', request.spec)
++        except Exception as e:
++            import traceback
++            LOG.debug("resize test error %s", traceback.format_exc())
+         request_spec.ignore_hosts = filter_properties['ignore_hosts']
+ 
+         # don't recalculate the NUMA topology unless the flavor has changed
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index 6e5d72f..de81bdb 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -34,6 +34,7 @@ import inspect
+ import sys
+ import time
+ import traceback
++import json
+ 
+ from cinderclient import exceptions as cinder_exception
+ from cursive import exception as cursive_exception
+@@ -2375,6 +2376,71 @@ class ComputeManager(manager.Manager):
+         if modified:
+             instance.save()
+ 
++    def _request_vdpa_vol_pci_device(self, context, instance, vendor_id,
++                                     product_id, volume_id):
++
++        pci_reqs = objects.InstancePCIRequests(
++            requests=[], instance_uuid=instance.uuid)
++        cn_id = objects.ComputeNode.get_by_host_and_nodename(
++            context,
++            instance.host,
++            instance.node).id
++
++        request_spec = [{
++            'vendor_id': vendor_id,
++            'product_id': product_id,
++            'dev_type': 'vdpa'
++        }]
++        request = objects.InstancePCIRequest(count=1,
++                                             spec=request_spec,
++                                             request_id=volume_id,
++                                             requester_id=cn_id)
++        pci_reqs.requests.append(request)
++
++        try:
++            pci_device = self._claim_pci_device_for_interface_attach(
++                context, instance, pci_reqs)
++        except exception.PciDeviceRequestFailed:
++            raise exception.VolumeAttachFailed(instance_uuid=instance.uuid)
++
++        instance.pci_requests.requests.extend(pci_reqs.requests)
++        instance.save()
++
++        LOG.debug('_request_vdpa_vol_pci_device done: %s', pci_device,
++                  instance=instance)
++        return pci_device
++
++    # 逻辑可以优化，不是每个人都要进入分配vDPA设备的分支的
++    def _alloc_vdpa_device(self, context, instance, block_device_info):
++        block_devices = block_device_info['block_device_mapping']
++
++        for block_device in block_devices:
++            connection_info = block_device['connection_info']
++            volume_id = driver_block_device.get_volume_id(connection_info)
++            volume = self.volume_api.get(context, volume_id)
++            volume_metadata = volume.get('volume_metadata')
++            offload_vdpa = volume_metadata.get('offload:generic-vdpa', None)
++            # 如果不是vDPA类型的存储，不需要进行分配和设置
++            if offload_vdpa != 'blk':
++                continue
++
++            queues = volume_metadata.get('virtio:queues', 2) # 默认2q，当前不支持设置
++            vendor_id = '1af4'
++            product_id = '1001' # virtio-blk设备号为1001，目前仅支持blk
++            pci_device = self._request_vdpa_vol_pci_device(context,
++                                                           instance,
++                                                           vendor_id,
++                                                           product_id,
++                                                           volume_id)
++            # 只能保存pci设备的address，如果是pci devices的对象无法存入数据库
++            vdpa_volume_info = dict(type=offload_vdpa, pci=pci_device.address,
++                                    queues=queues)
++            # 将vdpa pci设备的信息保存到connection_info当中
++            connection_info['data']['vdpa_volume_info'] = vdpa_volume_info
++            self.rt.allocate_pci_devices_for_instance(context, instance)
++
++        instance.save()
++
+     def _build_and_run_instance(self, context, instance, image, injected_files,
+             admin_password, requested_networks, security_groups,
+             block_device_mapping, node, limits, filter_properties,
+@@ -2434,6 +2500,8 @@ class ComputeManager(manager.Manager):
+                     instance.save(expected_task_state=
+                             task_states.BLOCK_DEVICE_MAPPING)
+                     block_device_info = resources['block_device_info']
++                    # claim和设置vdpa信息最好分开。
++                    self._alloc_vdpa_device(context, instance, block_device_info)
+                     network_info = resources['network_info']
+                     LOG.debug('Start spawning the instance on the hypervisor.',
+                               instance=instance)
+@@ -4554,6 +4622,7 @@ class ComputeManager(manager.Manager):
+ 
+             block_device_info = self._get_instance_block_device_info(
+                     context, instance, refresh_conn_info=True, bdms=bdms)
++            self._add_vdpa_volume_info(context, instance, block_device_info)
+ 
+             power_on = old_vm_state != vm_states.STOPPED
+             self.driver.finish_revert_migration(
+@@ -4705,6 +4774,7 @@ class ComputeManager(manager.Manager):
+         limits = filter_properties.get('limits', {})
+         allocs = self.reportclient.get_allocations_for_consumer(
+             context, instance.uuid)
++        LOG.debug('Migrating resize_claim', instance=instance)
+         with self.rt.resize_claim(context, instance, instance_type, node,
+                                   migration, allocs, image_meta=image,
+                                   limits=limits) as claim:
+@@ -5043,6 +5113,46 @@ class ComputeManager(manager.Manager):
+                     self.volume_api.attachment_complete(
+                         context, bdm.attachment_id)
+ 
++    def _add_vdpa_volume_info(self, context, instance, block_device_info):
++        block_devices = block_device_info['block_device_mapping']
++
++        for block_device in block_devices:
++            connection_info = block_device['connection_info']
++            volume_id = driver_block_device.get_volume_id(connection_info)
++            volume = self.volume_api.get(context, volume_id)
++            volume_metadata = volume.get('volume_metadata')
++            offload_vdpa = volume_metadata.get('offload:generic-vdpa', None)
++            # 如果不是vDPA类型的存储，不需要进行分配和设置
++            if offload_vdpa != 'blk':
++                continue
++
++            queues = volume_metadata.get('virtio:queues', 2)
++
++            try:
++                cn_id = objects.ComputeNode.get_by_host_and_nodename(
++                    context,
++                    instance.host,
++                    instance.node).id
++            except exception.NotFound:
++                LOG.warning("expected to find compute node with host %s "
++                            "and node %s when getting instance PCI request "
++                            "from volume", instance.host, instance.node)
++                break
++
++            found_pci_dev = None
++            for pci_dev in instance.pci_devices:
++                if (pci_dev.compute_node_id == cn_id and
++                        pci_dev.request_id == volume_id):
++                    found_pci_dev = pci_dev
++                    break
++            if not found_pci_dev:
++                LOG.warning("not found_pci_dev volume %s ", volume_id)
++                continue
++
++            vdpa_volume_info = dict(type=offload_vdpa, pci=found_pci_dev.address,
++                                    queues=queues)
++            connection_info['data']['vdpa_volume_info'] = vdpa_volume_info
++
+     def _finish_resize(self, context, instance, migration, disk_info,
+                        image_meta, bdms, request_spec):
+         resize_instance = False  # indicates disks have been resized
+@@ -5098,6 +5208,8 @@ class ComputeManager(manager.Manager):
+         block_device_info = self._get_instance_block_device_info(
+             context, instance, refresh_conn_info=True, bdms=bdms)
+ 
++        self._add_vdpa_volume_info(context, instance, block_device_info)
++
+         # NOTE(mriedem): If the original vm_state was STOPPED, we don't
+         # automatically power on the instance after it's migrated
+         power_on = old_vm_state != vm_states.STOPPED
+@@ -5552,7 +5664,7 @@ class ComputeManager(manager.Manager):
+         instance.system_metadata['shelved_host'] = self.host
+         instance.vm_state = vm_states.SHELVED
+         instance.task_state = None
+-        if CONF.shelved_offload_time == 0:
++        if offload:
+             instance.task_state = task_states.SHELVING_OFFLOADING
+         instance.power_state = self._get_power_state(context, instance)
+         instance.save(expected_task_state=[
+@@ -5677,7 +5789,7 @@ class ComputeManager(manager.Manager):
+         @utils.synchronized(instance.uuid)
+         def do_unshelve_instance():
+             self._unshelve_instance(context, instance, image,
+-                                    filter_properties, node)
++                                    filter_properties, node, request_spec)
+         do_unshelve_instance()
+ 
+     def _unshelve_instance_key_scrub(self, instance):
+@@ -5694,7 +5806,7 @@ class ComputeManager(manager.Manager):
+         instance.update(keys)
+ 
+     def _unshelve_instance(self, context, instance, image, filter_properties,
+-                           node):
++                           node, request_spec):
+         LOG.info('Unshelving', instance=instance)
+         bdms = objects.BlockDeviceMappingList.get_by_instance_uuid(
+                 context, instance.uuid)
+@@ -5727,13 +5839,25 @@ class ComputeManager(manager.Manager):
+                 utils.get_image_from_system_metadata(
+                     instance.system_metadata))
+ 
++        provider_mappings = self._get_request_group_mapping(request_spec)
++
+         try:
+-            self.network_api.setup_instance_network_on_host(context, instance,
+-                                                            self.host)
+-            network_info = self.network_api.get_instance_nw_info(
+-                context, instance)
++            if provider_mappings:
++                self._update_pci_request_spec_with_allocated_interface_name(
++                    context,
++                    instance,
++                    provider_mappings)
++
+             with self.rt.instance_claim(context, instance, node, allocations,
+                                         limits):
++                self.network_api.setup_instance_network_on_host(
++                    context,
++                    instance,
++                    self.host,
++                    provider_mappings=provider_mappings)
++                network_info = self.network_api.get_instance_nw_info(
++                    context, instance)
++
+                 self.driver.spawn(context, instance, image_meta,
+                                   injected_files=[],
+                                   admin_password=None,
+@@ -5744,6 +5868,10 @@ class ComputeManager(manager.Manager):
+             with excutils.save_and_reraise_exception(logger=LOG):
+                 LOG.exception('Instance failed to spawn',
+                               instance=instance)
++                # Set the image_ref back to initial image_ref because instance
++                # object might have been saved with image['id']
++                # https://bugs.lauchpad.net/nova/+bugs/1934094
++                instance.image_ref = shelved_image_ref
+                 # Cleanup allocations created by the scheduler on this host
+                 # since we failed to spawn the instance. We do this both if
+                 # the instance claim failed with ComputeResourcesUnavailable
+@@ -6136,6 +6264,28 @@ class ComputeManager(manager.Manager):
+             action=fields.NotificationAction.VOLUME_ATTACH,
+             phase=fields.NotificationPhase.START,
+             volume_id=bdm.volume_id)
++
++        volume = self.volume_api.get(context, bdm.volume_id)
++        vdpa_volume_type = volume.get('volume_metadata').get('offload:generic-vdpa')
++
++        pci_device = None
++        if vdpa_volume_type == 'blk':
++            product_id = '1001' # virtio-blk设备号为1001，目前仅支持blk
++            pci_device = self._request_vdpa_vol_pci_device(context,
++                                                           instance,
++                                                           '1af4',
++                                                           product_id,
++                                                           bdm.volume_id)
++
++            queues = volume.get('volume_metadata').get('virtio:queues', 2)
++            bdm['vdpa_volume_info'] = dict(type=vdpa_volume_type, pci=pci_device.address)
++
++            if queues:
++                bdm['vdpa_volume_info']['queues'] = queues
++        else:
++            bdm['vdpa_volume_info'] = None
++            pci_device = None
++
+         try:
+             bdm.attach(context, instance, self.volume_api, self.driver,
+                        do_driver_attach=True)
+@@ -6159,6 +6309,10 @@ class ComputeManager(manager.Manager):
+                                   exc, instance=instance)
+                 else:
+                     self.volume_api.unreserve_volume(context, bdm.volume_id)
++
++                if pci_device:
++                    self._unclaim_and_remove_pci_devices(context, instance, pci_device)
++
+                 tb = traceback.format_exc()
+                 compute_utils.notify_about_volume_attach_detach(
+                     context, instance, self.host,
+@@ -6167,6 +6321,11 @@ class ComputeManager(manager.Manager):
+                     exception=e,
+                     volume_id=bdm.volume_id, tb=tb)
+ 
++        if pci_device:
++            self.rt.allocate_pci_devices_for_instance(context, instance)
++        instance.save()
++        LOG.debug('allocate_pci_devices done: %s', pci_device, instance=instance)
++
+         info = {'volume_id': bdm.volume_id}
+         self._notify_about_instance_usage(
+             context, instance, "volume.attach", extra_usage_info=info)
+@@ -6235,6 +6394,25 @@ class ComputeManager(manager.Manager):
+         driver_bdm = driver_block_device.convert_volume(bdm)
+         driver_bdm.detach(context, instance, self.volume_api, self.driver,
+                           attachment_id=attachment_id, destroy_bdm=destroy_bdm)
++        try:
++            pci_req = pci_req_module.get_instance_pci_request_from_volume(
++                context, instance, driver_bdm)
++
++            pci_device = None
++            if pci_req:
++                pci_devices = [pci_device
++                               for pci_device in instance.pci_devices.objects
++                               if pci_device.request_id == pci_req.request_id]
++
++                if not pci_devices:
++                    raise exception.InterfaceDetachFailed(
++                        instance_uuid=instance.uuid)
++
++                pci_device = pci_devices[0]
++            self._unclaim_and_remove_pci_devices(context, instance, pci_device)
++            instance.save()
++        except Exception as e:
++            LOG.debug("_detach_volume test error %s", traceback.format_exc())
+ 
+         info = dict(volume_id=volume_id)
+         self._notify_about_instance_usage(
+@@ -6611,6 +6789,11 @@ class ComputeManager(manager.Manager):
+             # cinder v3 api flow
+             self.volume_api.attachment_delete(context, bdm.attachment_id)
+ 
++    def _unclaim_and_remove_pci_devices(self, context, instance, pci_device):
++        if pci_device:
++            self.rt.unclaim_pci_devices(context, pci_device, instance)
++            instance.remove_pci_device_and_request(pci_device)
++
+     def _deallocate_port_for_instance(self, context, instance, port_id,
+                                       raise_on_failure=False):
+         try:
+@@ -6645,6 +6828,49 @@ class ComputeManager(manager.Manager):
+                                     {'port_id': port_id, 'error': ex},
+                                     instance=instance)
+ 
++    def _claim_pci_device_for_interface_attach(
++            self,
++            context: nova.context.RequestContext,
++            instance: 'objects.Instance',
++            pci_reqs: 'objects.InstancePCIRequests',
++    ):
++        """Claim PCI devices if there are PCI requests
++
++        :param context: nova.context.RequestContext
++        :param instance: the objects.Instance to where the interface is being
++            attached
++        :param pci_reqs: A InstancePCIRequests object describing the
++            needed PCI devices
++        :raises InterfaceAttachPciClaimFailed: if the PCI device claim fails
++        :returns: An objects.PciDevice describing the claimed PCI device for
++            the interface or None if no device is requested
++        """
++
++        if not pci_reqs.requests:
++            return None
++
++        for request in pci_reqs.requests:
++            LOG.debug('_claim_pci_device_for_interface_attach request spec %s',
++                      request.spec)
++
++        devices = self.rt.claim_pci_devices(context, pci_reqs)
++
++        if not devices:
++            LOG.info('Failed to claim PCI devices during interface attach '
++                     'for PCI request %s', pci_reqs, instance=instance)
++            raise exception.InterfaceAttachPciClaimFailed(
++                instance_uuid=instance.uuid)
++
++        # NOTE(gibi): We assume that maximum one PCI devices is attached per
++        # interface attach request.
++        device = devices[0]
++        for dev in devices:
++            LOG.debug('_claim_pci_device_for_interface_attach dev %s', dev)
++        LOG.debug('_claim_pci_device_for_interface_attach device0 %s', device)
++        instance.pci_devices.objects.append(device)
++
++        return device
++
+     # TODO(mriedem): There are likely race failures which can result in
+     # NotFound and QuotaError exceptions getting traced as well.
+     @messaging.expected_exceptions(
+@@ -6680,9 +6906,50 @@ class ComputeManager(manager.Manager):
+             phase=fields.NotificationPhase.START)
+ 
+         bind_host_id = self.driver.network_binding_host_id(context, instance)
+-        network_info = self.network_api.allocate_port_for_instance(
+-            context, instance, port_id, network_id, requested_ip,
+-            bind_host_id=bind_host_id, tag=tag)
++
++        requested_networks = objects.NetworkRequestList(
++            objects=[
++                objects.NetworkRequest(
++                    network_id=network_id,
++                    port_id=port_id,
++                    address=requested_ip,
++                    tag=tag,
++                )
++            ]
++        )
++
++        if len(requested_networks) != 1:
++            LOG.warning(
++                "Interface attach only supports one interface per attach "
++                "request", instance=instance)
++            raise exception.InterfaceAttachFailed(instance_uuid=instance.uuid)
++
++        pci_reqs = objects.InstancePCIRequests(
++            requests=[], instance_uuid=instance.uuid)
++
++        self.network_api.create_resource_requests(
++            context,
++            requested_networks,
++            pci_reqs)
++
++        try:
++            pci_device = self._claim_pci_device_for_interface_attach(
++                context, instance, pci_reqs)
++        except exception.PciDeviceRequestFailed:
++            raise exception.InterfaceAttachFailed(
++                instance_uuid=instance.uuid)
++
++        instance.pci_requests.requests.extend(pci_reqs.requests)
++
++        network_info = self.network_api.allocate_for_instance(
++            context,
++            instance,
++            False,
++            requested_networks,
++            bind_host_id=bind_host_id,
++            attach=True,
++        )
++
+         if len(network_info) != 1:
+             LOG.error('allocate_port_for_instance returned %(ports)s '
+                       'ports', {'ports': len(network_info)})
+@@ -6702,6 +6969,7 @@ class ComputeManager(manager.Manager):
+                         {'port_id': port_id, 'msg': ex},
+                         instance=instance)
+             self._deallocate_port_for_instance(context, instance, port_id)
++            self._unclaim_and_remove_pci_devices(context, instance, pci_device)
+ 
+             tb = traceback.format_exc()
+             compute_utils.notify_about_instance_action(
+@@ -6712,6 +6980,10 @@ class ComputeManager(manager.Manager):
+ 
+             raise exception.InterfaceAttachFailed(
+                 instance_uuid=instance.uuid)
++        if pci_device:
++            self.rt.allocate_pci_devices_for_instance(context, instance)
++
++        instance.save()
+ 
+         compute_utils.notify_about_instance_action(
+             context, instance, self.host,
+@@ -6734,6 +7006,24 @@ class ComputeManager(manager.Manager):
+         if condemned is None:
+             raise exception.PortNotFound(_("Port %s is not "
+                                            "attached") % port_id)
++        pci_req = pci_req_module.get_instance_pci_request_from_vif(
++            context, instance, condemned)
++
++        pci_device = None
++        if pci_req:
++            pci_devices = [pci_device
++                           for pci_device in instance.pci_devices.objects
++                           if pci_device.request_id == pci_req.request_id]
++
++            if not pci_devices:
++                LOG.warning(
++                    "Detach interface failed, port_id=%(port_id)s, "
++                    "reason: PCI device not found for PCI request %(pci_req)s",
++                    {'port_id': port_id, 'pci_req': pci_req})
++                raise exception.InterfaceDetachFailed(
++                    instance_uuid=instance.uuid)
++
++            pci_device = pci_devices[0]
+ 
+         compute_utils.notify_about_instance_action(
+             context, instance, self.host,
+@@ -6756,6 +7046,9 @@ class ComputeManager(manager.Manager):
+         else:
+             self._deallocate_port_for_instance(
+                 context, instance, port_id, raise_on_failure=True)
++            self._unclaim_and_remove_pci_devices(context, instance, pci_device)
++
++        instance.save()
+ 
+         compute_utils.notify_about_instance_action(
+             context, instance, self.host,
+@@ -6986,10 +7279,22 @@ class ComputeManager(manager.Manager):
+ 
+                     # update the bdm with the new attachment_id.
+                     bdm.attachment_id = attach_ref['id']
++                    connection_info = json.loads(bdm['connection_info'])
++                    connection_data = connection_info.get('data')
++                    vdpa_volume_info = connection_data.get('vdpa_volume_info')
++                    # 在目的端申请pci设备，并且将新旧pci设备信息按顺序保存在vdpa_volume_info当中
++                    if vdpa_volume_info:
++                        product_id = '1001'
++                        new_pci_dev = self._request_vdpa_vol_pci_device(
++                            context, instance, '1af4', product_id, bdm.volume_id)
++                        vdpa_volume_info['old_dev'] = {'pci_slot': vdpa_volume_info['pci'],
++                                                        'dev_path': vdpa_volume_info['dev_path']}
++                        vdpa_volume_info['pci'] = new_pci_dev.address
++                    bdm['connection_info'] = json.dumps(connection_info)
+                     bdm.save()
+ 
+             block_device_info = self._get_instance_block_device_info(
+-                                context, instance, refresh_conn_info=True,
++                                context, instance, refresh_conn_info=False,
+                                 bdms=bdms)
+ 
+             # The driver pre_live_migration will plug vifs on the host. We call
+@@ -7023,6 +7328,10 @@ class ComputeManager(manager.Manager):
+             # onto destination host.
+             self.driver.ensure_filtering_rules_for_instance(instance,
+                                                 network_info)
++
++            for driver_bdm in block_device_info['block_device_mapping']:
++                driver_bdm.save()
++
+         except Exception:
+             # If we raise, migrate_data with the updated attachment ids
+             # will not be returned to the source host for rollback.
+diff --git a/nova/compute/resource_tracker.py b/nova/compute/resource_tracker.py
+index b2ba014..b7c493f 100644
+--- a/nova/compute/resource_tracker.py
++++ b/nova/compute/resource_tracker.py
+@@ -215,6 +215,9 @@ class ResourceTracker(object):
+         instance.numa_topology = instance_numa_topology
+         self._set_instance_host_and_node(instance, nodename)
+ 
++        for request in pci_requests.requests:
++            LOG.debug('instance_claim request spec %s', request.spec)
++
+         if self.pci_tracker:
+             # NOTE(jaypipes): ComputeNode.pci_device_pools is set below
+             # in _update_usage_from_instance().
+@@ -327,7 +330,12 @@ class ResourceTracker(object):
+         # with the new instance flavor pci_requests.
+         if instance.pci_requests:
+             for request in instance.pci_requests.requests:
+-                if request.source == objects.InstancePCIRequest.NEUTRON_PORT:
++                LOG.debug('request: %s source: %s spec: %s is_new: %s '
++                          'request_id: %s', request, request.source,
++                          request.spec, request.is_new, request.request_id)
++                dev_type = request.spec[0].get('dev_type') if request.spec else None
++                if request.source == objects.InstancePCIRequest.NEUTRON_PORT or \
++                        (migration.migration_type != 'live-migration' and dev_type == 'vdpa'):
+                     new_pci_requests.requests.append(request)
+         claim = claims.MoveClaim(context, instance, nodename,
+                                  new_instance_type, image_meta, self, cn,
+@@ -355,6 +363,9 @@ class ResourceTracker(object):
+         # TODO(jaypipes): Move claimed_numa_topology out of the Claim's
+         # constructor flow so the Claim constructor only tests whether
+         # resources can be claimed, not consume the resources directly.
++        LOG.debug(
++            'mig_context old_pci_devices: %s new_pci_devices: %s old_pci_requests: %s new_pci_requests: %s old_resources: %s claimed_resources: %s',
++            instance.pci_devices, claimed_pci_devices, instance.pci_requests, new_pci_requests, old_resources, claimed_resources)
+         mig_context = objects.MigrationContext(
+             context=context, instance_uuid=instance.uuid,
+             migration_id=migration.id,
+@@ -1772,6 +1783,18 @@ class ResourceTracker(object):
+         self.pci_tracker.save(context)
+         return result
+ 
++    @utils.synchronized(COMPUTE_RESOURCE_SEMAPHORE, fair=True)
++    def unclaim_pci_devices(self, context, pci_device, instance):
++        """Deallocate PCI devices
++
++        :param context: security context
++        :param pci_device: the objects.PciDevice describing the PCI device to
++            be freed
++        :param instance: the objects.Instance the PCI resources are freed from
++        """
++        self.pci_tracker.free_device(pci_device, instance)
++        self.pci_tracker.save(context)
++
+     @utils.synchronized(COMPUTE_RESOURCE_SEMAPHORE)
+     def allocate_pci_devices_for_instance(self, context, instance):
+         """Allocate instance claimed PCI resources
+diff --git a/nova/compute/rpcapi.py b/nova/compute/rpcapi.py
+index f37241c..dba3452 100644
+--- a/nova/compute/rpcapi.py
++++ b/nova/compute/rpcapi.py
+@@ -532,7 +532,9 @@ class ComputeAPI(object):
+         version = '5.0'
+         client = self.router.client(ctxt)
+         cctxt = client.prepare(server=_compute_host(None, instance),
+-                               version=version)
++                               version=version,
++                               call_monitor_timeout=CONF.rpc_response_timeout,
++                               timeout=CONF.rpc_response_timeout)
+         return cctxt.call(ctxt, 'attach_interface', **kw)
+ 
+     def attach_volume(self, ctxt, instance, bdm):
+@@ -573,7 +575,9 @@ class ComputeAPI(object):
+         version = '5.0'
+         client = self.router.client(ctxt)
+         source = _compute_host(None, instance)
+-        cctxt = client.prepare(server=source, version=version)
++        cctxt = client.prepare(server=source, version=version,
++                               call_monitor_timeout=CONF.rpc_response_timeout,
++                               timeout=CONF.long_rpc_timeout)
+         return cctxt.call(ctxt, 'check_can_live_migrate_source',
+                           instance=instance,
+                           dest_check_data=dest_check_data)
+diff --git a/nova/exception.py b/nova/exception.py
+index d178034..fd6acd7 100644
+--- a/nova/exception.py
++++ b/nova/exception.py
+@@ -690,6 +690,10 @@ class VolumeBDMPathNotFound(VolumeBDMNotFound):
+     msg_fmt = _("No volume Block Device Mapping at path: %(path)s")
+ 
+ 
++class InterfaceAttachPciClaimFailed(Invalid):
++    msg_fmt = _("Failed to claim PCI device for %(instance_uuid)s during "
++                "interface attach")
++
+ class DeviceDetachFailed(NovaException):
+     msg_fmt = _("Device detach failed for %(device)s: %(reason)s")
+ 
+@@ -1793,6 +1797,9 @@ class PciRequestFromVIFNotFound(NotFound):
+     msg_fmt = _("Failed to locate PCI request associated with the given VIF "
+                 "PCI address: %(pci_slot)s on compute node: %(node_id)s")
+ 
++class PciRequestFromVolumeNotFound(NotFound):
++    msg_fmt = _("Failed to locate PCI request associated with the given Volume "
++                "PCI address: %(pci_slot)s on compute node: %(node_id)s")
+ 
+ # Cannot be templated, msg needs to be constructed when raised.
+ class InternalError(NovaException):
+@@ -2553,3 +2560,8 @@ class GetPMEMNamespaceFailed(NovaException):
+ class VPMEMCleanupFailed(NovaException):
+     msg_fmt = _("Failed to clean up the vpmem backend device %(dev)s: "
+                 "%(error)s")
++
++
++class ProcessExecuteException(Invalid):
++    msg_fmt = _("Run cmd %(cmd)s failed. "
++                "Reason: %(reason)s")
+\ No newline at end of file
+diff --git a/nova/network/model.py b/nova/network/model.py
+index d8119fa..71accf2 100644
+--- a/nova/network/model.py
++++ b/nova/network/model.py
+@@ -104,19 +104,23 @@ VNIC_TYPE_MACVTAP = 'macvtap'
+ VNIC_TYPE_DIRECT_PHYSICAL = 'direct-physical'
+ VNIC_TYPE_BAREMETAL = 'baremetal'
+ VNIC_TYPE_VIRTIO_FORWARDER = 'virtio-forwarder'
++VNIC_TYPE_VDPA = 'vdpa'
+ 
+ # Define list of ports which needs pci request.
+ # Note: The macvtap port needs a PCI request as it is a tap interface
+ # with VF as the lower physical interface.
+ # Note: Currently, VNIC_TYPE_VIRTIO_FORWARDER assumes a 1:1
+ # relationship with a VF. This is expected to change in the future.
+-VNIC_TYPES_SRIOV = (VNIC_TYPE_DIRECT, VNIC_TYPE_MACVTAP,
+-                    VNIC_TYPE_DIRECT_PHYSICAL, VNIC_TYPE_VIRTIO_FORWARDER)
++VNIC_TYPES_SRIOV = (
++    VNIC_TYPE_DIRECT, VNIC_TYPE_MACVTAP, VNIC_TYPE_DIRECT_PHYSICAL,
++    VNIC_TYPE_VIRTIO_FORWARDER, VNIC_TYPE_VDPA
++)
+ 
+ # Define list of ports which are passthrough to the guest
+ # and need a special treatment on snapshot and suspend/resume
+ VNIC_TYPES_DIRECT_PASSTHROUGH = (VNIC_TYPE_DIRECT,
+-                                 VNIC_TYPE_DIRECT_PHYSICAL)
++                                 VNIC_TYPE_DIRECT_PHYSICAL,
++                                 VNIC_TYPE_VDPA)
+ 
+ # Constants for the 'vif_model' values
+ VIF_MODEL_VIRTIO = 'virtio'
+diff --git a/nova/network/neutronv2/api.py b/nova/network/neutronv2/api.py
+index 8f85a74..045ce09 100644
+--- a/nova/network/neutronv2/api.py
++++ b/nova/network/neutronv2/api.py
+@@ -341,32 +341,42 @@ class API(base_api.NetworkAPI):
+                 # the current instance.host.
+                 has_binding_ext = self.supports_port_binding_extension(context)
+                 if port_migrating and has_binding_ext:
+-                    # Attempt to delete all port bindings on the host and raise
+-                    # any errors at the end.
+-                    failed_port_ids = []
+-                    for port in ports:
+-                        # This call is safe in that 404s for non-existing
+-                        # bindings are ignored.
+-                        try:
+-                            self.delete_port_binding(
+-                                context, port['id'], host)
+-                        except exception.PortBindingDeletionFailed:
+-                            # delete_port_binding will log an error for each
+-                            # failure but since we're iterating a list we want
+-                            # to keep track of all failures to build a generic
+-                            # exception to raise
+-                            failed_port_ids.append(port['id'])
+-                    if failed_port_ids:
+-                        msg = (_("Failed to delete binding for port(s) "
+-                                 "%(port_ids)s and host %(host)s.") %
+-                               {'port_ids': ','.join(failed_port_ids),
+-                                'host': host})
+-                        raise exception.PortBindingDeletionFailed(msg)
++                    self._delete_port_bindings(context, ports, host)
+             elif port_migrating:
+                 # Setup the port profile
+                 self._setup_migration_port_profile(
+                     context, instance, host, admin_client, ports)
+ 
++    def _delete_port_bindings(self, context, ports, host):
++        """Attempt to delete all port bindings on the host
++
++        :param context: The user request context.
++        :param ports: list of port dicts to cleanup; the 'id' field is required
++            per port dict in the list
++        :param host: host from which to delete port bindings
++        :raises: PortBindingDeletionFailed if port binding deletion fails.
++        """
++        failed_port_ids = []
++
++        for port in ports:
++            # This call is safe in that 404s for non-existing
++            # bindings are ignored.
++            try:
++                self.delete_port_binding(context, port['id'], host)
++            except exception.PortBindingDeletionFailed:
++                # delete_port_binding will log an error for each
++                # failure but since we're iterating a list we want
++                # to keep track of all failures to build a generic
++                # exception to raise
++                failed_port_ids.append(port['id'])
++
++        if failed_port_ids:
++            msg = (_("Failed to delete binding for port(s) "
++                     "%(port_ids)s and host %(host)s.") %
++                   {'port_ids': ','.join(failed_port_ids),
++                    'host': host})
++            raise exception.PortBindingDeletionFailed(msg)
++
+     def _get_available_networks(self, context, project_id,
+                                 net_ids=None, neutron=None,
+                                 auto_allocate=False):
+@@ -693,10 +703,15 @@ class API(base_api.NetworkAPI):
+                         # SR-IOV port attach is not supported.
+                         vnic_type = port.get('binding:vnic_type',
+                                              network_model.VNIC_TYPE_NORMAL)
++                        profile = port.get('binding:profile', None)
++                        vdpa_type = None
++                        if profile:
++                            vdpa_type = profile.get('vdpa_type', None)
+                         if vnic_type in network_model.VNIC_TYPES_SRIOV:
+-                            raise exception.AttachSRIOVPortNotSupported(
+-                                port_id=port['id'],
+-                                instance_uuid=instance.uuid)
++                            if vdpa_type != 'generic':
++                                raise exception.AttachSRIOVPortNotSupported(
++                                    port_id=port['id'],
++                                    instance_uuid=instance.uuid)
+ 
+                     # If requesting a specific port, automatically process
+                     # the network for that port as if it were explicitly
+@@ -1999,6 +2014,7 @@ class API(base_api.NetworkAPI):
+         resource_requests = []
+ 
+         for request_net in requested_networks:
++            LOG.debug('request_net: %s', request_net)
+             physnet = None
+             trusted = None
+             tunneled_ = False
+@@ -2007,16 +2023,17 @@ class API(base_api.NetworkAPI):
+             requester_id = None
+ 
+             if request_net.port_id:
++                # InstancePCIRequest.requester_id is semantically linked
++                # to a port with a resource_request.
++                requester_id = request_net.port_id
+                 result = self._get_port_vnic_info(
+                     context, neutron, request_net.port_id)
+                 vnic_type, trusted, network_id, resource_request = result
++                LOG.debug('result: %s', result)
+                 physnet, tunneled_ = self._get_physnet_tunneled_info(
+                     context, neutron, network_id)
+ 
+                 if resource_request:
+-                    # InstancePCIRequest.requester_id is semantically linked
+-                    # to a port with a resource_request.
+-                    requester_id = request_net.port_id
+                     # NOTE(gibi): explicitly orphan the RequestGroup by setting
+                     # context=None as we never intended to save it to the DB.
+                     resource_requests.append(
+@@ -2050,8 +2067,12 @@ class API(base_api.NetworkAPI):
+                 # SR-IOV modes (legacy and ovs) in the same deployment.
+                 spec = {pci_request.PCI_NET_TAG: physnet}
+                 dev_type = pci_request.DEVICE_TYPE_FOR_VNIC_TYPE.get(vnic_type)
++                LOG.debug('vnic_type: %s dev_type: %s', vnic_type, dev_type)
+                 if dev_type:
+                     spec[pci_request.PCI_DEVICE_TYPE_TAG] = dev_type
++                    if vnic_type == network_model.VNIC_TYPE_VDPA:
++                        spec['vendor_id'] = '1af4'
++                        spec['product_id'] = '1000'
+                 if trusted is not None:
+                     # We specifically have requested device on a pool
+                     # with a tag trusted set to true or false. We
+@@ -2064,6 +2085,8 @@ class API(base_api.NetworkAPI):
+                     request_id=uuidutils.generate_uuid(),
+                     requester_id=requester_id)
+                 pci_requests.requests.append(request)
++                LOG.debug('create_resource_requests append request spec %s',
++                          request.spec)
+                 pci_request_id = request.request_id
+ 
+             # Add pci_request_id into the requested network
+@@ -3284,10 +3307,10 @@ class API(base_api.NetworkAPI):
+         raise NotImplementedError()
+ 
+     def setup_instance_network_on_host(self, context, instance, host,
+-                                       migration=None):
++                                       migration=None, provider_mappings=None):
+         """Setup network for specified instance on host."""
+         self._update_port_binding_for_instance(context, instance, host,
+-                                               migration)
++                                               migration, provider_mappings)
+ 
+     def cleanup_instance_network_on_host(self, context, instance, host):
+         """Cleanup network for specified instance on host."""
+@@ -3300,6 +3323,38 @@ class API(base_api.NetworkAPI):
+         # device_id field on the port which is not what we'd want for shelve.
+         pass
+ 
++    def _get_port_pci_dev(self, instance, port):
++        """Find the PCI device corresponding to the port.
++        Assumes the port is an SRIOV one.
++
++        :param instance: The instance to which the port is attached.
++        :param port: The Neutron port, as obtained from the Neutron API
++            JSON form.
++        :return: The PciDevice object, or None if unable to find.
++        """
++        # Find the port's PCIRequest, or return None
++        for r in instance.pci_requests.requests:
++            if r.requester_id == port['id']:
++                request = r
++                break
++        else:
++            LOG.debug('No PCI request found for port %s', port['id'],
++                      instance=instance)
++            return None
++        # Find the request's device, or return None
++        for d in instance.pci_devices:
++            if d.request_id == request.request_id:
++                device = d
++                break
++        else:
++            LOG.debug('No PCI device found for request %s',
++                      request.request_id, instance=instance)
++            return None
++
++        LOG.debug('Get the pci device %s corresponding to the port %s',
++                  device, port)
++        return device
++
+     def _get_pci_mapping_for_migration(self, instance, migration):
+         if not instance.migration_context:
+             return {}
+@@ -3350,27 +3405,43 @@ class API(base_api.NetworkAPI):
+             # that this function is called without a migration object, such
+             # as in an unshelve operation.
+             vnic_type = p.get('binding:vnic_type')
+-            if (vnic_type in network_model.VNIC_TYPES_SRIOV and
+-                    migration is not None and
+-                    migration['migration_type'] != constants.LIVE_MIGRATION):
+-                # Note(adrianc): for live migration binding profile was already
+-                # updated in conductor when calling bind_ports_to_host()
+-                if not pci_mapping:
+-                    pci_mapping = self._get_pci_mapping_for_migration(
+-                        instance, migration)
+-
+-                pci_slot = binding_profile.get('pci_slot')
+-                new_dev = pci_mapping.get(pci_slot)
+-                if new_dev:
+-                    binding_profile.update(
+-                        self._get_pci_device_profile(new_dev))
+-                    updates[constants.BINDING_PROFILE] = binding_profile
++            if vnic_type in network_model.VNIC_TYPES_SRIOV:
++                if migration is not None:
++                    if migration['migration_type'] != constants.LIVE_MIGRATION:
++                        # Note(adrianc): for live migration binding profile
++                        # was already updated in conductor when calling
++                        # bind_ports_to_host()
++                        if not pci_mapping:
++                            pci_mapping = self._get_pci_mapping_for_migration(
++                                instance, migration)
++
++                        pci_slot = binding_profile.get('pci_slot')
++                        new_dev = pci_mapping.get(pci_slot)
++                        if new_dev:
++                            binding_profile.update(
++                                self._get_pci_device_profile(new_dev))
++                            updates[constants.BINDING_PROFILE] = binding_profile
++                        else:
++                            raise exception.PortUpdateFailed(port_id=p['id'],
++                                reason=_("Unable to correlate PCI slot %s") %
++                                         pci_slot)
++                # NOTE(artom) If migration is None, this is an unshelve, and we
++                # need to figure out the pci related binding information from
++                # the InstancePCIRequest and PciDevice objects.
+                 else:
+-                    raise exception.PortUpdateFailed(port_id=p['id'],
+-                        reason=_("Unable to correlate PCI slot %s") %
+-                                 pci_slot)
+-
+-            if p.get('resource_request'):
++                    pci_dev = self._get_port_pci_dev(instance, p)
++                    if pci_dev:
++                        binding_profile.update(
++                            self._get_pci_device_profile(pci_dev))
++                        updates[constants.BINDING_PROFILE] = binding_profile
++
++            # NOTE(gibi): during live migration the conductor already sets the
++            # allocation key in the port binding. However during resize, cold
++            # migrate, evacuate and unshelve we have to set the binding here.
++            # Also note that during unshelve no migration object is created.
++            if p.get('resource_request') and (
++                migration is None or not migration.is_live_migration
++            ):
+                 if not provider_mappings:
+                     # TODO(gibi): Remove this check when compute RPC API is
+                     # bumped to 6.0
+diff --git a/nova/network/os_vif_util.py b/nova/network/os_vif_util.py
+index 9b76ef3..c124860 100644
+--- a/nova/network/os_vif_util.py
++++ b/nova/network/os_vif_util.py
+@@ -347,6 +347,9 @@ def _nova_to_osvif_vif_ovs(vif):
+         interface_id=vif.get('ovs_interfaceid') or vif['id'],
+         datapath_type=vif['details'].get(
+             model.VIF_DETAILS_OVS_DATAPATH_TYPE))
++    if vnic_type == model.VNIC_TYPE_VDPA:
++        obj = _get_vnic_vdpa_vif_instance(vif, port_profile=profile, plugin="ovs")
++        return obj
+     if vnic_type == model.VNIC_TYPE_DIRECT:
+         obj = _get_vnic_direct_vif_instance(
+             vif,
+@@ -373,6 +376,31 @@ def _nova_to_osvif_vif_ovs(vif):
+     return obj
+ 
+ 
++def _get_vnic_vdpa_vif_instance(vif, port_profile, plugin, set_bridge=True):
++    vif_name = ('vdpa' + vif['id'])[:model.NIC_NAME_LEN]
++    obj = _get_vif_instance(
++        vif,
++        objects.vif.VIFVDPADevice,
++        port_profile=port_profile,
++        plugin=plugin,
++        pci_id=vif["profile"]["pci_slot"],
++        vif_name=vif_name,
++        hw_type='dpdk',
++        dev_path=None
++    )
++    if set_bridge and vif["network"]["bridge"] is not None:
++        obj.network.bridge = vif["network"]["bridge"]
++
++    max_queues = vif['profile'].get('max_queues', None)
++    obj.max_queues = max_queues
++    n_rxq = vif['profile'].get('n_rxq', None)
++    obj.n_rxq = n_rxq
++
++    dev_path = vif['profile'].get('dev_path', None)
++    obj.dev_path = dev_path
++    return obj
++
++
+ # VIF_TYPE_AGILIO_OVS = 'agilio_ovs'
+ def _nova_to_osvif_vif_agilio_ovs(vif):
+     vnic_type = vif.get('vnic_type', model.VNIC_TYPE_NORMAL)
+diff --git a/nova/objects/fields.py b/nova/objects/fields.py
+index 366a970..5b87b2a 100644
+--- a/nova/objects/fields.py
++++ b/nova/objects/fields.py
+@@ -710,8 +710,9 @@ class PciDeviceType(BaseNovaEnum):
+     STANDARD = "type-PCI"
+     SRIOV_PF = "type-PF"
+     SRIOV_VF = "type-VF"
++    VDPA = "vdpa"
+ 
+-    ALL = (STANDARD, SRIOV_PF, SRIOV_VF)
++    ALL = (STANDARD, SRIOV_PF, SRIOV_VF, VDPA)
+ 
+ 
+ class PCINUMAAffinityPolicy(BaseNovaEnum):
+diff --git a/nova/objects/instance.py b/nova/objects/instance.py
+index ba0ea15..7dbce27 100644
+--- a/nova/objects/instance.py
++++ b/nova/objects/instance.py
+@@ -1207,6 +1207,14 @@ class Instance(base.NovaPersistentObject, base.NovaObject,
+         return objects.BlockDeviceMappingList.get_by_instance_uuid(
+             self._context, self.uuid)
+ 
++    def remove_pci_device_and_request(self, pci_device):
++        """Remove the PciDevice and the related InstancePciRequest"""
++        if pci_device in self.pci_devices.objects:
++            self.pci_devices.objects.remove(pci_device)
++        self.pci_requests.requests = [
++            pci_req for pci_req in self.pci_requests.requests
++            if pci_req.request_id != pci_device.request_id]
++
+ 
+ def _make_instance_list(context, inst_list, db_inst_list, expected_attrs):
+     get_fault = expected_attrs and 'fault' in expected_attrs
+diff --git a/nova/objects/pci_device.py b/nova/objects/pci_device.py
+index 56492a1..551dced 100644
+--- a/nova/objects/pci_device.py
++++ b/nova/objects/pci_device.py
+@@ -95,7 +95,8 @@ class PciDevice(base.NovaPersistentObject, base.NovaObject):
+     # Version 1.4: Added parent_addr field
+     # Version 1.5: Added 2 new device statuses: UNCLAIMABLE and UNAVAILABLE
+     # Version 1.6: Added uuid field
+-    VERSION = '1.6'
++    # Version 1.7: Added 'vdpa' to 'dev_type' field
++    VERSION = '1.7'
+ 
+     fields = {
+         'id': fields.IntegerField(),
+@@ -137,6 +138,13 @@ class PciDevice(base.NovaPersistentObject, base.NovaObject):
+                         status, target_version))
+         if target_version < (1, 6) and 'uuid' in primitive:
+             del primitive['uuid']
++        if target_version < (1, 7) and 'dev_type' in primitive:
++            dev_type = primitive['dev_type']
++            if dev_type == fields.PciDeviceType.VDPA:
++                raise exception.ObjectActionError(
++                    action='obj_make_compatible',
++                    reason='dev_type=%s not supported in version %s' % (
++                        dev_type, target_version))
+ 
+     def update_device(self, dev_dict):
+         """Sync the content from device dictionary to device object.
+@@ -283,7 +291,9 @@ class PciDevice(base.NovaPersistentObject, base.NovaObject):
+             self._bulk_update_status(vfs_list,
+                                            fields.PciDeviceStatus.UNCLAIMABLE)
+ 
+-        elif self.dev_type == fields.PciDeviceType.SRIOV_VF:
++        elif self.dev_type in (
++                fields.PciDeviceType.SRIOV_VF, fields.PciDeviceType.VDPA
++        ):
+             # Update VF status to CLAIMED if it's parent has not been
+             # previously allocated or claimed
+             # When claiming/allocating a VF, it's parent PF becomes
+@@ -343,7 +353,9 @@ class PciDevice(base.NovaPersistentObject, base.NovaObject):
+             self._bulk_update_status(vfs_list,
+                                      fields.PciDeviceStatus.UNAVAILABLE)
+ 
+-        elif (self.dev_type == fields.PciDeviceType.SRIOV_VF):
++        elif self.dev_type in (
++            fields.PciDeviceType.SRIOV_VF, fields.PciDeviceType.VDPA
++        ):
+             parent = self.parent_device
+             if parent:
+                 if parent.status not in parent_ok_statuses:
+@@ -402,7 +414,9 @@ class PciDevice(base.NovaPersistentObject, base.NovaObject):
+             self._bulk_update_status(vfs_list,
+                                      fields.PciDeviceStatus.AVAILABLE)
+             free_devs.extend(vfs_list)
+-        if self.dev_type == fields.PciDeviceType.SRIOV_VF:
++        if self.dev_type in (
++            fields.PciDeviceType.SRIOV_VF, fields.PciDeviceType.VDPA
++        ):
+             # Set PF status to AVAILABLE if all of it's VFs are free
+             parent = self.parent_device
+             if not parent:
+diff --git a/nova/pci/manager.py b/nova/pci/manager.py
+index 05930b0..36c6419 100644
+--- a/nova/pci/manager.py
++++ b/nova/pci/manager.py
+@@ -152,7 +152,9 @@ class PciDevTracker(object):
+             if dev.dev_type == fields.PciDeviceType.SRIOV_PF:
+                 dev.child_devices = []
+                 parents[dev.address] = dev
+-            elif dev.dev_type == fields.PciDeviceType.SRIOV_VF:
++            elif dev.dev_type in (
++                fields.PciDeviceType.SRIOV_VF, fields.PciDeviceType.VDPA
++            ):
+                 dev.parent_device = parents.get(dev.parent_addr)
+                 if dev.parent_device:
+                     parents[dev.parent_addr].child_devices.append(dev)
+@@ -249,6 +251,7 @@ class PciDevTracker(object):
+ 
+         instance_uuid = pci_requests.instance_uuid
+         for dev in devs:
++            LOG.debug("_claim_instance dev %s instance_uuid %s", dev, instance_uuid)
+             dev.claim(instance_uuid)
+         if instance_numa_topology and any(
+                                         dev.numa_node is None for dev in devs):
+@@ -259,22 +262,30 @@ class PciDevTracker(object):
+ 
+     def _allocate_instance(self, instance, devs):
+         for dev in devs:
++            LOG.debug("_allocate_instance dev %s", dev, instance=instance)
+             dev.allocate(instance)
+ 
+     def allocate_instance(self, instance):
++        LOG.debug("allocate_instance", instance=instance)
++        for pci_dev in instance.pci_devices:
++            LOG.debug("instance.pci_devices bf: %s", pci_dev, instance=instance)
+         devs = self.claims.pop(instance['uuid'], [])
+         self._allocate_instance(instance, devs)
+         if devs:
+             self.allocations[instance['uuid']] += devs
++        for pci_dev in instance.pci_devices:
++            LOG.debug("instance.pci_devices aft: %s", pci_dev, instance=instance)
+ 
+     def claim_instance(self, context, pci_requests, instance_numa_topology):
++        LOG.debug("claim_instance pci_requests %s", pci_requests)
+         devs = []
+         if self.pci_devs and pci_requests.requests:
+             instance_uuid = pci_requests.instance_uuid
++            LOG.debug("claim_instance %s", instance_uuid)
+             devs = self._claim_instance(context, pci_requests,
+                                         instance_numa_topology)
+             if devs:
+-                self.claims[instance_uuid] = devs
++                self.claims[instance_uuid] += devs
+         return devs
+ 
+     def free_device(self, dev, instance):
+diff --git a/nova/pci/request.py b/nova/pci/request.py
+index 845a3d5..26597b8 100644
+--- a/nova/pci/request.py
++++ b/nova/pci/request.py
+@@ -57,7 +57,8 @@ PCI_TRUSTED_TAG = 'trusted'
+ PCI_DEVICE_TYPE_TAG = 'dev_type'
+ 
+ DEVICE_TYPE_FOR_VNIC_TYPE = {
+-    network_model.VNIC_TYPE_DIRECT_PHYSICAL: obj_fields.PciDeviceType.SRIOV_PF
++    network_model.VNIC_TYPE_DIRECT_PHYSICAL: obj_fields.PciDeviceType.SRIOV_PF,
++    network_model.VNIC_TYPE_VDPA: obj_fields.PciDeviceType.VDPA
+ }
+ 
+ CONF = nova.conf.CONF
+@@ -226,6 +227,45 @@ def get_instance_pci_request_from_vif(context, instance, vif):
+         pci_slot=vif_pci_dev_addr,
+         node_id=cn_id)
+ 
++def get_instance_pci_request_from_volume(context, instance, volume_bdm):
++    """Given an Instance, return the PCI request associated
++    to the PCI device related to the given volume_id
++    """
++
++    vdpa_volume_info = volume_bdm.get('connection_info', {}).get('data', {}).get(
++        'vdpa_volume_info')
++    pci_slot = vdpa_volume_info.get('pci') if vdpa_volume_info else None
++    LOG.debug('volume %s pci_slot %s', volume_bdm.volume_id, pci_slot)
++
++    if not pci_slot:
++        return None
++
++    try:
++        cn_id = objects.ComputeNode.get_by_host_and_nodename(
++            context,
++            instance.host,
++            instance.node).id
++    except exception.NotFound:
++        LOG.warning("expected to find compute node with host %s "
++                    "and node %s when getting instance PCI request "
++                    "from volume", instance.host, instance.node)
++        return None
++
++    found_pci_dev = None
++    for pci_dev in instance.pci_devices:
++        if (pci_dev.compute_node_id == cn_id and
++                pci_dev.address == pci_slot):
++            found_pci_dev = pci_dev
++            break
++    if not found_pci_dev:
++        return None
++    # Find PCIRequest associated with the given PCIDevice in instance
++    for pci_req in instance.pci_requests.requests:
++        if pci_req.request_id == found_pci_dev.request_id:
++            return pci_req
++    raise exception.PciRequestFromVolumeNotFound(
++        pci_slot=pci_slot,
++        node_id=cn_id)
+ 
+ def get_pci_requests_from_flavor(flavor):
+     """Validate and return PCI requests.
+diff --git a/nova/pci/stats.py b/nova/pci/stats.py
+index 0a80ece..44a67df 100644
+--- a/nova/pci/stats.py
++++ b/nova/pci/stats.py
+@@ -15,6 +15,7 @@
+ #    under the License.
+ 
+ import copy
++import typing as ty
+ 
+ from oslo_config import cfg
+ from oslo_log import log as logging
+@@ -31,6 +32,12 @@ CONF = cfg.CONF
+ LOG = logging.getLogger(__name__)
+ 
+ 
++# TODO(stephenfin): We might want to use TypedDict here. Refer to
++# https://mypy.readthedocs.io/en/latest/kinds_of_types.html#typeddict for
++# more information.
++Pool = ty.Dict[str, ty.Any]
++
++
+ class PciDeviceStats(object):
+ 
+     """PCI devices summary information.
+@@ -176,6 +183,32 @@ class PciDeviceStats(object):
+             free_devs.extend(pool['devices'])
+         return free_devs
+ 
++    def _filter_pools_for_unrequested_vdpa_devices(
++        self,
++        pools: ty.List[Pool],
++        request: 'objects.InstancePCIRequest',
++    ) -> ty.List[Pool]:
++        """Filter out pools with VDPA devices, unless these are required.
++
++        This is necessary as vdpa devices require special handling and
++        should not be allocated to generic pci device requests.
++
++        :param pools: A list of PCI device pool dicts
++        :param request: An InstancePCIRequest object describing the type,
++            quantity and required NUMA affinity of device(s) we want.
++        :returns: A list of pools that can be used to support the request if
++            this is possible.
++        """
++        if all(
++            spec.get('dev_type') != fields.PciDeviceType.VDPA
++            for spec in request.spec
++        ):
++            pools = [
++                pool for pool in pools
++                if not pool.get('dev_type') == fields.PciDeviceType.VDPA
++            ]
++        return pools
++
+     def consume_requests(self, pci_requests, numa_cells=None):
+         alloc_devices = []
+         for request in pci_requests:
+@@ -191,6 +224,7 @@ class PciDeviceStats(object):
+                 pools = self._filter_pools_for_numa_cells(
+                     pools, numa_cells, numa_policy, count)
+             pools = self._filter_non_requested_pfs(pools, request)
++            pools = self._filter_pools_for_unrequested_vdpa_devices(pools, request)
+             # Failed to allocate the required number of devices
+             # Return the devices already allocated back to their pools
+             if sum([pool['count'] for pool in pools]) < count:
+@@ -232,7 +266,10 @@ class PciDeviceStats(object):
+             if vfs_list:
+                 for vf in vfs_list:
+                     self.remove_device(vf)
+-        elif pci_dev.dev_type == fields.PciDeviceType.SRIOV_VF:
++        elif pci_dev.dev_type in (
++                fields.PciDeviceType.SRIOV_VF,
++                fields.PciDeviceType.VDPA
++        ):
+             try:
+                 parent = pci_dev.parent_device
+                 # Make sure not to decrease PF pool count if this parent has
+diff --git a/nova/pci/utils.py b/nova/pci/utils.py
+index 5b0a082..6e809c5 100644
+--- a/nova/pci/utils.py
++++ b/nova/pci/utils.py
+@@ -221,6 +221,6 @@ def get_net_name_by_vf_pci_address(vfaddress):
+         return ("net_%(ifname)s_%(mac)s" %
+                 {'ifname': ifname, 'mac': '_'.join(mac)})
+     except Exception:
+-        LOG.warning("No net device was found for VF %(vfaddress)s",
+-                    {'vfaddress': vfaddress})
++        # LOG.warning("No net device was found for VF %(vfaddress)s",
++        #             {'vfaddress': vfaddress})
+         return
+diff --git a/nova/virt/block_device.py b/nova/virt/block_device.py
+index 202119f..a348b88 100644
+--- a/nova/virt/block_device.py
++++ b/nova/virt/block_device.py
+@@ -267,7 +267,7 @@ class DriverVolumeBlockDevice(DriverBlockDevice):
+                           'delete_on_termination'])
+     _new_fields = set(['guest_format', 'device_type',
+                        'disk_bus', 'boot_index',
+-                       'attachment_id'])
++                       'attachment_id', 'vdpa_volume_info'])
+     _fields = _legacy_fields | _new_fields
+ 
+     _valid_source = 'volume'
+@@ -557,6 +557,8 @@ class DriverVolumeBlockDevice(DriverBlockDevice):
+             self['mount_device'])['connection_info']
+         if 'serial' not in connection_info:
+             connection_info['serial'] = self.volume_id
++        if self['vdpa_volume_info']:
++            connection_info['data']['vdpa_volume_info'] = self['vdpa_volume_info']
+         self._preserve_multipath_id(connection_info)
+         if vol_multiattach:
+             # This will be used by the volume driver to determine the proper
+diff --git a/nova/virt/libvirt/config.py b/nova/virt/libvirt/config.py
+index 39c4da8..b409f61 100644
+--- a/nova/virt/libvirt/config.py
++++ b/nova/virt/libvirt/config.py
+@@ -2042,6 +2042,41 @@ class LibvirtConfigGuestHostdevPCI(LibvirtConfigGuestHostdev):
+                         self.function = sub.get('function')
+ 
+ 
++class LibvirtConfigGuestVDPAPCI(LibvirtConfigGuestHostdevPCI):
++    def __init__(self, **kwargs):
++        super(LibvirtConfigGuestVDPAPCI, self).\
++                __init__(**kwargs)
++        self.domain = None
++        self.bus = None
++        self.slot = None
++        self.function = None
++        self.source_dev = None
++        self.boot_order = None
++
++    def format_dom(self):
++        dev = super(LibvirtConfigGuestHostdevPCI, self).format_dom()
++
++        dev.set("type", 'vdpa')
++        dev.append(etree.Element("source", dev=self.source_dev))
++        if self.boot_order:
++            dev.append(etree.Element("boot", order=self.boot_order))
++        return dev
++
++    def parse_dom(self, xmldoc):
++        childs = super(LibvirtConfigGuestHostdevPCI, self).parse_dom(xmldoc)
++        for c in childs:
++            if c.tag == "source":
++                self.source_dev = c.get('dev')
++                for sub in c:
++                    if sub.tag == 'address':
++                        self.domain = sub.get('domain')
++                        self.bus = sub.get('bus')
++                        self.slot = sub.get('slot')
++                        self.function = sub.get('function')
++            elif c.tag == 'boot':
++                self.boot_order = c.get('order')
++
++
+ class LibvirtConfigGuestHostdevMDEV(LibvirtConfigGuestHostdev):
+     def __init__(self, **kwargs):
+         super(LibvirtConfigGuestHostdevMDEV, self).__init__(
+@@ -2783,6 +2818,7 @@ class LibvirtConfigGuest(LibvirtConfigObject):
+         # Note: This cover only for: LibvirtConfigGuestDisks
+         #                            LibvirtConfigGuestFilesys
+         #                            LibvirtConfigGuestHostdevPCI
++        #                            LibvirtConfigGuestVDPAPCI
+         #                            LibvirtConfigGuestHostdevMDEV
+         #                            LibvirtConfigGuestInterface
+         #                            LibvirtConfigGuestUidMap
+@@ -2804,6 +2840,10 @@ class LibvirtConfigGuest(LibvirtConfigObject):
+                         obj = LibvirtConfigGuestHostdevPCI()
+                         obj.parse_dom(d)
+                         self.devices.append(obj)
++                    elif d.tag == 'hostdev' and d.get('type') == 'vdpa':
++                        obj = LibvirtConfigGuestVDPAPCI()
++                        obj.parse_dom(d)
++                        self.devices.append(obj)
+                     elif d.tag == 'hostdev' and d.get('type') == 'mdev':
+                         obj = LibvirtConfigGuestHostdevMDEV()
+                         obj.parse_dom(d)
+@@ -2886,9 +2926,12 @@ class LibvirtConfigNodeDevice(LibvirtConfigObject):
+         super(LibvirtConfigNodeDevice, self).__init__(root_name="device",
+                                                 **kwargs)
+         self.name = None
++        self.path = None
+         self.parent = None
+         self.pci_capability = None
+         self.mdev_information = None
++        self.vdpa_capability = None
++        self.vpd_capability = None
+ 
+     def parse_dom(self, xmldoc):
+         super(LibvirtConfigNodeDevice, self).parse_dom(xmldoc)
+@@ -2896,6 +2939,8 @@ class LibvirtConfigNodeDevice(LibvirtConfigObject):
+         for c in xmldoc:
+             if c.tag == "name":
+                 self.name = c.text
++            elif c.tag == "path":
++                self.path = c.text
+             elif c.tag == "parent":
+                 self.parent = c.text
+             elif c.tag == "capability" and c.get("type") in ['pci', 'net']:
+@@ -2906,6 +2951,23 @@ class LibvirtConfigNodeDevice(LibvirtConfigObject):
+                 mdev_info = LibvirtConfigNodeDeviceMdevInformation()
+                 mdev_info.parse_dom(c)
+                 self.mdev_information = mdev_info
++            elif c.tag == "capability" and c.get("type") in ['vdpa']:
++                vdpa_caps = LibvirtConfigNodeDeviceVDPACap()
++                vdpa_caps.parse_dom(c)
++                self.vdpa_capability = vdpa_caps
++
++
++class LibvirtConfigNodeDeviceVDPACap(LibvirtConfigObject):
++    def __init__(self, **kwargs):
++        super().__init__(
++            root_name="capability", **kwargs)
++        self.dev_path = None
++
++    def parse_dom(self, xmldoc):
++        super().parse_dom(xmldoc)
++        for c in xmldoc:
++            if c.tag == "chardev":
++                self.dev_path = c.text
+ 
+ 
+ class LibvirtConfigNodeDevicePciCap(LibvirtConfigObject):
+@@ -2925,6 +2987,7 @@ class LibvirtConfigNodeDevicePciCap(LibvirtConfigObject):
+         self.numa_node = None
+         self.fun_capability = []
+         self.mdev_capability = []
++        self.vpd_capability = None
+         self.interface = None
+         self.address = None
+         self.link_state = None
+@@ -2967,6 +3030,9 @@ class LibvirtConfigNodeDevicePciCap(LibvirtConfigObject):
+                 mdevcap = LibvirtConfigNodeDeviceMdevCapableSubFunctionCap()
+                 mdevcap.parse_dom(c)
+                 self.mdev_capability.append(mdevcap)
++    def pci_address(self):
++        return "%04x:%02x:%02x.%01x" % (
++            self.domain, self.bus, self.slot, self.function)
+ 
+ 
+ class LibvirtConfigNodeDevicePciSubFunctionCap(LibvirtConfigObject):
+@@ -3026,6 +3092,101 @@ class LibvirtConfigNodeDeviceMdevInformation(LibvirtConfigObject):
+                 self.iommu_group = int(c.get('number'))
+ 
+ 
++class LibvirtConfigNodeDeviceVpdCap(LibvirtConfigObject):
++
++    def __init__(self, **kwargs):
++        super().__init__(
++            root_name="capability", **kwargs)
++        self._card_name = None
++        self._change_level = None
++        self._manufacture_id = None
++        self._part_number = None
++        self._serial_number = None
++        self._asset_tag = None
++        self._ro_vendor_fields = {}
++        self._rw_vendor_fields = {}
++        self._rw_system_fields = {}
++
++    @staticmethod
++    def _process_custom_field(fields_dict, field_element):
++        index = field_element.get('index')
++        if index:
++            fields_dict[index] = field_element.text
++
++    def _parse_ro_fields(self, fields_element):
++        for e in fields_element:
++            if e.tag == 'change_level':
++                self._change_level = e.text
++            elif e.tag == 'manufacture_id':
++                self._manufacture_id = e.text
++            elif e.tag == 'part_number':
++                self._part_number = e.text
++            elif e.tag == 'serial_number':
++                self._serial_number = e.text
++            elif e.tag == 'vendor_field':
++                self._process_custom_field(self._ro_vendor_fields, e)
++
++    def _parse_rw_fields(self, fields_element):
++        for e in fields_element:
++            if e.tag == 'asset_tag':
++                self._asset_tag = e.text
++            elif e.tag == 'vendor_field':
++                self._process_custom_field(self._rw_vendor_fields, e)
++            elif e.tag == 'system_field':
++                self._process_custom_field(self._rw_system_fields, e)
++
++    def parse_dom(self, xmldoc):
++        super(LibvirtConfigNodeDeviceVpdCap, self).parse_dom(xmldoc)
++        for c in xmldoc:
++            if c.tag == "name":
++                self._card_name = c.text
++            if c.tag == "fields":
++                access = c.get('access')
++                if access:
++                    if access == 'readonly':
++                        self._parse_ro_fields(c)
++                    elif access == 'readwrite':
++                        self._parse_rw_fields(c)
++                    else:
++                        continue
++
++    @property
++    def card_name(self):
++        return self._card_name
++
++    @property
++    def change_level(self):
++        return self._change_level
++
++    @property
++    def manufacture_id(self):
++        return self._manufacture_id
++
++    @property
++    def part_number(self):
++        return self._part_number
++
++    @property
++    def card_serial_number(self):
++        return self._serial_number
++
++    @property
++    def asset_tag(self):
++        return self._asset_tag
++
++    @property
++    def ro_vendor_fields(self):
++        return self._ro_vendor_fields
++
++    @property
++    def rw_vendor_fields(self):
++        return self._rw_vendor_fields
++
++    @property
++    def rw_system_fields(self):
++        return self._rw_system_fields
++
++
+ class LibvirtConfigGuestRng(LibvirtConfigGuestDevice):
+ 
+     def __init__(self, **kwargs):
+diff --git a/nova/virt/libvirt/driver.py b/nova/virt/libvirt/driver.py
+index f51463f..47bd9bf 100644
+--- a/nova/virt/libvirt/driver.py
++++ b/nova/virt/libvirt/driver.py
+@@ -198,6 +198,7 @@ libvirt_volume_drivers = [
+         'LibvirtHyperScaleVolumeDriver',
+     'storpool=nova.virt.libvirt.volume.storpool.LibvirtStorPoolVolumeDriver',
+     'nvmeof=nova.virt.libvirt.volume.nvme.LibvirtNVMEVolumeDriver',
++    'vdpa=nova.virt.libvirt.volume.vdpa.LibvirtVDPAVolumeDriver',
+ ]
+ 
+ 
+@@ -366,7 +367,7 @@ class LibvirtDriver(driver.ComputeDriver):
+             DEFAULT_FIREWALL_DRIVER,
+             host=self._host)
+ 
+-        self.vif_driver = libvirt_vif.LibvirtGenericVIFDriver()
++        self.vif_driver = libvirt_vif.LibvirtGenericVIFDriver(self._host)
+ 
+         # TODO(mriedem): Long-term we should load up the volume drivers on
+         # demand as needed rather than doing this on startup, as there might
+@@ -1647,7 +1648,17 @@ class LibvirtDriver(driver.ComputeDriver):
+     def _connect_volume(self, context, connection_info, instance,
+                         encryption=None, allow_native_luks=True):
+         vol_driver = self._get_volume_driver(connection_info)
+-        vol_driver.connect_volume(connection_info, instance)
++
++        vdpa_volume_info = connection_info['data'].get('vdpa_volume_info')
++        if vdpa_volume_info:
++            vdpa_pci = vdpa_volume_info['pci']
++            vdpa_volume_info['dev_path'] = self._host.get_vdpa_device_path(vdpa_pci)
++            vdpa_vol_driver = self.volume_drivers['vdpa']
++            vdpa_vol_driver.attach_volume(connection_info, instance)
++            return
++        else:
++            vol_driver.connect_volume(connection_info, instance)
++
+         try:
+             self._attach_encryptor(
+                 context, connection_info, encryption, allow_native_luks)
+@@ -1698,8 +1709,13 @@ class LibvirtDriver(driver.ComputeDriver):
+                            encryption=None):
+         self._detach_encryptor(context, connection_info, encryption=encryption)
+         if self._should_disconnect_target(context, connection_info, instance):
+-            vol_driver = self._get_volume_driver(connection_info)
+-            vol_driver.disconnect_volume(connection_info, instance)
++            data = connection_info['data']
++            if data.get('vdpa_volume_info'):
++                vdpa_vol_driver = self.volume_drivers['vdpa']
++                vdpa_vol_driver.detach_volume(connection_info, instance)
++            else:
++                vol_driver = self._get_volume_driver(connection_info)
++                vol_driver.disconnect_volume(connection_info, instance)
+         else:
+             LOG.info("Detected multiple connections on this host for volume: "
+                      "%s, skipping target disconnect.",
+@@ -1708,6 +1724,11 @@ class LibvirtDriver(driver.ComputeDriver):
+ 
+     def _extend_volume(self, connection_info, instance, requested_size):
+         vol_driver = self._get_volume_driver(connection_info)
++        vdpa_volume_info = connection_info['data']['vdpa_volume_info']
++
++        if vdpa_volume_info:
++            vdpa_volume_driver = self.volume_drivers['vdpa']
++            return vdpa_volume_driver.extend_volume(connection_info, instance, requested_size)
+         return vol_driver.extend_volume(connection_info, instance,
+                                         requested_size)
+ 
+@@ -1722,6 +1743,11 @@ class LibvirtDriver(driver.ComputeDriver):
+         return provider == encryptors.LUKS
+ 
+     def _get_volume_config(self, connection_info, disk_info):
++        if 'vdpa_volume_info' in connection_info['data']:
++            vdpa_driver = self.volume_drivers['vdpa']
++            vdpa_conf = vdpa_driver.get_config(connection_info, disk_info)
++            if vdpa_conf:
++                return vdpa_conf
+         vol_driver = self._get_volume_driver(connection_info)
+         conf = vol_driver.get_config(connection_info, disk_info)
+         self._set_cache_mode(conf)
+@@ -1873,7 +1899,7 @@ class LibvirtDriver(driver.ComputeDriver):
+ 
+         conf = self._get_volume_config(connection_info, disk_info)
+ 
+-        self._check_discard_for_attach_volume(conf, instance)
++        #self._check_discard_for_attach_volume(conf, instance)
+ 
+         try:
+             state = guest.get_power_state(self._host)
+@@ -2032,6 +2058,7 @@ class LibvirtDriver(driver.ComputeDriver):
+     def detach_volume(self, context, connection_info, instance, mountpoint,
+                       encryption=None):
+         disk_dev = mountpoint.rpartition("/")[2]
++        LOG.debug("detach_volume disk_dev %s", disk_dev, instance=instance)
+         try:
+             guest = self._host.get_guest(instance)
+ 
+@@ -2043,9 +2070,20 @@ class LibvirtDriver(driver.ComputeDriver):
+             # driver may report that the volume is still in use.
+             supports_device_missing = self._host.has_min_version(
+                MIN_LIBVIRT_VIR_ERR_DEVICE_MISSING)
+-            wait_for_detach = guest.detach_device_with_retry(
+-                guest.get_disk, disk_dev, live=live,
+-                supports_device_missing_error_code=supports_device_missing)
++            vdpa_volume_info = connection_info['data'].get('vdpa_volume_info')
++            LOG.debug("detach_volume vdpa_volume_info %s", vdpa_volume_info,
++                      instance=instance)
++            if vdpa_volume_info:
++                vdpa_device = vdpa_volume_info.get('dev_path')
++                LOG.debug("detach_volume vdpa_device %s", vdpa_device,
++                          instance=instance)
++                wait_for_detach = guest.detach_device_with_retry(
++                    guest.get_vdpa, vdpa_device, live=live,
++                    supports_device_missing_error_code=supports_device_missing)
++            else:
++                wait_for_detach = guest.detach_device_with_retry(
++                    guest.get_disk, disk_dev, live=live,
++                    supports_device_missing_error_code=supports_device_missing)
+             wait_for_detach()
+ 
+         except exception.InstanceNotFound:
+@@ -2082,6 +2120,11 @@ class LibvirtDriver(driver.ComputeDriver):
+         except NotImplementedError:
+             raise exception.ExtendVolumeNotSupported()
+ 
++        vdpa_volume_info = connection_info.get('data', {}).get('vdpa_volume_info', {})
++        if vdpa_volume_info:
++            LOG.debug('vdpa volume extend done', instance=instance)
++            return
++
+         # Resize the device in QEMU so its size is updated and
+         # detected by the instance without rebooting.
+         try:
+@@ -4145,20 +4188,30 @@ class LibvirtDriver(driver.ComputeDriver):
+                 guest.detach_device(self._get_guest_pci_device(dev), live=True)
+                 # after detachDeviceFlags returned, we should check the dom to
+                 # ensure the detaching is finished
+-                xml = guest.get_xml_desc()
+-                xml_doc = etree.fromstring(xml)
+-                guest_config = vconfig.LibvirtConfigGuest()
+-                guest_config.parse_dom(xml_doc)
+-
+-                for hdev in [d for d in guest_config.devices
+-                    if isinstance(d, vconfig.LibvirtConfigGuestHostdevPCI)]:
+-                    hdbsf = [hdev.domain, hdev.bus, hdev.slot, hdev.function]
+-                    dbsf = pci_utils.parse_address(dev.address)
+-                    if [int(x, 16) for x in hdbsf] ==\
+-                            [int(x, 16) for x in dbsf]:
+-                        raise exception.PciDeviceDetachFailed(reason=
+-                                                              "timeout",
+-                                                              dev=dev)
++                count = 0
++                err_times = 0
++                while count < 30:
++                    xml = guest.get_xml_desc()
++                    xml_doc = etree.fromstring(xml)
++                    guest_config = vconfig.LibvirtConfigGuest()
++                    guest_config.parse_dom(xml_doc)
++                    old_err_times = copy.deepcopy(err_times)
++
++                    for hdev in [d for d in guest_config.devices
++                        if isinstance(d, vconfig.LibvirtConfigGuestHostdevPCI) or
++                            isinstance(d, vconfig.LibvirtConfigGuestHostdevVDPAPCI)]:
++                        hdbsf = [hdev.domain, hdev.bus, hdev.slot, hdev.function]
++                        dbsf = pci_utils.parse_address(dev.address)
++                        if [int(x, 16) for x in hdbsf] ==\
++                                [int(x, 16) for x in dbsf]:
++                            err_times = err_times + 1
++                    if old_err_times == err_times:
++                        break
++                    time.sleep(1)
++                    count = count + 1
++
++                if count == 30:
++                    raise exception.PciDeviceDetachFailed(reason="timeout", dev=dev)
+ 
+         except libvirt.libvirtError as ex:
+             error_code = ex.get_error_code()
+@@ -4196,7 +4249,8 @@ class LibvirtDriver(driver.ComputeDriver):
+         if self._has_direct_passthrough_port(network_info):
+             for vif in network_info:
+                 if (vif['vnic_type'] in
+-                    network_model.VNIC_TYPES_DIRECT_PASSTHROUGH):
++                    network_model.VNIC_TYPES_DIRECT_PASSTHROUGH and
++                    vif['profile'].get('vdpa_type', None) != 'generic'):
+                     cfg = self.vif_driver.get_config(instance,
+                                                      vif,
+                                                      instance.image_meta,
+@@ -4222,7 +4276,8 @@ class LibvirtDriver(driver.ComputeDriver):
+                 for vif in network_info
+                 if (vif['vnic_type'] in
+                     network_model.VNIC_TYPES_DIRECT_PASSTHROUGH and
+-                    vif['profile'].get('pci_slot') is not None)
++                    vif['profile'].get('pci_slot') is not None and
++                    vif['profile'].get('vdpa_type', None) != 'generic')
+             ]
+ 
+             # use detach_pci_devices to avoid failure in case of
+@@ -5821,6 +5876,13 @@ class LibvirtDriver(driver.ComputeDriver):
+                 instance, image_meta, disk_info, rescue, block_device_info,
+                 flavor, guest.os_type)
+         for config in storage_configs:
++            LOG.debug("Config name: %s, boot_order: %s", type(config).__name__,
++                      config.boot_order, instance=instance)
++            if isinstance(config, vconfig.LibvirtConfigGuestHostdevPCI) and \
++                    config.boot_order != None:
++                guest.os_boot_dev = []
++                LOG.info("Found vdpa image volume, disable os_boot_dev",
++                          instance=instance)
+             guest.add_device(config)
+ 
+         for vif in network_info:
+@@ -6315,6 +6377,65 @@ class LibvirtDriver(driver.ComputeDriver):
+                           cleanup_instance_dir=cleanup_instance_dir,
+                           cleanup_instance_disks=cleanup_instance_disks)
+ 
++    def _get_vdpa_device_map(self, network_info):
++        """Create the map from old device path to new device path of vdpa"""
++        vdpa_device_map = {}
++
++        for vif in network_info:
++            if vif.get('vnic_type') == 'vdpa':
++                LOG.debug('_get_vdpa_device_map vif %s', vif)
++                old_vdpa_path = vif['profile']['old_dev_path']
++                vdpa_device_map[old_vdpa_path] = vif
++
++        return vdpa_device_map
++
++    def _update_guest_vdpa(self, xml, vdpa_device_map, instance):
++        xml_doc = etree.fromstring(xml)
++        instance_uuid = xml_doc.findtext('uuid')
++        parser = etree.XMLParser(remove_blank_text=True)
++        hostdev_nodes = xml_doc.findall('./devices/hostdev')
++
++        if hostdev_nodes is None:
++            return xml_doc
++
++        for host_dev in hostdev_nodes:
++            dev_type = host_dev.get('type')
++            if dev_type != 'vdpa':
++                continue
++            source = host_dev.find('source')
++            if source is None:
++                continue
++
++            dev_path = source.get('dev')
++            vif = vdpa_device_map.get(dev_path)
++            if vif is None:  # 有可能是存储的vdpa或者其他hostdev
++                LOG.debug('_update_guest_vdpa vif is None, may volume vdpa. '
++                          'dev_path: %s', dev_path)
++                continue
++            vif_config = self.vif_driver.get_config(
++                instance=instance,
++                vif=vif,
++                image_meta=instance.image_meta,
++                inst_type=instance.flavor,
++                virt_type=CONF.libvirt.virt_type,
++                host=self._host
++            )
++
++            conf_xml = vif_config.to_xml()
++            LOG.debug('Updating guest XML with vif config: %s', conf_xml,
++                      instance_uuid=instance_uuid)
++
++            new_hostdev_elem = etree.XML(conf_xml, parser)
++            host_dev.clear()
++            # Insert attributes.
++            for attr_name, attr_value in new_hostdev_elem.items():
++                host_dev.set(attr_name, attr_value)
++            # Insert sub-elements.
++            for index, dest_interface_subelem in enumerate(new_hostdev_elem):
++                host_dev.insert(index, dest_interface_subelem)
++
++        return etree.tostring(xml_doc, encoding='unicode')
++
+     def _create_domain_and_network(self, context, xml, instance, network_info,
+                                    block_device_info=None, power_on=True,
+                                    vifs_already_plugged=False,
+@@ -6339,6 +6460,14 @@ class LibvirtDriver(driver.ComputeDriver):
+                     instance, events, deadline=timeout,
+                     error_callback=self._neutron_failed_callback):
+                 self.plug_vifs(instance, network_info)
++                # If existing vdpa device, update the guest xml
++                vdpa_device_map = self._get_vdpa_device_map(network_info)
++                LOG.debug('network_info %s', network_info)
++                LOG.debug('vdpa_device_map %s', vdpa_device_map)
++                if vdpa_device_map:
++                    xml = self._update_guest_vdpa(xml, vdpa_device_map,
++                                                  instance)
++                LOG.info('The updated guest xml is %s', xml)
+                 self.firewall_driver.setup_basic_filtering(instance,
+                                                            network_info)
+                 self.firewall_driver.prepare_instance_filter(instance,
+@@ -6782,27 +6911,45 @@ class LibvirtDriver(driver.ComputeDriver):
+         """
+         # Bail early if we know we can't support `listDevices` to avoid
+         # repeated warnings within a periodic task
+-        if not getattr(self, '_list_devices_supported', True):
+-            return jsonutils.dumps([])
++        dev_flags = (
++                libvirt.VIR_CONNECT_LIST_NODE_DEVICES_CAP_NET |
++                libvirt.VIR_CONNECT_LIST_NODE_DEVICES_CAP_PCI_DEV
++        )
+ 
+-        try:
+-            dev_names = self._host.list_pci_devices() or []
+-        except libvirt.libvirtError as ex:
+-            error_code = ex.get_error_code()
+-            if error_code == libvirt.VIR_ERR_NO_SUPPORT:
+-                self._list_devices_supported = False
+-                LOG.warning("URI %(uri)s does not support "
+-                            "listDevices: %(error)s",
+-                            {'uri': self._uri(),
+-                             'error': encodeutils.exception_to_unicode(ex)})
+-                return jsonutils.dumps([])
+-            else:
+-                raise
++        dev_flags |= libvirt.VIR_CONNECT_LIST_NODE_DEVICES_CAP_VDPA
+ 
+-        pci_info = []
+-        for name in dev_names:
+-            pci_info.append(self._get_pcidev_info(name))
++        devices = {
++            dev.name(): dev for dev in
++            self._host.list_all_devices(flags=dev_flags)
++        }
++
++        # NOTE(mnaser): The listCaps() function can raise an exception if the
++        #               device disappeared while we're looping, this method
++        #               returns an empty list rather than raising an exception
++        #               which will remove the device for Nova's resource
++        #               tracker, but that is OK since the device disappeared.
++        def _safe_list_caps(dev):
++            try:
++                return dev.listCaps()
++            except libvirt.libvirtError:
++                return []
+ 
++        net_devs = [
++            dev for dev in devices.values() if "net" in _safe_list_caps(dev)
++        ]
++        vdpa_devs = [
++            dev for dev in devices.values() if "vdpa" in _safe_list_caps(dev)
++        ]
++        pci_devs = {
++            name: dev for name, dev in devices.items()
++            if "pci" in _safe_list_caps(dev)}
++        pci_info = [
++            self._host._get_pcidev_info(
++                name, dev, net_devs,
++                vdpa_devs, list(pci_devs.values())
++            )
++            for name, dev in pci_devs.items()
++        ]
+         return jsonutils.dumps(pci_info)
+ 
+     def _get_mdev_capabilities_for_dev(self, devname, types=None):
+@@ -8587,7 +8734,14 @@ class LibvirtDriver(driver.ComputeDriver):
+             if vif['vnic_type'] in direct_vnics:
+                 LOG.info("Detaching vif %s from instnace "
+                          "%s for live migration", vif['id'], instance.id)
+-                self.detach_interface(context, instance, vif)
++                vdpa_type = vif['profile'].get('vdpa_type', None)
++                if vdpa_type == 'generic':
++                    pci_slot = vif['profile'].get('pci_slot', None)
++                    dev_path = self._host.get_vdpa_device_path(pci_slot)
++                    vif['profile'].update({'dev_path': dev_path})
++                    LOG.warning("Can't detach vif %s during live migration", vif)
++                else:
++                    self.detach_interface(context, instance, vif)
+ 
+     def _live_migration_operation(self, context, instance, dest,
+                                   block_migration, migrate_data, guest,
+@@ -8630,10 +8784,9 @@ class LibvirtDriver(driver.ComputeDriver):
+             migrate_uri = None
+             if ('target_connect_addr' in migrate_data and
+                     migrate_data.target_connect_addr is not None):
+-                dest = migrate_data.target_connect_addr
+                 if (migration_flags &
+                     libvirt.VIR_MIGRATE_TUNNELLED == 0):
+-                    migrate_uri = self._migrate_uri(dest)
++                    migrate_uri = self._migrate_uri(migrate_data.target_connect_addr)
+ 
+             new_xml_str = None
+             if CONF.libvirt.virt_type != "parallels":
+@@ -9144,8 +9297,12 @@ class LibvirtDriver(driver.ComputeDriver):
+                 if vif['vnic_type'] in direct_vnics:
+                     LOG.info("Attaching vif %s to instance %s",
+                              vif['id'], instance.id)
+-                    self.attach_interface(context, instance,
+-                                          instance.image_meta, vif)
++                    vdpa_type = vif['profile'].get('vdpa_type', None)
++                    if vdpa_type == 'generic':
++                        LOG.warning("Can't reattach vif %s during live migration", vif)
++                    else:
++                        self.attach_interface(context, instance,
++                                              instance.image_meta, vif)
+ 
+     def rollback_live_migration_at_source(self, context, instance,
+                                           migrate_data):
+@@ -9217,6 +9374,19 @@ class LibvirtDriver(driver.ComputeDriver):
+                                 instance=instance)
+                     greenthread.sleep(1)
+ 
++    def _update_live_migration_vifs(self, migrate_data):
++        for index in range(len(migrate_data.vifs)):
++            migrate_vif = migrate_data.vifs[index]
++            profile = jsonutils.loads(migrate_vif.profile_json)
++
++            if migrate_vif.vnic_type == 'vdpa' and profile.get('vdpa_type'):
++                dev_path = self._host.get_vdpa_device_path(profile['pci_slot'])
++                dev_path_dict = {'dev_path': dev_path}
++                profile.update(dev_path_dict)
++            migrate_vif.profile_json = jsonutils.dumps(profile)
++            migrate_data.vifs[index] = migrate_vif
++        return migrate_data
++
+     def pre_live_migration(self, context, instance, block_device_info,
+                            network_info, disk_info, migrate_data):
+         """Preparation live migration."""
+@@ -9315,6 +9485,8 @@ class LibvirtDriver(driver.ComputeDriver):
+         self._pre_live_migration_plug_vifs(
+             instance, network_info, migrate_data)
+ 
++        migrate_data = self._update_live_migration_vifs(migrate_data)
++
+         # Store server_listen and latest disk device info
+         if not migrate_data:
+             migrate_data = objects.LibvirtLiveMigrateData(bdms=[])
+@@ -10416,7 +10588,8 @@ class LibvirtDriver(driver.ComputeDriver):
+                                                         trusted_by_mac)
+             if isinstance(dev, vconfig.LibvirtConfigGuestDisk):
+                 device = self._build_disk_metadata(dev, tagged_bdms)
+-            if isinstance(dev, vconfig.LibvirtConfigGuestHostdevPCI):
++            if isinstance(dev, vconfig.LibvirtConfigGuestHostdevPCI) \
++                    and not isinstance(dev, vconfig.LibvirtConfigGuestVDPAPCI):
+                 device = self._build_hostdev_metadata(dev, vifs_to_expose,
+                                                       vlans_by_mac)
+             if device:
+diff --git a/nova/virt/libvirt/guest.py b/nova/virt/libvirt/guest.py
+index a7fbc50..200f5ff 100644
+--- a/nova/virt/libvirt/guest.py
++++ b/nova/virt/libvirt/guest.py
+@@ -234,21 +234,35 @@ class Guest(object):
+         """
+ 
+         if cfg:
+-            interfaces = self.get_all_devices(
+-                vconfig.LibvirtConfigGuestInterface)
++            LOG.debug(f'looking for interface given config: {cfg}')
++            interfaces = self.get_all_devices(type(cfg))
++            if not interfaces:
++                LOG.debug(f'No interface of type: {type(cfg)} found in domain')
++                return None
++
+             for interface in interfaces:
+-                # NOTE(leehom) LibvirtConfigGuestInterface get from domain and
+-                # LibvirtConfigGuestInterface generated by
+-                # nova.virt.libvirt.vif.get_config must be identical.
+-                # NOTE(arches) Skip checking target_dev for vhostuser
+-                # vif type; target_dev is not a valid value for vhostuser.
+-                if (interface.mac_addr == cfg.mac_addr and
+-                        interface.net_type == cfg.net_type and
+-                        interface.source_dev == cfg.source_dev and
+-                        (cfg.net_type == 'vhostuser' or
++                if isinstance(interface, vconfig.LibvirtConfigGuestVDPAPCI):
++                    if interface.source_dev == cfg.source_dev:
++                        return interface
++                else:
++                    # NOTE(leehom) LibvirtConfigGuestInterface get from domain and
++                    # LibvirtConfigGuestInterface generated by
++                    # nova.virt.libvirt.vif.get_config must be identical.
++                    # NOTE(arches) Skip checking target_dev for vhostuser
++                    # vif type; target_dev is not a valid value for vhostuser.
++                    if (interface.mac_addr == cfg.mac_addr and
++                            interface.net_type == cfg.net_type and
++                            interface.source_dev == cfg.source_dev and
++                            (cfg.net_type == 'vhostuser' or
+                             interface.target_dev == cfg.target_dev) and
+-                        interface.vhostuser_path == cfg.vhostuser_path):
+-                    return interface
++                            interface.vhostuser_path == cfg.vhostuser_path):
++                        return interface
++            else:
++                LOG.debug(
++                    f'interface for config: {cfg}'
++                    f'not found in domain: {self._domain.XMLDesc(0)}'
++                )
++        return None
+ 
+     def get_vcpus_info(self):
+         """Returns virtual cpus information of guest.
+@@ -336,6 +350,25 @@ class Guest(object):
+             conf.parse_dom(node)
+             return conf
+ 
++    def get_vdpa(self, device):
++        """Returns the vdpa devices attached to the instance
++
++        :returns LivirtConfigGuestVDPA: attached to the instance or None
++        """
++        try:
++            doc = etree.fromstring(self._domain.XMLDesc(0))
++        except Exception:
++            return None
++
++        node = doc.find("./devices/hostdev/source[@dev='%s'].." % device)
++
++        if node is not None:
++            conf = vconfig.LibvirtConfigGuestVDPAPCI()
++            conf.parse_dom(node)
++            return conf
++
++        return None
++
+     def get_all_disks(self):
+         """Returns all the disks for a guest
+ 
+@@ -453,6 +486,9 @@ class Guest(object):
+                   alternative_device_name)
+         try:
+             _try_detach_device(conf, persistent, live)
++            # The second times to detach the device cant execute immediately,
++            # otherwise, an libvirt.InternalError will occur
++            time.sleep(5)
+         except exception.DeviceNotFound:
+             # NOTE(melwitt): There are effectively two configs for an instance.
+             # The persistent config (affects instance upon next boot) and the
+@@ -685,6 +721,7 @@ class Guest(object):
+                       if isinstance(value, six.text_type) else value
+                       for key, value in params.items()}
+ 
++        LOG.debug('migrateToURI3 destination:%s, params:%s, flags:%s', destination, params, flags)
+         self._domain.migrateToURI3(
+             destination, params=params, flags=flags)
+ 
+diff --git a/nova/virt/libvirt/host.py b/nova/virt/libvirt/host.py
+index d8078dd..ccd7851 100644
+--- a/nova/virt/libvirt/host.py
++++ b/nova/virt/libvirt/host.py
+@@ -33,6 +33,7 @@ import operator
+ import os
+ import socket
+ import threading
++import typing as ty
+ import traceback
+ 
+ from eventlet import greenio
+@@ -52,6 +53,8 @@ import nova.conf
+ from nova import context as nova_context
+ from nova import exception
+ from nova.i18n import _
++from nova.objects import fields
++from nova.pci import utils as pci_utils
+ from nova import rpc
+ from nova import utils
+ from nova.virt import event as virtevent
+@@ -1142,6 +1145,337 @@ class Host(object):
+         """
+         return self.get_connection().nodeDeviceLookupByName(name)
+ 
++    def _get_pcinet_info(
++            self,
++            dev: 'libvirt.virNodeDevice',
++            net_devs: ty.List['libvirt.virNodeDevice']
++    ) -> ty.Optional[ty.List[str]]:
++        """Returns a dict of NET device."""
++        net_dev = {dev.parent(): dev for dev in net_devs}.get(dev.name(), None)
++        if net_dev is None:
++            return None
++        xmlstr = net_dev.XMLDesc(0)
++        cfgdev = vconfig.LibvirtConfigNodeDevice()
++        cfgdev.parse_str(xmlstr)
++        return cfgdev.pci_capability.features
++
++    def _get_vf_parent_pci_vpd_info(
++            self,
++            vf_device: 'libvirt.virNodeDevice',
++            parent_pf_name: str,
++            candidate_devs: ty.List['libvirt.virNodeDevice']
++    ) -> ty.Optional[vconfig.LibvirtConfigNodeDeviceVpdCap]:
++        """Returns PCI VPD info of a parent device of a PCI VF.
++
++        :param vf_device: a VF device object to use for lookup.
++        :param str parent_pf_name: parent PF name formatted as pci_dddd_bb_ss_f
++        :param candidate_devs: devices that could be parent devs for the VF.
++        :returns: A VPD capability object of a parent device.
++        """
++        parent_dev = next(
++            (dev for dev in candidate_devs if dev.name() == parent_pf_name),
++            None
++        )
++        if parent_dev is None:
++            return None
++
++        xmlstr = parent_dev.XMLDesc(0)
++        cfgdev = vconfig.LibvirtConfigNodeDevice()
++        cfgdev.parse_str(xmlstr)
++        return cfgdev.pci_capability.vpd_capability
++
++    @staticmethod
++    def _get_vpd_card_serial_number(
++        dev: 'libvirt.virNodeDevice',
++    ) -> ty.Optional[ty.List[str]]:
++        """Returns a card serial number stored in PCI VPD (if present)."""
++        xmlstr = dev.XMLDesc(0)
++        cfgdev = vconfig.LibvirtConfigNodeDevice()
++        cfgdev.parse_str(xmlstr)
++        vpd_cap = cfgdev.pci_capability.vpd_capability
++        if not vpd_cap:
++            return None
++        return vpd_cap.card_serial_number
++
++    def _get_pf_details(self, device: dict, pci_address: str) -> dict:
++        if device.get('dev_type') != fields.PciDeviceType.SRIOV_PF:
++            return {}
++
++        try:
++            return {
++                'mac_address': pci_utils.get_mac_by_pci_address(pci_address)
++            }
++        except exception.PciDeviceNotFoundById:
++            LOG.debug(
++                'Cannot get MAC address of the PF %s. It is probably attached '
++                'to a guest already', pci_address)
++            return {}
++
++    def _get_pcidev_info(
++            self,
++            devname: str,
++            dev: 'libvirt.virNodeDevice',
++            net_devs: ty.List['libvirt.virNodeDevice'],
++            vdpa_devs: ty.List['libvirt.virNodeDevice'],
++            pci_devs: ty.List['libvirt.virNodeDevice'],
++    ) -> ty.Dict[str, ty.Union[str, dict]]:
++        """Returns a dict of PCI device."""
++
++        def _get_device_type(
++                cfgdev: vconfig.LibvirtConfigNodeDevice,
++                pci_address: str,
++                device: 'libvirt.virNodeDevice',
++                net_devs: ty.List['libvirt.virNodeDevice'],
++                vdpa_devs: ty.List['libvirt.virNodeDevice'],
++        ) -> ty.Dict[str, str]:
++            """Get a PCI device's device type.
++
++            An assignable PCI device can be a normal PCI device,
++            a SR-IOV Physical Function (PF), or a SR-IOV Virtual
++            Function (VF).
++            """
++            net_dev_parents = {dev.parent() for dev in net_devs}
++            vdpa_parents = {dev.parent() for dev in vdpa_devs}
++            for fun_cap in cfgdev.pci_capability.fun_capability:
++                if fun_cap.type == 'virt_functions':
++                    return {
++                        'dev_type': fields.PciDeviceType.SRIOV_PF,
++                    }
++                if (
++                        fun_cap.type == 'phys_function' and
++                        len(fun_cap.device_addrs) != 0
++                ):
++                    phys_address = "%04x:%02x:%02x.%01x" % (
++                        fun_cap.device_addrs[0][0],
++                        fun_cap.device_addrs[0][1],
++                        fun_cap.device_addrs[0][2],
++                        fun_cap.device_addrs[0][3])
++                    result = {
++                        'dev_type': fields.PciDeviceType.SRIOV_VF,
++                        'parent_addr': phys_address,
++                    }
++                    parent_ifname = None
++                    # NOTE(sean-k-mooney): if the VF is a parent of a netdev
++                    # the PF should also have a netdev, however on some exotic
++                    # hardware such as Cavium ThunderX this may not be the case
++                    # see bug #1915255 for details. As such we wrap this in a
++                    # try except block.
++                    if device.name() in net_dev_parents:
++                        try:
++                            parent_ifname = (
++                                pci_utils.get_ifname_by_pci_address(
++                                    pci_address, pf_interface=True))
++                            result['parent_ifname'] = parent_ifname
++                        except exception.PciDeviceNotFoundById:
++                            # NOTE(sean-k-mooney): we ignore this error as it
++                            # is expected when the virtual function is not a
++                            # NIC or the VF does not have a parent PF with a
++                            # netdev. We do not log here as this is called
++                            # in a periodic task and that would be noisy at
++                            # debug level.
++                            pass
++                    if device.name() in vdpa_parents:
++                        result['dev_type'] = fields.PciDeviceType.VDPA
++                    return result
++
++            return {'dev_type': fields.PciDeviceType.STANDARD}
++
++        def _get_vpd_details(
++            device_dict: dict,
++            device: 'libvirt.virNodeDevice',
++            pci_devs: ty.List['libvirt.virNodeDevice']
++        ) -> ty.Dict[str, ty.Any]:
++            """Get information from PCI VPD (if present).
++
++            PCI/PCIe devices may include the optional VPD capability. It may
++            contain useful information such as the unique serial number
++            uniquely assigned at a factory.
++
++            If a device is a VF and it does not contain the VPD capability,
++            a parent device's VPD is used (if present) as a fallback to
++            retrieve the unique add-in card number. Whether a VF exposes
++            the VPD capability or not may be controlled via a vendor-specific
++            firmware setting.
++            """
++            vpd_info: ty.Dict[str, ty.Any] = {}
++            # At the time of writing only the serial number had a clear
++            # use-case. However, the set of fields may be extended.
++            card_serial_number = self._get_vpd_card_serial_number(device)
++
++            if (not card_serial_number and
++               device_dict.get('dev_type') == fields.PciDeviceType.SRIOV_VF
++            ):
++                # Format the address of a physical function to use underscores
++                # since that's how Libvirt formats the <name> element content.
++                pf_addr = device_dict.get('parent_addr')
++                if not pf_addr:
++                    LOG.warning("A VF device dict does not have a parent PF "
++                                "address in it which is unexpected. Skipping "
++                                "serial number retrieval")
++                    return vpd_info
++
++                formatted_addr = pf_addr.replace('.', '_').replace(':', '_')
++                vpd_cap = self._get_vf_parent_pci_vpd_info(
++                    device, f'pci_{formatted_addr}', pci_devs)
++                if vpd_cap is not None:
++                    card_serial_number = vpd_cap.card_serial_number
++
++            if card_serial_number:
++                vpd_info = {'card_serial_number': card_serial_number}
++            return vpd_info
++
++        def _get_sriov_netdev_details(
++            device_dict: dict,
++            device: 'libvirt.virNodeDevice',
++        ) -> ty.Dict[str, ty.Dict[str, ty.Any]]:
++            """Get SR-IOV related information"""
++            sriov_info: ty.Dict[str, ty.Any] = {}
++
++            if device_dict.get('dev_type') != fields.PciDeviceType.SRIOV_VF:
++                return sriov_info
++
++            pf_addr = device_dict['parent_addr']
++
++            # A netdev VF may be associated with a PF which does not have a
++            # netdev as described in LP #1915255.
++            try:
++                sriov_info.update({
++                    'pf_mac_address': pci_utils.get_mac_by_pci_address(pf_addr)
++                })
++            except exception.PciDeviceNotFoundById:
++                LOG.debug(f'Could not get a PF mac for {pf_addr}')
++                # For the purposes Nova uses this information currently,
++                # having both a PF MAC and a VF number is needed so we return
++                # an empty dict if a PF MAC is not available.
++                return {}
++
++            vf_num = pci_utils.get_vf_num_by_pci_address(
++                device_dict['address'])
++
++            sriov_info.update({'vf_num': vf_num})
++            return sriov_info
++
++        def _get_device_capabilities(
++            device_dict: dict,
++            device: 'libvirt.virNodeDevice',
++            pci_devs: ty.List['libvirt.virNodeDevice'],
++            net_devs: ty.List['libvirt.virNodeDevice']
++        ) -> ty.Dict[str, ty.Any]:
++            """Get PCI VF device's additional capabilities.
++
++            If a PCI device is a virtual function, this function reads the PCI
++            parent's network capabilities (must be always a NIC device) and
++            appends this information to the device's dictionary.
++            """
++            caps: ty.Dict[str, ty.Any] = {}
++
++            if device_dict.get('dev_type') == fields.PciDeviceType.SRIOV_VF:
++                pcinet_info = self._get_pcinet_info(device, net_devs)
++                if pcinet_info:
++                    caps['network'] = pcinet_info
++                    # Only attempt to get SR-IOV details if a VF is a netdev
++                    # because there are no use cases for other dev types yet.
++                sriov_caps = _get_sriov_netdev_details(device_dict, dev)
++                if sriov_caps:
++                    caps['sriov'] = sriov_caps
++
++            vpd_info = _get_vpd_details(device_dict, device, pci_devs)
++            if vpd_info:
++                caps['vpd'] = vpd_info
++
++            if caps:
++                return {'capabilities': caps}
++
++            return caps
++
++        xmlstr = dev.XMLDesc(0)
++        cfgdev = vconfig.LibvirtConfigNodeDevice()
++        cfgdev.parse_str(xmlstr)
++
++        address = "%04x:%02x:%02x.%1x" % (
++            cfgdev.pci_capability.domain,
++            cfgdev.pci_capability.bus,
++            cfgdev.pci_capability.slot,
++            cfgdev.pci_capability.function)
++
++        device = {
++            "dev_id": cfgdev.name,
++            "address": address,
++            "product_id": "%04x" % cfgdev.pci_capability.product_id,
++            "vendor_id": "%04x" % cfgdev.pci_capability.vendor_id,
++            }
++
++        device["numa_node"] = cfgdev.pci_capability.numa_node
++
++        # requirement by DataBase Model
++        device['label'] = 'label_%(vendor_id)s_%(product_id)s' % device
++        device.update(
++            _get_device_type(cfgdev, address, dev, net_devs, vdpa_devs))
++        device.update(_get_device_capabilities(device, dev,
++                                               pci_devs, net_devs))
++        device.update(self._get_pf_details(device, address))
++        return device
++
++    def get_vdpa_nodedev_by_address(
++        self, pci_address: str,
++    ) -> vconfig.LibvirtConfigNodeDevice:
++        """Finds a vDPA device by the parent VF PCI device address.
++
++        :param pci_address: Parent PCI device address
++        :returns: A libvirt nodedev representing the vDPA device
++        :raises: StopIteration if not found
++        """
++        dev_flags = (
++            libvirt.VIR_CONNECT_LIST_NODE_DEVICES_CAP_VDPA |
++            libvirt.VIR_CONNECT_LIST_NODE_DEVICES_CAP_PCI_DEV
++        )
++        devices = {
++            dev.name(): dev for dev in
++            self.list_all_devices(flags=dev_flags)}
++        vdpa_devs = [
++            dev for dev in devices.values() if "vdpa" in dev.listCaps()]
++        pci_info = [
++            self._get_pcidev_info(name, dev, [], vdpa_devs, []) for name, dev
++            in devices.items() if "pci" in dev.listCaps()]
++        parent_dev = next(
++            dev for dev in pci_info if dev['address'] == pci_address)
++        vdpa_dev = next(
++            dev for dev in vdpa_devs if dev.parent() == parent_dev['dev_id'])
++        xmlstr = vdpa_dev.XMLDesc(0)
++        cfgdev = vconfig.LibvirtConfigNodeDevice()
++        cfgdev.parse_str(xmlstr)
++        return cfgdev
++
++    def get_vdpa_device_path(
++        self, pci_address: str,
++    ) -> str:
++        """Finds a vDPA device path by the parent VF PCI device address.
++
++        :param pci_address: Parent PCI device address
++        :returns: Device path as string
++        :raises: StopIteration if not found
++        """
++        nodedev = self.get_vdpa_nodedev_by_address(pci_address)
++        return nodedev.vdpa_capability.dev_path
++
++    def get_vdpa_device_name(
++        self, pci_address: str,
++    ) -> str:
++        """Finds a vDPA device name by the parent VF PCI device address.
++
++        :param pci_address: Parent PCI device address
++        :returns: Device name as string
++        :raises: StopIteration if not found
++        """
++        nodedev = self.get_vdpa_nodedev_by_address(pci_address)
++        name_idx = nodedev.path.rfind("/")
++
++        if name_idx == -1 or name_idx == len(nodedev.path) - 1:
++            raise exception.InternalError(
++                _("The obtained vdpa path is invalid!")
++            )
++        return nodedev.path[name_idx + 1:]
++
+     def list_pci_devices(self, flags=0):
+         """Lookup pci devices.
+ 
+@@ -1180,6 +1514,20 @@ class Host(object):
+             else:
+                 raise
+ 
++    def list_all_devices(
++            self, flags: int = 0,
++    ) -> ty.List['libvirt.virNodeDevice']:
++        """Lookup devices.
++
++        :param flags: a bitmask of flags to filter the returned devices.
++        :returns: a list of virNodeDevice xml strings.
++        """
++        try:
++            return self.get_connection().listAllDevices(flags) or []
++        except libvirt.libvirtError as ex:
++            LOG.warning(ex)
++            return []
++
+     def compare_cpu(self, xmlDesc, flags=0):
+         """Compares the given CPU description with the host CPU."""
+         return self.get_connection().compareCPU(xmlDesc, flags)
+diff --git a/nova/virt/libvirt/migration.py b/nova/virt/libvirt/migration.py
+index 7b72147..193c14f 100644
+--- a/nova/virt/libvirt/migration.py
++++ b/nova/virt/libvirt/migration.py
+@@ -16,14 +16,15 @@
+ """Utility methods to manage guests migration
+ 
+ """
+-
++import json
+ from collections import deque
+ 
+ from lxml import etree
+ from oslo_log import log as logging
++from oslo_serialization import jsonutils
+ 
+-from nova.compute import power_state
+ import nova.conf
++from nova.compute import power_state
+ from nova import exception
+ from nova.virt import hardware
+ from nova.virt.libvirt import config as vconfig
+@@ -89,6 +90,8 @@ def get_updated_guest_xml(guest, migrate_data, get_volume_config,
+     xml_doc = _update_memory_backing_xml(xml_doc, migrate_data)
+     if get_vif_config is not None:
+         xml_doc = _update_vif_xml(xml_doc, migrate_data, get_vif_config)
++
++    xml_doc = _update_generic_vdpa_xml(xml_doc, migrate_data, get_volume_config, get_vif_config)
+     if 'dst_numa_info' in migrate_data:
+         xml_doc = _update_numa_xml(xml_doc, migrate_data)
+     return etree.tostring(xml_doc, encoding='unicode')
+@@ -250,6 +253,71 @@ def _update_volume_xml(xml_doc, migrate_data, get_volume_config):
+                     disk_dev.insert(cnt, item_dst)
+     return xml_doc
+ 
++def _update_generic_vdpa_xml(xml_doc, migrate_data, get_volume_config, get_vif_config):
++    instance_uuid = xml_doc.findtext('uuid')
++    parser = etree.XMLParser(remove_blank_text=True)
++    # 获得所有的hostdev信息
++    hostdev_nodes = xml_doc.findall('./devices/hostdev')
++    if hostdev_nodes is None:
++        return xml_doc
++
++    # 生成volume和vif  vdpa的map
++    # vdpa_map = {'/dev/vhost-vdpa-4': '/dev/vhost-vdpa-5'}
++    migrate_vif_by_pci = {vif.source_vif['profile'].get('dev_path'): vif
++                        for vif in migrate_data.vifs}
++
++    migrate_volume_by_pci = {}
++    migrate_disk_by_pci = {}
++    for bdm in migrate_data.bdms:
++        connection_info = bdm.connection_info
++        connection_data = connection_info.get('data')
++        vdpa_volume_info = connection_data.get('vdpa_volume_info')
++        if vdpa_volume_info:
++            old_dev = vdpa_volume_info.get('old_dev')
++            if old_dev:
++                old_dev_path = old_dev.get('dev_path')
++                migrate_volume_by_pci[old_dev_path] = connection_info
++                migrate_disk_by_pci[old_dev_path] = bdm.as_disk_info()
++
++    for host_dev in hostdev_nodes:
++        # <hostdev mode = 'subsystem' type = 'vdpa' managed = 'no'>
++        #     < source dev = '/dev/vhost-vdpa-4' />
++        # </hostdev>
++        dev_type = host_dev.get('type')
++        if dev_type != 'vdpa':
++            continue
++        source = host_dev.find('source')
++
++        if source is not None:
++            source_dev = source.get('dev')
++            migrate_vif_info = migrate_vif_by_pci.get(source_dev)
++            migrate_volume_info = migrate_volume_by_pci.get(source_dev)
++            migrate_disk_info = migrate_disk_by_pci.get(source_dev)
++            if migrate_vif_info:
++                vif = migrate_vif_info.get_dest_vif()
++                config = get_vif_config(vif=vif)
++            elif migrate_volume_info:
++                LOG.debug("get_volume_config migrate_disk_info %s", migrate_disk_info)
++                config = get_volume_config(migrate_volume_info, migrate_disk_info)
++        else:
++            # This shouldn't happen but if it does, we need to abort the
++            # migration.
++            raise exception.NovaException(
++                'Unable to find vdpa_vif in hostdev XML for '
++                'instance %s: %s' % (
++                    instance_uuid,
++                    etree.tostring(host_dev, encoding='unicode')))
++        conf_xml = config.to_xml()
++        dest_hostdev_elem = etree.XML(conf_xml, parser)
++        host_dev.clear()
++        # Insert attributes.
++        for attr_name, attr_value in dest_hostdev_elem.items():
++            host_dev.set(attr_name, attr_value)
++        # Insert sub-elements.
++        for index, dest_interface_subelem in enumerate(dest_hostdev_elem):
++            host_dev.insert(index, dest_interface_subelem)
++
++    return xml_doc
+ 
+ def _update_perf_events_xml(xml_doc, migrate_data):
+     """Update XML by the supported events of destination host."""
+@@ -397,6 +465,47 @@ def _update_vif_xml(xml_doc, migrate_data, get_vif_config):
+ 
+     return xml_doc
+ 
++def _update_generic_vdpa_vif_xml(xml_doc, migrate_data, get_vif_config):
++    instance_uuid = xml_doc.findtext('uuid')
++    parser = etree.XMLParser(remove_blank_text=True)
++    hostdev_nodes = xml_doc.findall('./devices/hostdev')
++    if hostdev_nodes is None:
++        return xml_doc
++
++    migrate_vif_by_pci = {vif.source_vif['profile'].get('dev_path'): vif
++                        for vif in migrate_data.vifs}
++    for host_dev in hostdev_nodes:
++        dev_type = host_dev.get('type')
++        if dev_type != 'vdpa':
++            continue
++        source = host_dev.find('source')
++
++        if source is not None:
++            source_dev = source.get('dev')
++            migrate_vif = migrate_vif_by_pci[source_dev]
++            vif = migrate_vif.get_dest_vif()
++            vif_config = get_vif_config(vif=vif)
++        else:
++            # This shouldn't happen but if it does, we need to abort the
++            # migration.
++            raise exception.NovaException(
++                'Unable to find vdpa_vif in hostdev XML for '
++                'instance %s: %s' % (
++                    instance_uuid,
++                    etree.tostring(host_dev, encoding='unicode')))
++
++        conf_xml = vif_config.to_xml()
++        LOG.debug('Updating guest XML with vif config: %s', conf_xml,
++                  instance_uuid=instance_uuid)
++        dest_hostdev_elem = etree.XML(conf_xml, parser)
++        host_dev.clear()
++        # Insert attributes.
++        for attr_name, attr_value in dest_hostdev_elem.items():
++            host_dev.set(attr_name, attr_value)
++        # Insert sub-elements.
++        for index, dest_interface_subelem in enumerate(dest_hostdev_elem):
++            host_dev.insert(index, dest_interface_subelem)
++    return xml_doc
+ 
+ def find_job_type(guest, instance, logging_ok=True):
+     """Determine the (likely) current migration job type
+diff --git a/nova/virt/libvirt/vif.py b/nova/virt/libvirt/vif.py
+index c03548d..3fdc4fe 100644
+--- a/nova/virt/libvirt/vif.py
++++ b/nova/virt/libvirt/vif.py
+@@ -19,6 +19,7 @@
+ """VIF drivers for libvirt."""
+ 
+ import os
++import typing as ty
+ 
+ import os_vif
+ from os_vif import exception as osv_exception
+@@ -41,6 +42,7 @@ from nova import profiler
+ from nova import utils
+ from nova.virt.libvirt import config as vconfig
+ from nova.virt.libvirt import designer
++from nova.virt.libvirt import host as libvirt_host
+ from nova.virt.libvirt import utils as libvirt_utils
+ from nova.virt import osinfo
+ 
+@@ -60,6 +62,21 @@ MIN_LIBVIRT_TX_QUEUE_SIZE = (3, 7, 0)
+ MIN_QEMU_TX_QUEUE_SIZE = (2, 10, 0)
+ 
+ 
++def execute(*cmd, **kwargs):
++    return processutils.execute(*cmd, **kwargs)
++
++def _run_cmd_by_root(cmd):
++    try:
++        root_helper = utils.get_root_helper()
++        return execute(*cmd, root_helper=root_helper, run_as_root=True)
++    except processutils.ProcessExecutionError as e:
++        reason = _('Please check the cmd, an unexpected exception occurs '
++                   'because {}'.format(e))
++        raise exception.ProcessExecuteException(
++            cmd=' '.join(cmd),
++            reason=reason
++        )
++
+ def is_vif_model_valid_for_virt(virt_type, vif_model):
+     valid_models = {
+         'qemu': [network_model.VIF_MODEL_VIRTIO,
+@@ -121,6 +138,10 @@ def set_vf_interface_vlan(pci_addr, mac_addr, vlan=0):
+ class LibvirtGenericVIFDriver(object):
+     """Generic VIF driver for libvirt networking."""
+ 
++    def __init__(self, host: libvirt_host.Host = None):
++        super().__init__()
++        self.host = host
++
+     def get_vif_devname(self, vif):
+         if 'devname' in vif:
+             return vif['devname']
+@@ -512,6 +533,19 @@ class LibvirtGenericVIFDriver(object):
+         designer.set_vif_host_backend_vhostuser_config(
+             conf, vif.mode, vif.path, rx_queue_size, tx_queue_size)
+ 
++    def _set_config_VIFVDPADevice(self, instance, vif, conf, host=None):
++        dev_path = vif.dev_path
++        if not dev_path:
++            dev_path = self._get_vdpa_dev_path(vif.pci_id)
++
++        dbsf = pci_utils.parse_address(vif.pci_id)
++        conf.domain, conf.bus, conf.slot, conf.function = dbsf
++        conf.source_dev = dev_path
++        vif.dev_path = dev_path
++
++        # do not allow libvirt to manage vdpa drivers automally
++        conf.managed = 'no'
++
+     def _set_config_VIFHostDevice(self, instance, vif, conf, host=None):
+         if vif.dev_type == osv_fields.VIFHostDeviceDevType.ETHERNET:
+             # This sets the required fields for an <interface type='hostdev'>
+@@ -542,6 +576,36 @@ class LibvirtGenericVIFDriver(object):
+             raise exception.InternalError(
+                 _('Unsupported VIF port profile type %s') % profile_name)
+ 
++    def _get_vdpa_dev_path(self, pci_address: ty.Text) -> ty.Text:
++        if self.host is not None:
++            return self.host.get_vdpa_device_path(pci_address)
++        # TODO(sean-k-mooney) this should never be raised remove when host
++        # is not optional in __init__.
++        raise TypeError("self.host must set to use this function.")
++
++    def _get_vdpa_dev_name(self, pci_address: ty.Text) -> ty.Text:
++        if self.host is not None:
++            return self.host.get_vdpa_device_name(pci_address)
++        raise TypeError("self.host must set to use this function.")
++
++    def _delete_vdpa_vif_dev(self, vdpa_name):
++        delete_vdpa_cmd = ['rexec', 'vdpa', 'dev', 'del', vdpa_name]
++        _run_cmd_by_root(delete_vdpa_cmd)
++
++    def _recreate_vdpa_vif_dev(self, vdpa_name, pci_id):
++        create_vdpa_cmd = ['rexec', 'vdpa', 'dev', 'add', 'name', vdpa_name,
++                           'mgmtdev', 'pci/%s' % pci_id]
++        _run_cmd_by_root(create_vdpa_cmd)
++
++    def _update_vdpa_device(self, vif):
++        if vif.if_exists:
++            return
++
++        LOG.debug("Update the max_queue of vDPA")
++        vdpa_name = self._get_vdpa_dev_name(vif.pci_id)
++        self._delete_vdpa_vif_dev(vdpa_name)
++        self._recreate_vdpa_vif_dev(vdpa_name, vif.pci_id)
++
+     def _get_config_os_vif(self, instance, vif, image_meta, inst_type,
+                            virt_type, host, vnic_type):
+         """Get the domain config for a VIF
+@@ -558,9 +622,12 @@ class LibvirtGenericVIFDriver(object):
+         """
+ 
+         # Do the config that's common to all vif types
+-        conf = self.get_base_config(instance, vif.address, image_meta,
+-                                    inst_type, virt_type, vnic_type,
+-                                    host)
++        if isinstance(vif, osv_vifs.VIFVDPADevice):
++            conf = vconfig.LibvirtConfigGuestVDPAPCI()
++        else:
++            conf = self.get_base_config(instance, vif.address, image_meta,
++                                        inst_type, virt_type, vnic_type,
++                                        host)
+ 
+         # Do the VIF type specific config
+         if isinstance(vif, osv_vifs.VIFGeneric):
+@@ -573,6 +640,9 @@ class LibvirtGenericVIFDriver(object):
+             self._set_config_VIFVHostUser(instance, vif, conf, host)
+         elif isinstance(vif, osv_vifs.VIFHostDevice):
+             self._set_config_VIFHostDevice(instance, vif, conf, host)
++        elif isinstance(vif, osv_vifs.VIFVDPADevice):
++            self._set_config_VIFVDPADevice(instance, vif, conf, host)
++            return conf
+         else:
+             raise exception.InternalError(
+                 _("Unsupported VIF type %s") % vif.obj_name())
+@@ -758,6 +828,10 @@ class LibvirtGenericVIFDriver(object):
+         vif_obj = os_vif_util.nova_to_osvif_vif(vif)
+         if vif_obj is not None:
+             self._plug_os_vif(instance, vif_obj)
++            if isinstance(vif_obj, osv_vifs.VIFVDPADevice):
++                pci_id = vif_obj.pci_id
++                vif['profile']['old_dev_path'] = self._get_vdpa_dev_path(pci_id)
++                self._update_vdpa_device(vif_obj)
+             return
+ 
+         # Legacy non-os-vif codepath
+diff --git a/nova/virt/libvirt/volume/vdpa.py b/nova/virt/libvirt/volume/vdpa.py
+new file mode 100644
+index 0000000..5622187
+--- /dev/null
++++ b/nova/virt/libvirt/volume/vdpa.py
+@@ -0,0 +1,121 @@
++# Copyright 2024 Huawei Technology corp.
++#
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++"""
++Libvirt volume driver for direct device
++"""
++
++import typing
++
++from os_brick import initiator
++from os_brick.initiator import connector
++from oslo_log import log as logging
++
++import nova.conf
++from nova import utils
++from nova.pci import utils as pci_utils
++from nova.virt.libvirt import config as vconfig
++from nova.virt.libvirt.volume import volume as libvirt_volume
++
++LOG = logging.getLogger(__name__)
++
++CONF = nova.conf.CONF
++SUPPORT_VOL_DRIVER = ('rbd', 'iscsi')
++
++class LibvirtVDPAVolumeDriver(libvirt_volume.LibvirtBaseVolumeDriver):
++    """Driver to attach direct device volumes to libvirt."""
++
++    def __init__(self, host):
++        super(LibvirtVDPAVolumeDriver, self).__init__(host,
++                                                       is_block_dev=True)
++        self.connector = connector.InitiatorConnector.factory(
++            initiator.VDPA, utils.get_root_helper(),
++            use_multipath=CONF.libvirt.volume_use_multipath,
++            device_scan_attempts=CONF.libvirt.num_volume_scan_tries,
++            transport=self._get_transport())
++
++    def attach_volume(self, connection_info, instance):
++        """Attach the volume to instance_name."""
++        vdpa_volume_info = connection_info['data'].get('vdpa_volume_info')
++        # 这个driver_volume_type是指后端存储，在此处是iscsi或者rbd
++        # vdpa_volume_type是存储在connection_info['data'].get('vdpa_volume_info')
++        driver_volume_type = connection_info.get('driver_volume_type')
++        # 说明使用的是vdpa_volume并且后端存储可供支持
++        if vdpa_volume_info and driver_volume_type in SUPPORT_VOL_DRIVER:
++            LOG.debug('Calling os-brick to attach VDPA Volume', instance=instance)
++            self.connector.attach_volume(connection_info)
++            LOG.debug("Connected VDPA Volume", instance=instance)
++
++    def detach_volume(self, connection_info, instance):
++        """Detach the volume from instance_name."""
++        vdpa_volume_info = connection_info['data'].get('vdpa_volume_info')
++        driver_volume_type = connection_info.get('driver_volume_type')
++        if vdpa_volume_info and driver_volume_type in SUPPORT_VOL_DRIVER:
++            LOG.debug("Calling os-brick to detach VDPA Volume.", instance=instance)
++            self.connector.detach_volume(connection_info)
++            LOG.debug("Disconnected VDPA Volume", instance=instance)
++
++    def extend_volume(self, connection_info, instance, requested_size):
++        """Extend the volume."""
++        vdpa_volume_info = connection_info['data'].get('vdpa_volume_info')
++        driver_volume_type = connection_info.get('driver_volume_type')
++        if vdpa_volume_info and driver_volume_type in SUPPORT_VOL_DRIVER:
++            LOG.debug("Calling os-brick to extend VDPA Volume.",
++                      instance=instance)
++            self.connector.extend_volume(
++                connection_info, instance, requested_size)
++            LOG.debug("Extended VDPA Volume", instance=instance)
++
++    def get_config(self, connection_info, disk_info):
++        vdpa_volume_info = connection_info['data'].get('vdpa_volume_info')
++        driver_volume_type = connection_info.get('driver_volume_type')
++
++        if vdpa_volume_info and driver_volume_type in SUPPORT_VOL_DRIVER:
++            conf = vconfig.LibvirtConfigGuestVDPAPCI()
++            pci_slot = vdpa_volume_info['pci']
++            dev_path = vdpa_volume_info.get('dev_path')
++
++            if not dev_path:
++                dev_path = self._get_vdpa_dev_path(pci_slot)
++
++            dbsf = pci_utils.parse_address(pci_slot)
++            conf.domain, conf.bus, conf.slot, conf.function = dbsf
++            conf.source_dev = dev_path
++            vdpa_volume_info['dev_path'] = dev_path
++
++            # only kvm support managed mode
++            conf.managed = 'no'
++
++            conf.boot_order = disk_info.get('boot_index')
++            LOG.info('get disk_info = %s', disk_info)
++
++            LOG.debug('get vdpa volume xml conf')
++            return conf
++
++        return None
++
++    def _get_vdpa_dev_path(self, pci_address: typing.Text) -> typing.Text:
++        if self.host is not None:
++            return self.host.get_vdpa_device_path(pci_address)
++        # TODO(sean-k-mooney) this should never be raised remove when host
++        # is not optional in __init__.
++        raise TypeError("self.host must set to use this function.")
++
++    def _get_transport(self):
++        if CONF.libvirt.iscsi_iface:
++            transport = CONF.libvirt.iscsi_iface
++        else:
++            transport = 'default'
++
++        return transport

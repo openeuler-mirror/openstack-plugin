@@ -18,6 +18,7 @@
 - python-neutronclient: 6.14.1
 - python-openstackclient: 4.0.2
 - python-openstacksdk: 0.36.5
+- python-novaclient: 15.1.1
 
 ### 特性
 - 流量分散 neutron为[15.3.4](https://opendev.org/openstack/neutron/src/tag/15.3.4)、neutron-lib为[1.29.2](https://opendev.org/openstack/neutron-lib/src/tag/1.29.2)。neutron还涉及entry point的修改，在子包中完成。特性spec请阅读相关[文档](https://gitee.com/openeuler/openstack/blob/master/docs/spec/distributed-traffic.md)。
@@ -26,6 +27,13 @@
   - ironic-offload-support-baremetal-with-dpu.patch 应用于裸机管理节点的ironic项目
   - nova-offload-support-baremetal-with-dpu-agent.patch 应用于DPU上的nova项目
   - neutron-offload-support-baremetal-with-dpu.patch 应用于裸机管理节点以及DPU上的neutron项目
+- 支持纳管带DPU卸载的裸金属节点virtio-fs特性。一共包含6个patch，其中：
+  - nova-offload-support-baremetal-with-dpu-ctrl-24.1.RC1.B023.patch 应用于裸机管理节点的nova项目
+  - ironic-offload-support-baremetal-with-dpu-24.1.RC1.B023.patch 应用于裸机管理节点的ironic项目
+  - nova-offload-support-baremetal-with-dpu-agent-24.1.RC1.B023.patch 应用于DPU上的nova项目
+  - neutron-offload-support-baremetal-with-dpu-24.1.RC1.B023.patch 应用于裸机管理节点以及DPU上的neutron项目
+  - python-openstackclient-offload-support-baremetal-with-dpu-24.1.RC1.B023.patch 应用于裸机管理节点的python-openstackclient项目
+  - python-novaclient-offload-support-baremetal-with-dpu-24.1.RC1.B023.patch 应用于裸机管理节点的python-novaclient项目
 - 支持纳管智能网卡网络vDPA设备（virtio-net）。一共包含6个patch，其中：
   - nova-offload-support-generic-vdpa-of-smartnic.patch 应用于控制节点和计算节点的nova项目
   - os-vif-offload-support-generic-vdpa-of-smartnic.patch 应用于控制节点和计算节点的os-vif项目
@@ -41,3 +49,11 @@
   - os-brick-offload-support-generic-vdpa-of-dpu.patch 应用于计算节点的os-brick项目
   - python-neutronclient-offload-support-generic-vdpa-of-dpu.patch 应用于控制节点的python-neutronclient项目
   - python-openstackclient-offload-support-generic-vdpa-of-dpu.patch 应用于控制节点的python-openstackclient项目
+- 支持纳管DPU卸载场景vDPA设备（支持虚拟机扩容和vdpa系统盘）。一共包含7个patch，其中：
+  - nova-offload-support-generic-vdpa-of-dpu-24.1.RC1.B024.patch 应用于控制节点和计算节点的nova项目
+  - os-vif-offload-support-generic-vdpa-of-dpu-24.1.RC1.B024.patch 应用于控制节点和计算节点的os-vif项目
+  - neutron-offload-support-generic-vdpa-of-dpu-24.1.RC1.B024.patch 应用于控制节点和计算节点的neutron项目
+  - neutron-lib-offload-support-generic-vdpa-of-dpu-24.1.RC1.B024.patch 应用于控制节点的neutron-lib项目
+  - os-brick-offload-support-generic-vdpa-of-dpu-24.1.RC1.B024.patch 应用于计算节点的os-brick项目
+  - python-neutronclient-offload-support-generic-vdpa-of-dpu-24.1.RC1.B024.patch 应用于控制节点的python-neutronclient项目
+  - python-openstackclient-offload-support-generic-vdpa-of-dpu-24.1.RC1.B024.patch 应用于控制节点的python-openstackclient项目

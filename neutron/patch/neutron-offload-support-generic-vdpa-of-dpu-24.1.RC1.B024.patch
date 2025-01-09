@@ -1,0 +1,87 @@
+diff --git a/neutron/plugins/ml2/drivers/openvswitch/agent/openflow/native/br_int.py b/neutron/plugins/ml2/drivers/openvswitch/agent/openflow/native/br_int.py
+index 94cec08..61db723 100644
+--- a/neutron/plugins/ml2/drivers/openvswitch/agent/openflow/native/br_int.py
++++ b/neutron/plugins/ml2/drivers/openvswitch/agent/openflow/native/br_int.py
+@@ -21,6 +21,7 @@
+ 
+ import netaddr
+ 
++from neutron_lib import constants as lib_const
+ from os_ken.lib.packet import ether_types
+ from os_ken.lib.packet import icmpv6
+ from os_ken.lib.packet import in_proto
+@@ -51,6 +52,13 @@ class OVSIntegrationBridge(ovs_bridge.OVSAgentBridge):
+         # deal with all egress flow.
+         self.install_normal(table_id=constants.TRANSIENT_EGRESS_TABLE,
+                             priority=3)
++        LOG.debug("OVSIntegrationBridge add_flow RARP start")
++        self.add_flow(
++            table=constants.LOCAL_SWITCHING,
++            priority=100,
++            dl_type=lib_const.ETHERTYPE_RARP,
++            actions='normal')
++        LOG.debug("OVSIntegrationBridge add_flow RARP end")
+ 
+     def setup_canary_table(self):
+         self.install_drop(constants.CANARY_TABLE)
+diff --git a/neutron/plugins/ml2/drivers/openvswitch/agent/openflow/native/br_tun.py b/neutron/plugins/ml2/drivers/openvswitch/agent/openflow/native/br_tun.py
+index f361d08..ea7d66c 100644
+--- a/neutron/plugins/ml2/drivers/openvswitch/agent/openflow/native/br_tun.py
++++ b/neutron/plugins/ml2/drivers/openvswitch/agent/openflow/native/br_tun.py
+@@ -29,8 +29,10 @@
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
+ 
++from neutron_lib import constants as lib_const
+ from os_ken.lib.packet import arp
+ from os_ken.lib.packet import ether_types
++from oslo_log import log as logging
+ 
+ from neutron.plugins.ml2.drivers.openvswitch.agent.common import constants
+ from neutron.plugins.ml2.drivers.openvswitch.agent.openflow.native \
+@@ -38,6 +40,7 @@ from neutron.plugins.ml2.drivers.openvswitch.agent.openflow.native \
+ from neutron.plugins.ml2.drivers.openvswitch.agent.openflow.native \
+     import ovs_bridge
+ 
++LOG = logging.getLogger(__name__)
+ 
+ class OVSTunnelBridge(ovs_bridge.OVSAgentBridge,
+                       br_dvr_process.OVSDVRProcessMixin):
+@@ -135,6 +138,13 @@ class OVSTunnelBridge(ovs_bridge.OVSAgentBridge,
+         # FLOOD_TO_TUN will handle flooding in tunnels based on lvid,
+         # for now, add a default drop action
+         self.install_drop(table_id=constants.FLOOD_TO_TUN)
++        LOG.debug("OVSTunnelBridge add_flow RARP start")
++        self.add_flow(
++            table=constants.LOCAL_SWITCHING,
++            priority=100,
++            dl_type=lib_const.ETHERTYPE_RARP,
++            actions='normal')
++        LOG.debug("OVSTunnelBridge add_flow RARP end")
+ 
+     @staticmethod
+     def _local_vlan_match(_ofp, ofpp, tun_id):
+diff --git a/neutron/plugins/ml2/drivers/openvswitch/mech_driver/mech_openvswitch.py b/neutron/plugins/ml2/drivers/openvswitch/mech_driver/mech_openvswitch.py
+index 422c570..f06f8ac 100644
+--- a/neutron/plugins/ml2/drivers/openvswitch/mech_driver/mech_openvswitch.py
++++ b/neutron/plugins/ml2/drivers/openvswitch/mech_driver/mech_openvswitch.py
+@@ -81,7 +81,8 @@ class OpenvswitchMechanismDriver(mech_agent.SimpleAgentMechanismDriverBase):
+         self.supported_vnic_types = self.blacklist_supported_vnic_types(
+             vnic_types=[portbindings.VNIC_NORMAL,
+                         portbindings.VNIC_DIRECT,
+-                        portbindings.VNIC_SMARTNIC],
++                        portbindings.VNIC_SMARTNIC,
++                        portbindings.VNIC_VHOST_VDPA],
+             blacklist=cfg.CONF.OVS_DRIVER.vnic_type_blacklist
+         )
+         LOG.info("%s's supported_vnic_types: %s",
+@@ -148,6 +149,9 @@ class OpenvswitchMechanismDriver(mech_agent.SimpleAgentMechanismDriverBase):
+         if (context.current.get(portbindings.VNIC_TYPE) ==
+                 portbindings.VNIC_DIRECT):
+             return portbindings.VIF_TYPE_OVS
++        if (context.current.get(portbindings.VNIC_TYPE) ==
++                portbindings.VNIC_VHOST_VDPA):
++            return portbindings.VIF_TYPE_OVS
+         return self.get_supported_vif_type(agent)
+ 
+     def get_vhost_mode(self, iface_types):

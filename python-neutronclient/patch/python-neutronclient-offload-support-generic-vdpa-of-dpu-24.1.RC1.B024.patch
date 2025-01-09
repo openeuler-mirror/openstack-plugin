@@ -1,0 +1,13 @@
+diff --git a/neutronclient/neutron/v2_0/port.py b/neutronclient/neutron/v2_0/port.py
+index 0982b04..cef7737 100644
+--- a/neutronclient/neutron/v2_0/port.py
++++ b/neutronclient/neutron/v2_0/port.py
+@@ -247,7 +247,7 @@ class CreatePort(neutronV20.CreateCommand, UpdatePortSecGroupMixin,
+             metavar='<direct | direct-physical | macvtap '
+                     '| normal | baremetal>',
+             choices=['direct', 'direct-physical', 'macvtap',
+-                     'normal', 'baremetal'],
++                     'normal', 'baremetal', 'vdpa'],
+             type=utils.convert_to_lowercase,
+             help=_('VNIC type for this port.'))
+         parser.add_argument(
