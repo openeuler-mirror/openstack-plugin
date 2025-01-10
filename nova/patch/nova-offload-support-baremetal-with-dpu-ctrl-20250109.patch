@@ -1,0 +1,3062 @@
+diff --git a/nova/api/openstack/compute/routes.py b/nova/api/openstack/compute/routes.py
+index 763db39..6da7861 100644
+--- a/nova/api/openstack/compute/routes.py
++++ b/nova/api/openstack/compute/routes.py
+@@ -74,6 +74,7 @@ from nova.api.openstack.compute import server_groups
+ from nova.api.openstack.compute import server_metadata
+ from nova.api.openstack.compute import server_migrations
+ from nova.api.openstack.compute import server_password
++from nova.api.openstack.compute import server_shares
+ from nova.api.openstack.compute import server_tags
+ from nova.api.openstack.compute import server_topology
+ from nova.api.openstack.compute import servers
+@@ -313,6 +314,8 @@ server_remote_consoles_controller = functools.partial(_create_controller,
+ server_security_groups_controller = functools.partial(_create_controller,
+     security_groups.ServerSecurityGroupController, [])
+ 
++server_shares_controller = functools.partial(_create_controller,
++    server_shares.ServerSharesController, [])
+ 
+ server_tags_controller = functools.partial(_create_controller,
+     server_tags.ServerTagsController, [])
+@@ -825,6 +828,14 @@ ROUTE_LIST = (
+     ('/servers/{server_id}/os-security-groups', {
+         'GET': [server_security_groups_controller, 'index']
+     }),
++    ('/servers/{server_id}/shares', {
++        'GET': [server_shares_controller, 'index'],
++        'POST': [server_shares_controller, 'create'],
++    }),
++    ('/servers/{server_id}/shares/{id}', {
++        'GET': [server_shares_controller, 'show'],
++        'DELETE': [server_shares_controller, 'delete'],
++    }),
+     ('/servers/{server_id}/tags', {
+         'GET': [server_tags_controller, 'index'],
+         'PUT': [server_tags_controller, 'update_all'],
+diff --git a/nova/api/openstack/compute/server_shares.py b/nova/api/openstack/compute/server_shares.py
+new file mode 100644
+index 0000000..d11fc38
+--- /dev/null
++++ b/nova/api/openstack/compute/server_shares.py
+@@ -0,0 +1,162 @@
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++from oslo_log import log as logging
++import webob
++
++from oslo_db import exception as db_exc
++from oslo_utils import uuidutils
++
++from nova.api.openstack import common
++
++from nova.api.openstack.compute.views import server_shares
++from nova.api.openstack import wsgi
++from nova.api import validation
++from nova.compute import api as compute
++from nova.compute import vm_states
++from nova import context as nova_context
++from nova import exception
++from nova import objects
++from nova.objects import fields
++from nova.policies import server_shares as ss_policies
++from nova.share import manila
++from nova.virt import hardware as hw
++
++
++from oslo_config import cfg
++CONF = cfg.CONF
++
++LOG = logging.getLogger(__name__)
++
++def _get_instance_mapping(context, server_id):
++    try:
++        return objects.InstanceMapping.get_by_instance_uuid(context, server_id)
++    except exception.InstanceMappingNotFound as e:
++        raise webob.exc.HTTPNotFound(explanation=e.format_message())
++
++
++class ServerSharesController(wsgi.Controller):
++    _view_builder_class = server_shares.ViewBuilder
++
++    def __init__(self):
++        super(ServerSharesController, self).__init__()
++        self.compute_api = compute.API()
++        self.manila = manila.API()
++
++    def _get_instance_from_server_uuid(self, context, server_id):
++        instance = common.get_instance(self.compute_api, context, server_id)
++        return instance
++
++    @wsgi.response(200)
++    @wsgi.expected_errors((400, 403, 404))
++    def index(self, req, server_id):
++        context = req.environ["nova.context"]
++        im = _get_instance_mapping(context, server_id)
++        context.can(ss_policies.POLICY_ROOT % 'index',
++                    target={'project_id': im.project_id})
++
++        with nova_context.target_cell(context, im.cell_mapping) as cctxt:
++            try:
++                instance = self._get_instance_from_server_uuid(
++                    cctxt, server_id
++                )
++
++                db_shares = objects.ShareMappingList.get_by_instance_uuid(
++                        cctxt, server_id
++                )
++
++            except (exception.ForbiddenSharesNotSupported) as e:
++                raise webob.exc.HTTPForbidden(explanation=e.format_message())
++            except (exception.ForbiddenSharesNotConfiguredCorrectly) as e:
++                raise webob.exc.HTTPConflict(explanation=e.format_message())
++
++        return self._view_builder._list_view(db_shares)
++
++    @wsgi.response(201)
++    @wsgi.expected_errors((400, 403, 404, 409))
++    def create(self, req, server_id, body):
++        context = req.environ["nova.context"]
++
++        im = _get_instance_mapping(context, server_id)
++        context.can(
++            ss_policies.POLICY_ROOT % 'create',
++            target={'project_id': im.project_id}
++        )
++
++        share_dict = body['share']
++        share_id = share_dict.get('share_id')
++        LOG.debug("server_shares create share_dict %s", share_dict)
++
++        with nova_context.target_cell(context, im.cell_mapping) as cctxt:
++            instance = self._get_instance_from_server_uuid(cctxt, server_id)
++            try:
++                self.compute_api.attach_share(cctxt, instance, share_id)
++
++                view = {
++                    'share': {
++                        'share_id': share_id,
++                    }
++                }
++            except (exception.ShareNotFound) as e:
++                raise webob.exc.HTTPNotFound(explanation=e.format_message())
++            except (exception.ShareProtocolNotSupported) as e:
++                raise webob.exc.HTTPConflict(explanation=e.format_message())
++            except (exception.ShareMappingAlreadyExists) as e:
++                raise webob.exc.HTTPConflict(explanation=e.format_message())
++        return view
++
++    @wsgi.response(200)
++    @wsgi.expected_errors((400, 403, 404))
++    def show(self, req, server_id, id):
++        context = req.environ["nova.context"]
++
++        im = _get_instance_mapping(context, server_id)
++        context.can(
++            ss_policies.POLICY_ROOT % 'show',
++            target={'project_id': im.project_id}
++        )
++
++        with nova_context.target_cell(context, im.cell_mapping) as cctxt:
++            try:
++                share = objects.ShareMapping.get_by_instance_uuid_and_share_id(
++                    cctxt,
++                    server_id,
++                    id
++                )
++                view = self._view_builder._show_view(cctxt, share)
++            except (exception.ShareNotFound) as e:
++                raise webob.exc.HTTPNotFound(explanation=e.format_message())
++            except (exception.ForbiddenSharesNotSupported) as e:
++                raise webob.exc.HTTPForbidden(explanation=e.format_message())
++            except (exception.ForbiddenSharesNotConfiguredCorrectly) as e:
++                raise webob.exc.HTTPConflict(explanation=e.format_message())
++        return view
++
++    @wsgi.response(200)
++    @wsgi.expected_errors((400, 403, 404, 409))
++    def delete(self, req, server_id, id):
++        context = req.environ["nova.context"]
++        LOG.debug("server_shares delete server_id %s", server_id)
++        LOG.debug("server_shares delete id %s", id)
++
++        im = _get_instance_mapping(context, server_id)
++        context.can(
++            ss_policies.POLICY_ROOT % 'delete',
++            target={'project_id': im.project_id}
++        )
++
++        with nova_context.target_cell(context, im.cell_mapping) as cctxt:
++            instance = self._get_instance_from_server_uuid(cctxt, server_id)
++            try:
++                self.compute_api.detach_share(cctxt, instance, id)
++            except (exception.ShareNotFound) as e:
++                raise webob.exc.HTTPNotFound(explanation=e.format_message())
+diff --git a/nova/api/openstack/compute/views/server_shares.py b/nova/api/openstack/compute/views/server_shares.py
+new file mode 100644
+index 0000000..4e4fb9f
+--- /dev/null
++++ b/nova/api/openstack/compute/views/server_shares.py
+@@ -0,0 +1,46 @@
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++from nova.api.openstack import common
++from nova.api.openstack.compute.views import servers
++
++
++class ViewBuilder(common.ViewBuilder):
++    _collection_name = 'shares'
++
++    def __init__(self):
++        super(ViewBuilder, self).__init__()
++        self._server_builder = servers.ViewBuilder()
++
++    def _list_view(self, db_shares):
++        shares = {'shares': []}
++        for db_share in db_shares:
++            share = {
++                'share_id': db_share.share_id,
++                'status': db_share.status,
++                'tag': db_share.tag,
++            }
++            shares['shares'].append(share)
++        return shares
++
++    def _show_view(self, context, db_share):
++        share = {'share': {
++            'share_id': db_share.share_id,
++            'status': db_share.status,
++            'tag': db_share.tag,
++        }}
++
++        if context.is_admin:
++            share['share']['export_location'] = db_share.export_location
++            share['share']['uuid'] = db_share.uuid
++
++        return share
+diff --git a/nova/api/openstack/compute/views/servers.py b/nova/api/openstack/compute/views/servers.py
+index 087bc27..ad15920 100644
+--- a/nova/api/openstack/compute/views/servers.py
++++ b/nova/api/openstack/compute/views/servers.py
+@@ -190,7 +190,7 @@ class ViewBuilder(common.ViewBuilder):
+              show_keypair=True, show_srv_usg=True, show_sec_grp=True,
+              show_extended_status=True, show_extended_volumes=True,
+              bdms=None, cell_down_support=False, show_server_groups=False,
+-             show_user_data=True):
++             show_user_data=True, show_extended_shares=True):
+         """Detailed view of a single instance."""
+         if show_extra_specs is None:
+             # detail will pre-calculate this for us. If we're doing show,
+@@ -328,6 +328,11 @@ class ViewBuilder(common.ViewBuilder):
+             self._add_volumes_attachments(server["server"],
+                                           bdms,
+                                           add_delete_on_termination)
++        if show_extended_shares:
++            share_mappings = objects.ShareMappingList.get_by_instance_uuid(
++                    context, [instance["uuid"]])
++            self._add_share_mappings(server["server"], share_mappings)
++
+         if (api_version_request.is_supported(request, min_version='2.16')):
+             if show_host_status is None:
+                 show_host_status = context.can(
+@@ -687,6 +692,19 @@ class ViewBuilder(common.ViewBuilder):
+         key = "os-extended-volumes:volumes_attached"
+         server[key] = volumes_attached
+ 
++    def _add_share_mappings(self, server, share_mappings):
++        shares_attached = []
++        for share_mapping in share_mappings:
++            if share_mapping.share_id:
++                share_attached = {
++                    'id': share_mapping.share_id,
++                    'tag': share_mapping.tag,
++                    'status': share_mapping.status,
++                }
++                shares_attached.append(share_attached)
++        key = "os-extended-shares:shares_attached"
++        server[key] = shares_attached
++
+     @staticmethod
+     def _get_server_groups(context, instance):
+         try:
+diff --git a/nova/api/validation/parameter_types.py b/nova/api/validation/parameter_types.py
+index 7943142..fbcd4fd 100644
+--- a/nova/api/validation/parameter_types.py
++++ b/nova/api/validation/parameter_types.py
+@@ -333,6 +333,11 @@ image_id = {
+ }
+ 
+ 
++share_id = {
++    'type': 'string', 'format': 'uuid'
++}
++
++
+ image_id_or_empty_string = {
+     'oneOf': [
+         {'type': 'string', 'format': 'uuid'},
+diff --git a/nova/compute/api.py b/nova/compute/api.py
+index 4fa0cc2..355c5cd 100644
+--- a/nova/compute/api.py
++++ b/nova/compute/api.py
+@@ -5045,6 +5045,23 @@ class API(base.Base):
+             host_statuses[instance.uuid] = host_status
+         return host_statuses
+ 
++    @check_instance_lock
++    @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.PAUSED,
++                                    vm_states.STOPPED, vm_states.RESIZED,
++                                    vm_states.SOFT_DELETED, vm_states.SHELVED,
++                                    vm_states.SHELVED_OFFLOADED])
++    def attach_share(self, context, instance, share_id):
++        self.compute_rpcapi.attach_share(
++            context, instance, share_id)
++
++    @check_instance_lock
++    @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.PAUSED,
++                                    vm_states.STOPPED, vm_states.RESIZED,
++                                    vm_states.SOFT_DELETED, vm_states.SHELVED,
++                                    vm_states.SHELVED_OFFLOADED])
++    def detach_share(self, context, instance, share_id):
++        self.compute_rpcapi.detach_share(
++            context, instance, share_id)
+ 
+ def target_host_cell(fn):
+     """Target a host-based function to a cell.
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index 6e5d72f..c9ed2b5 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -43,7 +43,9 @@ import eventlet.semaphore
+ import eventlet.timeout
+ import futurist
+ from keystoneauth1 import exceptions as keystone_exception
++from openstack import exceptions as sdk_exc
+ import os_traits
++from oslo_db import exception as db_exc
+ from oslo_log import log as logging
+ import oslo_messaging as messaging
+ from oslo_serialization import jsonutils
+@@ -53,6 +55,7 @@ from oslo_utils import excutils
+ from oslo_utils import strutils
+ from oslo_utils import timeutils
+ from oslo_utils import units
++from oslo_utils import uuidutils
+ import six
+ from six.moves import range
+ 
+@@ -87,6 +90,7 @@ from nova.objects import external_event as external_event_obj
+ from nova.objects import fields
+ from nova.objects import instance as obj_instance
+ from nova.objects import migrate_data as migrate_data_obj
++from nova.objects import share_mapping as share_mapping_obj
+ from nova.pci import request as pci_req_module
+ from nova.pci import whitelist
+ from nova import rpc
+@@ -94,6 +98,7 @@ from nova import safe_utils
+ from nova.scheduler.client import query
+ from nova.scheduler.client import report
+ from nova.scheduler import utils as scheduler_utils
++from nova.share import manila
+ from nova import utils
+ from nova.virt import block_device as driver_block_device
+ from nova.virt import configdrive
+@@ -532,6 +537,7 @@ class ComputeManager(manager.Manager):
+         self.virtapi = ComputeVirtAPI(self)
+         self.network_api = network.API()
+         self.volume_api = cinder.API()
++        self.manila_api = manila.API()
+         self.image_api = image.API()
+         self._last_bw_usage_poll = 0
+         self._bw_usage_supported = True
+@@ -1084,21 +1090,7 @@ class ComputeManager(manager.Manager):
+             return
+ 
+         net_info = instance.get_network_info()
+-        try:
+-            self.driver.plug_vifs(instance, net_info)
+-        except NotImplementedError as e:
+-            LOG.debug(e, instance=instance)
+-        except exception.VirtualInterfacePlugException:
+-            # NOTE(mriedem): If we get here, it could be because the vif_type
+-            # in the cache is "binding_failed" or "unbound".
+-            # The periodic task _heal_instance_info_cache checks for this
+-            # condition. It should fix this by binding the ports again when
+-            # it gets to this instance.
+-            LOG.exception('Virtual interface plugging failed for instance. '
+-                          'The port binding:host_id may need to be manually '
+-                          'updated.', instance=instance)
+-            self._set_instance_obj_error_state(context, instance)
+-            return
++        # delete self.driver.plug_vifs
+ 
+         if instance.task_state == task_states.RESIZE_MIGRATING:
+             # We crashed during resize/migration, so roll back for safety
+@@ -2845,6 +2837,14 @@ class ComputeManager(manager.Manager):
+         block_device_info = self._get_instance_block_device_info(
+             context, instance, bdms=bdms)
+ 
++        LOG.debug('dpulog try_deallocate_networks start.',
++                  instance=instance)
++        # deallocate networks before destroy
++        if try_deallocate_networks:
++            self._try_deallocate_network(context, instance, requested_networks)
++        LOG.debug('dpulog try_deallocate_networks end.',
++                  instance=instance)
++
+         # NOTE(melwitt): attempt driver destroy before releasing ip, may
+         #                want to keep ip allocated for certain failures
+         try:
+@@ -2861,14 +2861,11 @@ class ComputeManager(manager.Manager):
+                 pass
+         except Exception:
+             with excutils.save_and_reraise_exception():
+-                # deallocate ip and fail without proceeding to
+-                # volume api calls, preserving current behavior
+-                if try_deallocate_networks:
+-                    self._try_deallocate_network(context, instance,
+-                                                 requested_networks)
++                # move try_deallocate_networks before self.driver.destroy
++                LOG.error('driver destroy with Exception.',
++                          instance=instance)
+ 
+-        if try_deallocate_networks:
+-            self._try_deallocate_network(context, instance, requested_networks)
++        # move try_deallocate_networks before self.driver.destroy
+ 
+         timer.restart()
+         for bdm in vol_bdms:
+@@ -2954,6 +2951,48 @@ class ComputeManager(manager.Manager):
+         if exc_info is not None and raise_exc:
+             six.reraise(exc_info[0], exc_info[1], exc_info[2])
+ 
++    def _cleanup_shares(self, context, instance, raise_exc=True):
++        LOG.debug("Cleanup shares begine", instance=instance)
++
++        def _do_cleanup_shares(context, instance, raise_exc):
++            share_mapping_list = objects.ShareMappingList.get_by_instance_uuid(
++                context, instance.uuid)
++            LOG.debug("Do cleanup shares: %s", share_mapping_list,
++                      instance_uuid=instance.uuid)
++            for share_mapping in share_mapping_list:
++                LOG.debug("cleanup share: %s", share_mapping.share_id,
++                          instance_uuid=instance.uuid)
++                try:
++                    access_ip = self.driver.get_share_access_ip(context,
++                                                                instance)
++                    share_mapping.set_access_according_to_protocol(access_ip)
++
++                    LOG.debug("cleanup share deny share %s",
++                              share_mapping.share_id)
++                    self.manila_api.deny(context, share_mapping.share_id,
++                                         share_mapping.access_type,
++                                         share_mapping.access_to)
++                except Exception as exc:
++                    LOG.warning("Deny access %s error, due to %s",
++                                share_mapping.share_id, exc)
++                    if raise_exc:
++                        raise
++                finally:
++                    LOG.debug("delete share_mapping %s", share_mapping.share_id)
++                    share_mapping.delete()
++
++            LOG.debug("Do cleanup shares done", instance=instance)
++
++        exc_info = None
++        try:
++            _do_cleanup_shares(context, instance, raise_exc)
++        except Exception as exc:
++            exc_info = sys.exc_info()
++            LOG.warning('Failed to cleanup shares due to %(exc)s', {'exc': exc})
++        if exc_info is not None and raise_exc:
++            six.reraise(exc_info[0], exc_info[1], exc_info[2])
++        LOG.debug("Cleanup shares done", instance=instance)
++
+     @hooks.add_hook("delete_instance")
+     def _delete_instance(self, context, instance, bdms):
+         """Delete an instance on this host.
+@@ -2992,6 +3031,7 @@ class ComputeManager(manager.Manager):
+ 
+         self._cleanup_volumes(context, instance, bdms,
+                 raise_exc=False, detach=False)
++        self._cleanup_shares(context, instance, raise_exc=False)
+         # if a delete task succeeded, always update vm state and task
+         # state without expecting task state to be DELETING
+         instance.vm_state = vm_states.DELETED
+@@ -3919,6 +3959,175 @@ class ComputeManager(manager.Manager):
+         self.driver.volume_snapshot_delete(context, instance, volume_id,
+                                            snapshot_id, delete_info)
+ 
++    @messaging.expected_exceptions(NotImplementedError)
++    @wrap_exception()
++    def attach_share(self, context, instance, share_id):
++        LOG.debug('attach_share share_id: %s.', share_id, instance=instance)
++
++        @utils.synchronized(share_id)
++        def _attach_share(context, instance, share_id):
++
++            def Is_share_usage(context, share_id):
++                share_mappings_used_by_share = (
++                    share_mapping_obj.ShareMappingList.get_by_share_id(
++                        context, share_id
++                    )
++                )
++
++                for sm in share_mappings_used_by_share:
++                    if sm.status == fields.ShareMappingStatus.ACTIVE or sm.status == fields.ShareMappingStatus.ATTACHING:
++                        LOG.error('share has been already attached: %s.', share_id)
++                        return True
++
++                LOG.debug('share is available: %s.', share_id)
++                return False
++
++            def _apply_policy(share_mapping):
++                self.manila_api.allow(context, share_mapping.share_id,
++                                      share_mapping.access_type,
++                                      share_mapping.access_to, "rw")
++
++            def _wait_policy_to_be_applied(share_mapping):
++                max_retries = 10
++                attempt_count = 0
++                while attempt_count < max_retries:
++                    if self.manila_api.has_access(
++                            context,
++                            share_mapping.share_id,
++                            share_mapping.access_type,
++                            share_mapping.access_to,
++                    ):
++                        LOG.debug("Allow policy set on share %s ",
++                                  share_mapping.share_id)
++                        break
++                    else:
++                        LOG.debug("Waiting policy to be set on share %s ",
++                                  share_mapping.share_id)
++                        time.sleep(1)
++                        attempt_count += 1
++
++                if attempt_count >= max_retries:
++                    raise exception.ShareAccessGrantError(
++                        share_id=share_mapping.share_id,
++                        reason="Failed to set allow policy on share, "
++                               "too many retries",
++                    )
++
++            still_used = Is_share_usage(context, share_id)
++            if still_used == True:
++                return
++            
++            manila_share_data = self.manila_api.get(context, share_id)
++
++            share_mapping = objects.ShareMapping(context)
++            share_mapping.uuid = uuidutils.generate_uuid()
++            share_mapping.instance_uuid = instance.uuid
++            share_mapping.share_id = share_id
++            share_mapping.status = fields.ShareMappingStatus.ATTACHING
++            share_mapping.export_location = manila_share_data.export_location
++            share_mapping.share_proto = manila_share_data.share_proto
++            share_mapping.tag = share_mapping.uuid
++
++            access_ip = self.driver.get_share_access_ip(context, instance)
++            share_mapping.set_access_according_to_protocol(access_ip)
++
++            try:
++                share_mapping.create()
++            except db_exc.DBDuplicateEntry:
++                raise exception.ShareMappingAlreadyExists(share_id=share_id)
++            except Exception as exp:
++                LOG.error("db error %s", exp.format_message())
++                raise exception.ShareMappingAlreadyExists(share_id=share_id)
++
++            try:
++                if not self.manila_api.has_access(context,
++                                                  share_mapping.share_id,
++                                                  share_mapping.access_type,
++                                                  share_mapping.access_to,
++                ):
++                    _apply_policy(share_mapping)
++                    _wait_policy_to_be_applied(share_mapping)
++
++                LOG.debug("attach share %s", share_mapping.share_id)
++                self.driver.attach_share(context, instance, share_mapping)
++                LOG.debug("attach share %s done", share_mapping.share_id)
++
++            except exception.ShareAccessGrantError as exp:
++                LOG.error(exp.format_message())
++                share_mapping.delete()
++                raise
++            except Exception as exp:
++                LOG.error(exp.format_message())
++                share_mapping.delete()
++                self.manila_api.deny(context, share_mapping.share_id,
++                                     share_mapping.access_type,
++                                     share_mapping.access_to)
++                raise
++
++        _attach_share(context, instance, share_id)
++
++    @messaging.expected_exceptions(NotImplementedError)
++    @wrap_exception()
++    def detach_share(self, context, instance, share_id):
++        LOG.debug('detach_share share_id: %s.', share_id, instance=instance)
++
++        @utils.synchronized(share_id)
++        def _detach_share(context, instance, share_id):
++            try:
++                share_mapping = share_mapping_obj.ShareMapping.get_by_instance_uuid_and_share_id(
++                    context, instance.uuid, share_id)
++
++                self.driver.detach_share(context, instance, share_mapping)
++
++                access_ip = self.driver.get_share_access_ip(context, instance)
++                share_mapping.set_access_according_to_protocol(access_ip)
++
++                LOG.debug("deny share %s", share_mapping.share_id)
++                self.manila_api.deny(context, share_mapping.share_id,
++                                     share_mapping.access_type,
++                                     share_mapping.access_to)
++                
++                LOG.debug("delete share_mapping %s", share_mapping.share_id)
++                share_mapping.delete()
++
++
++                LOG.debug("detach share %s done", share_mapping.share_id)
++            except (
++                    exception.ShareAccessRemovalError,
++                    exception.ShareProtocolNotSupported,
++            ) as e:
++                self._set_share_mapping_status(
++                    share_mapping, fields.ShareMappingStatus.ERROR
++                )
++
++                LOG.error(e.format_message())
++                raise
++            except keystone_exception.http.Unauthorized as e:
++                self._set_share_mapping_status(
++                    share_mapping, fields.ShareMappingStatus.ERROR
++                )
++
++                LOG.error(e)
++                raise
++            except (exception.ShareNotFound, exception.ShareAccessNotFound):
++                share_mapping.delete()
++
++
++        _detach_share(context, instance, share_id)
++
++    def _set_share_mapping_status(self, share_mapping, status):
++        share_mapping.status = status
++        share_mapping.save()
++
++    def _set_share_mapping_and_instance_in_error(
++            self, instance, share_mapping
++    ):
++        share_mapping.status = fields.ShareMappingStatus.ERROR
++        share_mapping.save()
++        self._set_instance_obj_error_state(
++            instance, clean_task_state=True
++        )
++
+     @wrap_instance_fault
+     def _rotate_backups(self, context, instance, backup_type, rotation):
+         """Delete excess backups associated to an instance.
+@@ -4554,7 +4763,10 @@ class ComputeManager(manager.Manager):
+ 
+             block_device_info = self._get_instance_block_device_info(
+                     context, instance, refresh_conn_info=True, bdms=bdms)
+-
++            LOG.info('finish_revert_resize prepare_for_spawn node %s',
++                     instance.node,
++                     instance=instance)
++            self.driver.prepare_for_spawn(instance)
+             power_on = old_vm_state != vm_states.STOPPED
+             self.driver.finish_revert_migration(
+                 context, instance, network_info, migration, block_device_info,
+@@ -4944,6 +5156,10 @@ class ComputeManager(manager.Manager):
+             instance.task_state = task_states.RESIZE_MIGRATED
+             instance.save(expected_task_state=task_states.RESIZE_MIGRATING)
+ 
++            LOG.debug('_resize_instance prepare_for_spawn node %s',
++                      instance.node,
++                      instance=instance)
++            self.driver.prepare_for_spawn(instance)
+             # RPC cast to the destination host to finish the resize/migration.
+             self.compute_rpcapi.finish_resize(context, instance,
+                 migration, image, disk_info, migration.dest_compute,
+@@ -8638,6 +8854,7 @@ class ComputeManager(manager.Manager):
+ 
+         # We re-query the DB to get the latest instance info to minimize
+         # (not eliminate) race condition.
++        LOG.debug("start _sync_instance_power_state")
+         db_instance.refresh(use_slave=use_slave)
+         db_power_state = db_instance.power_state
+         vm_state = db_instance.vm_state
+@@ -9158,6 +9375,7 @@ class ComputeManager(manager.Manager):
+                                  self.network_api, context,
+                                  instance,
+                                  nw_info=network_info)
++                vif['force'] = True
+                 try:
+                     self.driver.detach_interface(context, instance, vif)
+                 except NotImplementedError:
+diff --git a/nova/compute/rpcapi.py b/nova/compute/rpcapi.py
+index f37241c..36a1e8c 100644
+--- a/nova/compute/rpcapi.py
++++ b/nova/compute/rpcapi.py
+@@ -1176,6 +1176,28 @@ class ComputeAPI(object):
+                    volume_id=volume_id, snapshot_id=snapshot_id,
+                    delete_info=delete_info)
+ 
++    def attach_share(self, ctxt, instance, share_id):
++        version = '5.0'
++        cctxt = self.router.client(ctxt).prepare(
++                server=_compute_host(None, instance), version=version)
++        cctxt.call(
++            ctxt,
++            "attach_share",
++            instance=instance,
++            share_id=share_id
++        )
++
++    def detach_share(self, ctxt, instance, share_id):
++        version = '5.0'
++        cctxt = self.router.client(ctxt).prepare(
++                server=_compute_host(None, instance), version=version)
++        cctxt.call(
++            ctxt,
++            "detach_share",
++            instance=instance,
++            share_id=share_id,
++        )
++
+     def external_instance_event(self, ctxt, instances, events, host=None):
+         instance = instances[0]
+         cctxt = self.router.client(ctxt).prepare(
+diff --git a/nova/conf/ironic.py b/nova/conf/ironic.py
+index dc5d241..90b6d9d 100644
+--- a/nova/conf/ironic.py
++++ b/nova/conf/ironic.py
+@@ -89,6 +89,16 @@ Related options:
+              'Nodes matching the partition_key value will be distributed '
+              'between all services specified here. '
+              'If partition_key is unset, this option is ignored.'),
++    cfg.BoolOpt(
++        'volume_use_multipath',
++        default=False,
++        help='Use multipath connection of the iSCSI volume.'),
++    cfg.StrOpt(
++        'manila_access_to',
++        default=None,
++        mutable=True,
++        max_length=255,
++        help='Configure the manila access network segment.'),
+ ]
+ 
+ 
+diff --git a/nova/db/api.py b/nova/db/api.py
+index c65803b..c03b81f 100644
+--- a/nova/db/api.py
++++ b/nova/db/api.py
+@@ -1890,3 +1890,43 @@ def console_auth_token_destroy_expired_by_host(context, host):
+     tokens associated with the given host.
+     """
+     return IMPL.console_auth_token_destroy_expired_by_host(context, host)
++
++
++
++####################
++
++
++def share_mapping_get_all(context):
++    """Get all share_mapping."""
++    return IMPL.share_mapping_get_all(context)
++
++
++def share_mapping_get_by_share_id(context, share_id):
++    """Get share_mapping records for a specific share."""
++    return IMPL.share_mapping_get_by_share_id(context, share_id)
++
++
++def share_mapping_get_by_instance_uuid(context, instance_uuid):
++    """Get share_mapping records for a specific instance."""
++    return IMPL.share_mapping_get_by_instance_uuid(context, instance_uuid)
++
++
++def share_mapping_get_by_instance_uuid_and_share_id(
++        context, instance_uuid, share_id):
++    """Get share_mapping record for a specific instance and share_id."""
++    return IMPL.share_mapping_get_by_instance_uuid_and_share_id(context, instance_uuid, share_id)
++
++
++def share_mapping_delete_by_instance_uuid_and_share_id(
++        context, instance_uuid, share_id):
++    """Delete share_mapping record for a specific instance and share_id."""
++    return IMPL.share_mapping_delete_by_instance_uuid_and_share_id(context, instance_uuid, share_id)
++
++
++def share_mapping_update(
++    context, uuid, instance_uuid, share_id, status, tag, export_location,
++    share_proto, extra,
++):
++    return IMPL.share_mapping_update(context, uuid, instance_uuid, share_id,
++                                     status, tag, export_location, share_proto,
++                                     extra)
+\ No newline at end of file
+diff --git a/nova/db/sqlalchemy/api.py b/nova/db/sqlalchemy/api.py
+index d86b253..7ccd3d6 100644
+--- a/nova/db/sqlalchemy/api.py
++++ b/nova/db/sqlalchemy/api.py
+@@ -5940,3 +5940,83 @@ def console_auth_token_destroy_expired_by_host(context, host):
+         filter_by(host=host).\
+         filter(models.ConsoleAuthToken.expires <= timeutils.utcnow_ts()).\
+         delete()
++
++
++####################
++
++
++@require_context
++@pick_context_manager_reader
++def share_mapping_get_all(context):
++    """Get all share_mapping."""
++    return context.session.query(models.ShareMapping).all()
++
++
++@require_context
++@pick_context_manager_reader
++def share_mapping_get_by_share_id(context, share_id):
++    """Get share_mapping records for a specific share."""
++    return context.session.query(models.ShareMapping).\
++    filter_by(share_id=share_id).all()
++
++
++@require_context
++@pick_context_manager_reader
++def share_mapping_get_by_instance_uuid(context, instance_uuid):
++    """Get share_mapping records for a specific instance."""
++    return context.session.query(models.ShareMapping).\
++    filter_by(instance_uuid=instance_uuid).all()
++
++
++@require_context
++@pick_context_manager_reader
++def share_mapping_get_by_instance_uuid_and_share_id(
++        context, instance_uuid, share_id):
++    """Get share_mapping record for a specific instance and share_id."""
++    return context.session.query(models.ShareMapping).\
++    filter_by(instance_uuid=instance_uuid, share_id=share_id).first()
++
++
++@require_context
++@pick_context_manager_writer
++def share_mapping_delete_by_instance_uuid_and_share_id(
++        context, instance_uuid, share_id):
++    """Delete share_mapping record for a specific instance and share_id."""
++    context.session.query(models.ShareMapping).\
++    filter_by(instance_uuid=instance_uuid, share_id=share_id).delete()
++
++
++@require_context
++@pick_context_manager_writer
++def share_mapping_update(
++    context, uuid, instance_uuid, share_id, status, tag, export_location,
++    share_proto, extra
++):
++    """Update share_mapping for a share
++    Creates new record if needed.
++    """
++    share_mapping = share_mapping_get_by_instance_uuid_and_share_id(
++            context, instance_uuid, share_id)
++
++    if share_mapping:
++        share_mapping.status = status
++        share_mapping.tag = tag
++        share_mapping.export_location = export_location
++        share_mapping.share_proto = share_proto
++        share_mapping.extra = extra
++        share_mapping.save(context.session)
++        context.session.refresh(share_mapping)
++
++    else:
++        share_mapping = models.ShareMapping()
++        share_mapping.uuid = uuid
++        share_mapping.instance_uuid = instance_uuid
++        share_mapping.share_id = share_id
++        share_mapping.status = status
++        share_mapping.tag = tag
++        share_mapping.export_location = export_location
++        share_mapping.share_proto = share_proto
++        share_mapping.extra = extra
++        share_mapping.save(context.session)
++
++    return share_mapping
+diff --git a/nova/db/sqlalchemy/migrate_repo/versions/403_add_share_mapping.py b/nova/db/sqlalchemy/migrate_repo/versions/403_add_share_mapping.py
+new file mode 100644
+index 0000000..16512ad
+--- /dev/null
++++ b/nova/db/sqlalchemy/migrate_repo/versions/403_add_share_mapping.py
+@@ -0,0 +1,60 @@
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++from migrate import UniqueConstraint
++from sqlalchemy import Column
++from sqlalchemy import DateTime
++from sqlalchemy import ForeignKey
++from sqlalchemy import Index
++from sqlalchemy import Integer
++from sqlalchemy import MetaData
++from sqlalchemy import String
++from sqlalchemy import Table
++from sqlalchemy import Text
++
++def upgrade(migrate_engine):
++    meta = MetaData()
++    meta.bind = migrate_engine
++    instances = Table('instances', meta, autoload=True)
++    share_mapping = Table('share_mapping', meta,
++        Column("created_at", DateTime),
++        Column("updated_at", DateTime),
++        Column('id', Integer, primary_key=True, nullable=False),
++        Column("uuid", String(36)),
++        Column(
++            "instance_uuid",
++            String(length=36),
++            ForeignKey(
++                instances.c.uuid, name="share_mapping_instance_uuid_fkey"
++            ),
++        ),
++        Column("share_id", String(length=36)),
++        Column("status", String(length=32)),
++        Column("tag", String(48)),
++        Column("export_location", Text),
++        Column("share_proto", String(32)),
++        Column('extra', Text, nullable=True),
++        UniqueConstraint(
++            "instance_uuid",
++            "share_id",
++            name="uniq_key_pairs0instance_uuid0share_id",
++        ),
++        Index("share_idx", "share_id"),
++        Index(
++            "share_mapping_instance_uuid_share_id_idx",
++            "instance_uuid",
++            "share_id",
++        ),
++        mysql_engine="InnoDB",
++        mysql_charset="utf8",
++    )
++    share_mapping.create(checkfirst=True)
+diff --git a/nova/db/sqlalchemy/models.py b/nova/db/sqlalchemy/models.py
+index 027a04f..64d3fc8 100644
+--- a/nova/db/sqlalchemy/models.py
++++ b/nova/db/sqlalchemy/models.py
+@@ -647,6 +647,36 @@ class BlockDeviceMapping(BASE, NovaBase, models.SoftDeleteMixin):
+     attachment_id = Column(String(36))
+ 
+ 
++class ShareMapping(BASE, NovaBase):
++    """Represents share / instance mapping."""
++    __tablename__ = "share_mapping"
++    __table_args__ = (
++        Index('share_idx', 'share_id'),
++        Index('share_mapping_instance_uuid_share_id_idx',
++              'instance_uuid', 'share_id'),
++        schema.UniqueConstraint(
++            "instance_uuid",
++            "share_id",
++            name="uniq_key_pairs0instance_uuid0share_id",
++        ),
++    )
++    id = Column(Integer, primary_key=True, nullable=False)
++    uuid = Column(String(36))
++    instance_uuid = Column(String(36), ForeignKey('instances.uuid'))
++    instance = orm.relationship(
++        "Instance",
++        foreign_keys=instance_uuid,
++        primaryjoin='and_(ShareMapping.instance_uuid == Instance.uuid,'
++                    'Instance.deleted == 0)'
++    )
++    share_id = Column(String(36))
++    status = Column(String(32))
++    tag = Column(String(48))
++    export_location = Column(Text)
++    share_proto = Column(String(32))
++    extra = Column(Text)
++
++
+ class SecurityGroupInstanceAssociation(BASE, NovaBase, models.SoftDeleteMixin):
+     __tablename__ = 'security_group_instance_association'
+     __table_args__ = (
+diff --git a/nova/exception.py b/nova/exception.py
+index d178034..416325c 100644
+--- a/nova/exception.py
++++ b/nova/exception.py
+@@ -148,6 +148,10 @@ class CinderConnectionFailed(NovaException):
+     msg_fmt = _("Connection to cinder host failed: %(reason)s")
+ 
+ 
++class ManilaConnectionFailed(NovaException):
++    msg_fmt = _("Connection to manila service failed: %(reason)s")
++
++
+ class UnsupportedCinderAPIVersion(NovaException):
+     msg_fmt = _('Nova does not support Cinder API version %(version)s')
+ 
+@@ -164,6 +168,19 @@ class Forbidden(NovaException):
+     code = 403
+ 
+ 
++class ForbiddenSharesNotSupported(NotSupported):
++    msg_fmt = _("Feature not supported until computes have not been updated.")
++
++
++class ForbiddenSharesNotConfiguredCorrectly(NotSupported):
++    msg_fmt = _("Feature not supported because either compute or instance "
++                "are not configured correctly.")
++
++
++class ForbiddenWithShare(NotSupported):
++    msg_fmt = _("Feature not supported with instances that have shares. ")
++
++
+ class AdminRequired(Forbidden):
+     msg_fmt = _("User does not have admin privileges")
+ 
+@@ -277,6 +294,11 @@ class VolumeDetachFailed(Invalid):
+                 "Reason: %(reason)s")
+ 
+ 
++class VolumeExtendFailed(Invalid):
++    msg_fmt = _("Volume %(volume_id)s could not be extended. "
++                "Reason: %(reason)s")
++
++
+ class MultiattachNotSupportedByVirtDriver(NovaException):
+     # This exception indicates the compute hosting the instance does not
+     # support multiattach volumes. This should generally be considered a
+@@ -656,6 +678,86 @@ class AgentBuildExists(NovaException):
+                 "architecture %(architecture)s exists.")
+ 
+ 
++class ShareNotFound(NotFound):
++    msg_fmt = _("Share %(share_id)s could not be found.")
++
++
++class ShareMappingAlreadyExists(NotFound):
++    msg_fmt = _("Share %(share_id)s already associated to this server.")
++
++
++class ShareProtocolUnknown(NotFound):
++    msg_fmt = _("Share protocol %(share_proto)s is unknown.")
++
++
++class ShareError(NovaException):
++    msg_fmt = _("Share %(share_id)s used by instance %(instance_uuid)s "
++                "is in error state.")
++
++
++class ShareErrorUnexpectedStatus(NovaException):
++    msg_fmt = _("Share %(share_id)s used by instance %(instance_uuid)s "
++                "is in an unexpected state.")
++
++
++class ShareDetachError(NovaException):
++    msg_fmt = _("Share id %(share_id)s detach error "
++                "from server %(server_id)s.\n"
++                "Reason: %(reason)s.")
++
++
++class ShareAttachError(NovaException):
++    msg_fmt = _("Share id %(share_id)s attach error "
++                "from server %(server_id)s.\n"
++                "Reason: %(reason)s.")
++
++
++class ShareAccessNotFound(NotFound):
++    msg_fmt = _("Share access from Manila could not be found for "
++                "share id %(share_id)s.")
++
++
++class ShareAccessGrantError(NovaException):
++    msg_fmt = _("Share access could not be granted to "
++                "share id %(share_id)s.\n"
++                "Reason: %(reason)s.")
++
++
++class ShareAccessRemovalError(NovaException):
++    msg_fmt = _("Share access could not be removed from "
++                "share id %(share_id)s.\n"
++                "Reason: %(reason)s.")
++
++
++class ShareLockNotFound(NovaException):
++    msg_fmt = _("Share lock can not be found for "
++                "share id %(share_id)s.\n")
++
++
++class ShareLockError(NovaException):
++    msg_fmt = _("Share lock can not be acquired from "
++                "share id %(share_id)s.\n"
++                "Reason: %(reason)s.")
++
++
++class ShareLockAlreadyExists(NovaException):
++    msg_fmt = _("Share lock can not be acquired from "
++                "share id %(share_id)s.\n"
++                "Reason: lock already exists.")
++
++
++class ShareUnlockError(NovaException):
++    msg_fmt = _("Share can not be unlocked from "
++                "share id %(share_id)s.\n"
++                "Reason: %(reason)s.")
++
++
++class ShareProtocolNotSupported(NovaException):
++    msg_fmt = _("Share protocol not supported "
++                "share id %(share_id)s.\n"
++                "protocol: %(protocol)s.")
++
++
+ class VolumeAttachmentNotFound(NotFound):
+     msg_fmt = _("Volume attachment %(attachment_id)s could not be found.")
+ 
+diff --git a/nova/objects/__init__.py b/nova/objects/__init__.py
+index 621c2d2..e118a59 100644
+--- a/nova/objects/__init__.py
++++ b/nova/objects/__init__.py
+@@ -63,6 +63,7 @@ def register_all():
+     __import__('nova.objects.pci_device')
+     __import__('nova.objects.pci_device_pool')
+     __import__('nova.objects.request_spec')
++    __import__('nova.objects.share_mapping')
+     __import__('nova.objects.tag')
+     __import__('nova.objects.quotas')
+     __import__('nova.objects.resource')
+diff --git a/nova/objects/fields.py b/nova/objects/fields.py
+index 366a970..ff331a2 100644
+--- a/nova/objects/fields.py
++++ b/nova/objects/fields.py
+@@ -486,6 +486,27 @@ class RNGModel(BaseNovaEnum):
+     ALL = (VIRTIO,)
+ 
+ 
++class ShareMappingStatus(BaseNovaEnum):
++    """Represents the possible status of a share mapping"""
++
++    ATTACHING = "attaching"
++    DETACHING = "detaching"
++    ACTIVE = "active"
++    INACTIVE = "inactive"
++    ERROR = "error"
++
++    ALL = (ATTACHING, DETACHING, ACTIVE, INACTIVE, ERROR)
++
++
++class ShareMappingProto(BaseNovaEnum):
++    """Represents the possible protocol used by a share mapping"""
++
++    NFS = "NFS"
++    CEPHFS = "CEPHFS"
++
++    ALL = (NFS, CEPHFS)
++
++
+ class SCSIModel(BaseNovaEnum):
+ 
+     BUSLOGIC = "buslogic"
+@@ -831,6 +852,8 @@ class NotificationAction(BaseNovaEnum):
+     RESCUE = 'rescue'
+     VOLUME_ATTACH = 'volume_attach'
+     VOLUME_DETACH = 'volume_detach'
++    SHARE_ATTACH = 'share_attach'
++    SHARE_DETACH = 'share_detach'
+     CREATE = 'create'
+     IMPORT = 'import'
+     EVACUATE = 'evacuate'
+@@ -870,7 +893,7 @@ class NotificationAction(BaseNovaEnum):
+     ALL = (UPDATE, EXCEPTION, DELETE, PAUSE, UNPAUSE, RESIZE, VOLUME_SWAP,
+            SUSPEND, POWER_ON, REBOOT, SHUTDOWN, SNAPSHOT, INTERFACE_ATTACH,
+            POWER_OFF, SHELVE, RESUME, RESTORE, EXISTS, RESCUE, VOLUME_ATTACH,
+-           VOLUME_DETACH, CREATE, IMPORT, EVACUATE, RESIZE_FINISH,
++           VOLUME_DETACH, SHARE_ATTACH, SHARE_DETACH, CREATE, IMPORT, EVACUATE, RESIZE_FINISH,
+            LIVE_MIGRATION_ABORT, LIVE_MIGRATION_POST_DEST, LIVE_MIGRATION_POST,
+            LIVE_MIGRATION_PRE, LIVE_MIGRATION_ROLLBACK,
+            LIVE_MIGRATION_ROLLBACK_DEST, REBUILD, INTERFACE_DETACH,
+@@ -1196,6 +1219,14 @@ class RNGModelField(BaseEnumField):
+     AUTO_TYPE = RNGModel()
+ 
+ 
++class ShareMappingStatusField(BaseEnumField):
++    AUTO_TYPE = ShareMappingStatus()
++
++
++class ShareMappingProtoField(BaseEnumField):
++    AUTO_TYPE = ShareMappingProto()
++
++
+ class SCSIModelField(BaseEnumField):
+     AUTO_TYPE = SCSIModel()
+ 
+diff --git a/nova/objects/share_mapping.py b/nova/objects/share_mapping.py
+new file mode 100644
+index 0000000..cef083f
+--- /dev/null
++++ b/nova/objects/share_mapping.py
+@@ -0,0 +1,189 @@
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++import logging
++
++from oslo_utils import versionutils
++
++import nova.conf
++
++from nova.db import api as db
++from nova import exception
++from nova.objects import base
++from nova.objects import fields
++
++CONF = nova.conf.CONF
++LOG = logging.getLogger(__name__)
++
++EPHEMERAL_FIELDS = [
++    "access_type",
++    "access_to",
++    "access_key",
++]
++
++@base.NovaObjectRegistry.register
++class ShareMapping(base.NovaTimestampObject, base.NovaObject):
++    VERSION = '1.2'
++
++    fields = {
++        'id': fields.IntegerField(read_only=True),
++        'uuid': fields.UUIDField(nullable=False),
++        'instance_uuid': fields.UUIDField(nullable=False),
++        'share_id': fields.UUIDField(nullable=False),
++        'status': fields.ShareMappingStatusField(),
++        'tag': fields.StringField(nullable=False),
++        'export_location': fields.StringField(nullable=False),
++        'share_proto': fields.ShareMappingProtoField(),
++        'extra': fields.StringField(nullable=True),
++
++        'access_type': fields.StringField(nullable=True),
++        'access_to': fields.StringField(nullable=True),
++        'access_key': fields.StringField(nullable=True),
++    }
++
++    def __init__(self, *args, **kwargs):
++        super(ShareMapping, self).__init__(*args, **kwargs)
++        self.status = fields.ShareMappingStatus.ERROR
++        self.tag = 'None'
++        self.export_location = ""
++        self.share_proto = fields.ShareMappingProto.NFS
++        self.extra = ""
++
++    def obj_make_compatible(self, primitive, target_version):
++        super(ShareMapping, self).obj_make_compatible(
++            primitive, target_version
++        )
++        target_version = versionutils.convert_version_to_tuple(target_version)
++        if target_version < (1, 1):
++            status = primitive.get('status')
++            if status in (
++                fields.ShareMappingStatus.ATTACHING,
++                fields.ShareMappingStatus.DETACHING,
++            ):
++                raise exception.ObjectActionError(
++                    action='obj_make_compatible',
++                    reason='status=%s not supported in version %s' % (
++                        status, target_version))
++
++    @staticmethod
++    def _from_db_object(context, share_mapping, db_share_mapping):
++        for field in share_mapping.fields:
++            if field not in EPHEMERAL_FIELDS:
++                setattr(share_mapping, field, db_share_mapping[field])
++        share_mapping._context = context
++        share_mapping.obj_reset_changes()
++        return share_mapping
++
++    @base.remotable
++    def save(self):
++        db_share_mapping = db.share_mapping_update(
++            self._context, self.uuid, self.instance_uuid, self.share_id,
++            self.status, self.tag, self.export_location, self.share_proto,
++            self.extra)
++        self._from_db_object(self._context, self, db_share_mapping)
++
++    def create(self):
++        LOG.info("Attaching share '%s' to instance '%s'.", self.share_id,
++                 self.instance_uuid)
++        self.save()
++
++    @base.remotable
++    def delete(self):
++        LOG.info(
++            "Detaching share '%s' from instance '%s'.",
++            self.share_id,
++            self.instance_uuid,
++        )
++        db.share_mapping_delete_by_instance_uuid_and_share_id(
++            self._context, self.instance_uuid, self.share_id
++        )
++
++    def activate(self):
++        LOG.info(
++            "Share '%s' about to be activated on instance '%s'.",
++            self.share_id, self.instance_uuid)
++
++        self.status = fields.ShareMappingStatus.ACTIVE
++        self.save()
++
++    def deactivate(self):
++        LOG.info(
++            "Share '%s' about to be deactivated on instance '%s'.",
++            self.share_id,
++            self.instance_uuid,
++        )
++        self.status = fields.ShareMappingStatus.INACTIVE
++        self.save()
++
++    @base.remotable_classmethod
++    def get_by_instance_uuid_and_share_id(
++            cls, context, instance_uuid, share_id):
++        share_mapping = ShareMapping(context)
++        db_share_mapping = db.share_mapping_get_by_instance_uuid_and_share_id(
++            context, instance_uuid, share_id)
++        if not db_share_mapping:
++            raise exception.ShareNotFound(share_id=share_id)
++        return ShareMapping._from_db_object(
++                context,
++                share_mapping,
++                db_share_mapping)
++
++    def get_share_host_provider(self):
++        if not self.export_location:
++            return None
++        if self.share_proto == 'NFS':
++            rhost, _ = self.export_location.strip().split(':')
++        else:
++            raise NotImplementedError()
++        return rhost
++
++    def set_access_according_to_protocol(self, ip=None):
++        if self.share_proto == fields.ShareMappingProto.NFS:
++            self.access_type = 'ip'
++            self.access_to = ip
++        elif self.share_proto == fields.ShareMappingProto.CEPHFS:
++            self.access_type = 'cephx'
++            self.access_to = 'nova'
++        else:
++            raise exception.ShareProtocolNotSupported(
++                share_proto=self.share_proto
++            )
++
++
++@base.NovaObjectRegistry.register
++class ShareMappingList(base.ObjectListBase, base.NovaObject):
++    VERSION = '1.0'
++    fields = {
++        'objects': fields.ListOfObjectsField('ShareMapping'),
++    }
++
++    @base.remotable_classmethod
++    def get_by_instance_uuid(cls, context, instance_uuid):
++        db_share_mappings = db.share_mapping_get_by_instance_uuid(
++            context, instance_uuid)
++        return base.obj_make_list(
++            context, cls(context), ShareMapping, db_share_mappings)
++
++    @base.remotable_classmethod
++    def get_by_share_id(cls, context, share_id):
++        db_share_mappings = db.share_mapping_get_by_share_id(
++            context, share_id)
++        return base.obj_make_list(
++            context, cls(context), ShareMapping, db_share_mappings)
++
++    def activate_all(self):
++        for share in self:
++            share.activate()
++
++    def deactivate_all(self):
++        for share in self:
++            share.deactivate()
+\ No newline at end of file
+diff --git a/nova/policies/__init__.py b/nova/policies/__init__.py
+index d82ad6d..a4837b4 100644
+--- a/nova/policies/__init__.py
++++ b/nova/policies/__init__.py
+@@ -60,6 +60,7 @@ from nova.policies import server_external_events
+ from nova.policies import server_groups
+ from nova.policies import server_metadata
+ from nova.policies import server_password
++from nova.policies import server_shares
+ from nova.policies import server_tags
+ from nova.policies import server_topology
+ from nova.policies import servers
+@@ -123,6 +124,7 @@ def list_rules():
+         server_groups.list_rules(),
+         server_metadata.list_rules(),
+         server_password.list_rules(),
++        server_shares.list_rules(),
+         server_tags.list_rules(),
+         server_topology.list_rules(),
+         servers.list_rules(),
+diff --git a/nova/policies/server_shares.py b/nova/policies/server_shares.py
+new file mode 100644
+index 0000000..3eec4df
+--- /dev/null
++++ b/nova/policies/server_shares.py
+@@ -0,0 +1,69 @@
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++from oslo_policy import policy
++
++from nova.policies import base
++
++
++POLICY_ROOT = 'os_compute_api:os-server-shares:%s'
++
++
++server_shares_policies = [
++    policy.DocumentedRuleDefault(
++        name=POLICY_ROOT % 'index',
++        check_str=base.RULE_ADMIN_OR_OWNER,
++        description="List all shares for given server",
++        operations=[
++            {
++                'method': 'GET',
++                'path': '/servers/{server_id}/shares'
++            }
++        ],
++        scope_types=['project']),
++    policy.DocumentedRuleDefault(
++        name=POLICY_ROOT % 'create',
++        check_str=base.RULE_ADMIN_OR_OWNER,
++        description="Attach a share to the specified server",
++        operations=[
++            {
++                'method': 'POST',
++                'path': '/servers/{server_id}/shares'
++            }
++        ],
++        scope_types=['project']),
++    policy.DocumentedRuleDefault(
++        name=POLICY_ROOT % 'show',
++        check_str=base.RULE_ADMIN_OR_OWNER,
++        description="Show a share configured for the specified server",
++        operations=[
++            {
++                'method': 'GET',
++                'path': '/servers/{server_id}/shares/{share_id}'
++            }
++        ],
++        scope_types=['project']),
++    policy.DocumentedRuleDefault(
++        name=POLICY_ROOT % 'delete',
++        check_str=base.RULE_ADMIN_OR_OWNER,
++        description="Detach a share to the specified server",
++        operations=[
++            {
++                'method': 'DELETE',
++                'path': '/servers/{server_id}/shares/{share_id}'
++            }
++        ],
++        scope_types=['project']),
++]
++
++def list_rules():
++    return server_shares_policies
+\ No newline at end of file
+diff --git a/nova/share/manila.py b/nova/share/manila.py
+new file mode 100644
+index 0000000..dc4fef3
+--- /dev/null
++++ b/nova/share/manila.py
+@@ -0,0 +1,334 @@
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++from dataclasses import dataclass
++import functools
++import json
++import requests
++from typing import Optional
++
++from openstack import exceptions as sdk_exc
++from oslo_log import log as logging
++
++import nova.conf
++from nova import exception
++from nova import utils
++
++from nova.share import manila_api
++
++CONF = nova.conf.CONF
++LOG = logging.getLogger(__name__)
++
++@dataclass(frozen=True)
++class Share():
++    id: str
++    size: int
++    availability_zone: Optional[str]
++    created_at: str
++    status: str
++    name: Optional[str]
++    description: Optional[str]
++    project_id: str
++    snapshot_id: Optional[str]
++    share_network_id: Optional[str]
++    share_proto: str
++    export_location: str
++    metadata: dict
++    share_type: Optional[str]
++    is_public: bool
++
++    @classmethod
++    def from_manila_share(cls, manila_share, export_location):
++        return cls(
++            id=manila_share.id,
++            size=manila_share.size,
++            availability_zone=manila_share.availability_zone,
++            created_at=manila_share.created_at,
++            status=manila_share.status,
++            name=manila_share.name,
++            description=manila_share.description,
++            project_id=manila_share.project_id,
++            snapshot_id=manila_share.snapshot_id,
++            share_network_id=manila_share.share_network_id,
++            share_proto=manila_share.share_protocol,
++            export_location=export_location,
++            metadata=manila_share.metadata,
++            share_type=manila_share.share_type,
++            is_public=manila_share.is_public,
++        )
++
++    @classmethod
++    def from_dict(cls, manila_share, export_location):
++        return cls(
++            id=manila_share['id'],
++            size=manila_share['size'],
++            availability_zone=manila_share['availability_zone'],
++            created_at=manila_share['created_at'],
++            status=manila_share['status'],
++            name=manila_share['name'],
++            description=manila_share['description'],
++            project_id=manila_share['project_id'],
++            snapshot_id=manila_share['snapshot_id'],
++            share_network_id=manila_share['share_network_id'],
++            share_proto=manila_share['share_proto'],
++            export_location=export_location,
++            metadata=manila_share['metadata'],
++            share_type=manila_share['share_type'],
++            is_public=manila_share['is_public'],
++        )
++
++@dataclass(frozen=True)
++class Access():
++    id: str
++    access_level: str
++    state: str
++    access_type: str
++    access_to: str
++    access_key: Optional[str]
++
++    @classmethod
++    def from_manila_access(cls, manila_access):
++        return cls(
++            id=manila_access.id,
++            access_level=manila_access.access_level,
++            state=manila_access.state,
++            access_type=manila_access.access_type,
++            access_to=manila_access.access_to,
++            access_key=getattr(manila_access, 'access_key', None)
++        )
++
++    @classmethod
++    def from_dict(cls, manila_access):
++        return cls(
++            id=manila_access['id'],
++            access_level=manila_access['access_level'],
++            state=manila_access['state'],
++            access_type=manila_access['access_type'],
++            access_to=manila_access['access_to'],
++            access_key=manila_access['access_key'],
++        )
++
++
++class Lock():
++    def __init__(self, manila_lock):
++        self.id = manila_lock.id
++        self.project_id = manila_lock.project_id
++        self.resource_type = manila_lock.resource_type
++        self.resource_id = manila_lock.resource_id
++        self.resource_action = manila_lock.resource_action
++        self.lock_reason = manila_lock.lock_reason
++
++
++def from_manila_lock(manila_lock):
++    return Lock(manila_lock)
++
++
++def translate_sdk_exception(method):
++    @functools.wraps(method)
++    def wrapper(self, *args, **kwargs):
++        try:
++            res = method(self, *args, **kwargs)
++        except (exception.ServiceUnavailable,
++                exception.ConfGroupForServiceTypeNotFound) as exc:
++            raise exception.ManilaConnectionFailed(reason=str(exc)) from exc
++        except (sdk_exc.BadRequestException) as exc:
++            raise exception.InvalidInput(reason=str(exc)) from exc
++        except (sdk_exc.ForbiddenException) as exc:
++            raise exception.Forbidden(str(exc)) from exc
++        return res
++    return wrapper
++
++
++def translate_share_exception(method):
++
++    def wrapper(self, *args, **kwargs):
++        try:
++            res = method(self, *args, **kwargs)
++        except (sdk_exc.ResourceNotFound) as exc:
++            raise exception.ShareNotFound(
++                share_id=args[1], reason=exc) from exc
++        except (sdk_exc.BadRequestException) as exc:
++            raise exception.ShareNotFound(
++                share_id=args[1], reason=exc) from exc
++        return res
++    return translate_sdk_exception(wrapper)
++
++
++def translate_allow_exception(method):
++
++    def wrapper(self, *args, **kwargs):
++        try:
++            res = method(self, *args, **kwargs)
++        except (sdk_exc.BadRequestException) as exc:
++            raise exception.ShareAccessGrantError(
++                share_id=args[1], reason=exc) from exc
++        except (sdk_exc.ResourceNotFound) as exc:
++            raise exception.ShareNotFound(
++                share_id=args[1], reason=exc) from exc
++        return res
++    return translate_sdk_exception(wrapper)
++
++
++def translate_deny_exception(method):
++
++    def wrapper(self, *args, **kwargs):
++        try:
++            res = method(self, *args, **kwargs)
++        except (sdk_exc.BadRequestException) as exc:
++            raise exception.ShareAccessRemovalError(
++                share_id=args[1], reason=exc) from exc
++        except (sdk_exc.ResourceNotFound) as exc:
++            raise exception.ShareNotFound(
++                share_id=args[1], reason=exc) from exc
++        return res
++    return translate_sdk_exception(wrapper)
++
++
++class API(object):
++    def __init__(self):
++        self.client = manila_api.APIClient("http://127.0.0.1:8786/")
++
++    @translate_share_exception
++    def get(self, context, share_id):
++        def filter_export_locations(export_locations):
++            paths = []
++            for export_location in export_locations:
++                if export_location.get('preferred'):
++                    return export_location['path']
++                else:
++                    paths.append(export_location['path'])
++            return paths[0]
++
++        LOG.debug("Get share id:'%s' data from manila", share_id)
++        response = self.client.manila_get_share(share_id)
++        LOG.debug('manila_get_share response: %(response)s.',
++                 {'response': response})
++        if response.status_code != requests.codes.OK:
++            LOG.error("manila_get_share error share_id: %s, status_code: %s",
++                      share_id, response.status_code)
++            return None
++        if response.content:
++            data = json.loads(response.content)
++            LOG.debug('share: %s', data)
++            share = data.get('share')
++        else:
++            LOG.error('attach_volume response content none')
++            return None
++
++        response = self.client.manila_export_locations(share_id)
++        if response.status_code != requests.codes.OK:
++            LOG.error("manila_export_locations error share_id: %s, status_code: %s",
++                      share_id, response.status_code)
++            return None
++        if response.content:
++            data = json.loads(response.content)
++            LOG.debug('export_locations: %s', data)
++            export_locations = data.get('export_locations')
++        else:
++            LOG.error('attach_volume response content none')
++            return None
++
++        export_location = filter_export_locations(export_locations)
++
++        return Share.from_dict(share, export_location)
++
++    @translate_share_exception
++    def get_access(self, context, share_id, access_type, access_to):
++        LOG.debug("Get share access id for share id: %s, access_type: %s, "
++                  "access_to: %s", share_id, access_type, access_to)
++        response = self.client.manila_list_access(share_id)
++        if response.status_code != requests.codes.OK:
++            LOG.error("manila_list_access error share_id: %s, status_code: %s",
++                      share_id, response.status_code)
++            return None
++
++        if response.content:
++            access_list = json.loads(response.content).get("access_list", [])
++            LOG.debug('access_list: %s', access_list)
++        else:
++            LOG.error("manila_list_access content None share_id: %s", share_id)
++            return None
++
++        for access in access_list:
++            if (access.get('access_type') == access_type and
++                access.get('access_to') == access_to
++            ):
++                return Access.from_dict(access)
++
++        LOG.warning("No matching share access found. share_id: %s", share_id)
++        return None
++
++    @translate_allow_exception
++    def allow(self, context, share_id, access_type, access_to, access_level):
++        def check_manila_access_response(access):
++            if not (
++                isinstance(access, Access) and
++                access.access_type == access_type and
++                access.access_to == access_to and
++                access.access_level == access_level
++            ):
++                raise exception.ShareAccessGrantError(share_id=share_id)
++
++        LOG.debug("Allow host access to share id:'%s'", share_id)
++
++        data = {
++            "allow_access": {
++                "access_level": access_level,
++                "access_type": access_type,
++                "access_to": access_to,
++                "lock_visibility": True,
++                "lock_deletion": True,
++                "lock_reason": "Locked by nova"
++            }
++        }
++        response = self.client.manila_allow_access(share_id, data)
++        if response.status_code != 202 and response.status_code != 200:
++            LOG.error("manila_allow_access error share_id: %s, status_code: %s",
++                      share_id, response.status_code)
++            raise exception.ShareAccessGrantError(share_id=share_id)
++
++        if response.content:
++            access = json.loads(response.content).get("access")
++            LOG.debug('access_list: %s', access)
++        else:
++            LOG.error("manila_allow_access content None share_id: %s", share_id)
++            raise exception.ShareAccessGrantError(share_id=share_id)
++
++        access = Access.from_dict(access)
++        check_manila_access_response(access)
++        return access
++
++    @translate_deny_exception
++    def deny(self, context, share_id, access_type, access_to):
++        access = self.get_access(context, share_id, access_type, access_to)
++        if access:
++            LOG.debug("Deny host access to share id:'%s'", share_id)
++            data = {
++                "deny_access": {
++                    "access_id": access.id,
++                    "unrestrict": True
++                }
++            }
++            response = self.client.manila_deny_access(share_id, data)
++            if response.status_code != 202 and response.status_code != 200:
++                LOG.error(
++                    "manila_deny_access error share_id: %s, status_code: %s",
++                    share_id, response.status_code)
++                raise exception.ShareAccessRemovalError(
++                    share_id=share_id, reason=response.reason
++                )
++        else:
++            raise exception.ShareAccessNotFound(share_id=share_id)
++
++    def has_access(self, context, share_id, access_type, access_to):
++        access = self.get_access(context, share_id, access_type, access_to)
++        return access is not None and access.state == 'active'
+\ No newline at end of file
+diff --git a/nova/share/manila_api.py b/nova/share/manila_api.py
+new file mode 100644
+index 0000000..6715b3b
+--- /dev/null
++++ b/nova/share/manila_api.py
+@@ -0,0 +1,212 @@
++# Copyright 2023 Huawei Technology corp.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License. 
++# You may obtain a copy of the License at
++#
++#   http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import json
++import requests
++import time
++
++from oslo_config import cfg
++from oslo_log import log as logging
++
++CONF = cfg.CONF
++LOG = logging.getLogger(__name__)
++
++class APIClient(object):
++    def __init__(self, api_url):
++        self.api_url = api_url.rstrip('/')
++        self.api_version = "v2"
++
++        adapter = requests.adapters.HTTPAdapter(pool_connections=2,
++                                                pool_maxsize=2)
++        self.session = requests.Session()
++        self.session.mount(self.api_url, adapter)
++
++        self.encoder = json.JSONEncoder()
++
++        self.token_update_time = 0
++        self.token = ''
++        self._init_auth_conf()
++        self.project_id = None
++
++    def _init_auth_conf(self):
++        if hasattr(CONF, 'keystone_authtoken'):
++            LOG.debug('APIClient no need to init auth_conf')
++            return
++        group = cfg.OptGroup('keystone_authtoken')
++        opts = [
++            cfg.StrOpt('username', default=''),
++            cfg.StrOpt('project_domain_name', default=''),
++            cfg.StrOpt('user_domain_name', default=''),
++            cfg.StrOpt('project_name', default=''),
++            cfg.StrOpt('password', default=''),
++            cfg.StrOpt('auth_url', default=''),
++        ]
++        try:
++            CONF.register_group(group)
++            CONF.register_opts(opts, group=group)
++            CONF(default_config_files=['/etc/nova/nova.conf'])
++        except cfg.DuplicateOptError:
++            LOG.warning('cfg DuplicateOptError')
++
++    def _get_token(self):
++        ka = CONF.keystone_authtoken
++        username = ka.username.lower()
++        project_domain_name = ka.project_domain_name.lower()
++        user_domain_name = ka.user_domain_name.lower()
++        project_name = ka.project_name.lower()
++        password = ka.password
++        self.auth_data = json.dumps({
++            "auth": {
++                "identity": {
++                    "methods": ["password"],
++                    "password": {
++                        "user": {
++                            "name": username,
++                            "domain": {"id": user_domain_name},
++                            "password": password
++                        }
++                    }
++                },
++                "scope": {
++                    "project": {
++                        "name": project_name,
++                        "domain": {"id": project_domain_name}
++                    }
++                }
++            }
++        })
++        self.auth_url = ka.auth_url + "/identity/v3/auth/tokens"
++
++        if self.token_update_time < time.time() - 5 * 60:
++            headers = {
++                'Content-Type': 'application/json',
++                'Accept': 'application/json',
++            }
++            response = self.session.request('POST',
++                                            self.auth_url,
++                                            headers=headers,
++                                            data=self.auth_data,
++                                            verify=None,
++                                            cert=None)
++            self.token_update_time = time.time()
++            self.token = response.headers['X-Subject-Token']
++            LOG.debug('get token success')
++
++        if self.project_id is None:
++            self._init_project_id(self.token)
++
++        return self.token
++
++    def _init_project_id(self, token):
++        ka = CONF.keystone_authtoken
++        project_name = ka.project_name.lower()
++        path = ka.auth_url + '/v3/projects?name={}'.format(project_name)
++
++        headers = {
++            'Content-Type': 'application/json',
++            'Accept': 'application/json',
++            'X-Auth-Token': token,
++        }
++        response = self.session.request('GET', path,
++                                        headers=headers,
++                                        verify=None,
++                                        cert=None)
++
++        projects = json.loads(response.content).get("projects", [{}])
++        project = projects[0]
++        project_id = project.get('id')
++        self.project_id = project_id
++        LOG.debug('manila api token project_id: %s ', project_id)
++
++    def _request(self, method, path, data=None, headers=None, **kwargs):
++        request_url = '{api_url}{path}'.format(api_url=self.api_url, path=path)
++
++        if data is not None:
++            data = self.encoder.encode(data)
++
++        headers = headers or {}
++        token = self._get_token()
++        headers.update({
++            'Content-Type': 'application/json',
++            'Accept': 'application/json',
++            'X-Auth-Token': token,
++            'X-Openstack-Manila-Api-Version': '2.51',
++        })
++
++        return self.session.request(method,
++                                    request_url,
++                                    headers=headers,
++                                    data=data,
++                                    verify=None,
++                                    cert=None,
++                                    **kwargs)
++
++    def manila_get_share(self, share_id):
++        self._get_token()
++        path = '/{}/{}/shares/{}'.format(self.api_version, self.project_id,
++                                         share_id)
++        try:
++            response = self._request('GET', path)
++        except Exception as err:
++            LOG.error('Unhandled error manila_get_share. Error: %s ', err)
++            raise
++
++        return response
++
++    def manila_export_locations(self, share_id):
++        self._get_token()
++        path = '/{}/{}/shares/{}/export_locations'.format(self.api_version,
++                                                          self.project_id,
++                                                          share_id)
++        try:
++            response = self._request('GET', path)
++        except Exception as err:
++            LOG.error('Unhandled error manila_export_locations. Error: %s ', err)
++            raise
++
++        return response
++
++    def manila_list_access(self, share_id):
++        self._get_token()
++        path = '/{}/{}/share-access-rules?share_id={}'.format(self.api_version, self.project_id, share_id)
++        try:
++            response = self._request('GET', path)
++        except Exception as err:
++            LOG.error('Unhandled error manila_list_access. Error: %s ',
++                      err)
++            raise
++
++        return response
++
++    def manila_allow_access(self, share_id, data):
++        self._get_token()
++        path = '/{}/{}/shares/{}/action'.format(self.api_version, self.project_id, share_id)
++        try:
++            response = self._request('POST', path, data=data)
++        except Exception as err:
++            LOG.error('Unhandled error manila_allow_access. Error: %s ', err)
++            raise
++
++        return response
++
++    def manila_deny_access(self, share_id, data):
++        self._get_token()
++        path = '/{}/{}/shares/{}/action'.format(self.api_version, self.project_id, share_id)
++        try:
++            response = self._request('POST', path, data=data)
++        except Exception as err:
++            LOG.error('Unhandled error manila_deny_access. Error: %s ', err)
++            raise
++
++        return response
+diff --git a/nova/virt/driver.py b/nova/virt/driver.py
+index 25c0ac9..d2599c5 100644
+--- a/nova/virt/driver.py
++++ b/nova/virt/driver.py
+@@ -171,6 +171,7 @@ class ComputeDriver(object):
+         "supports_multiattach": False,
+         "supports_trusted_certs": False,
+         "supports_pcpus": False,
++        "supports_virtio_fs": False,
+ 
+         # Image type support flags
+         "supports_image_type_aki": False,
+@@ -869,6 +870,15 @@ class ComputeDriver(object):
+         """
+         raise NotImplementedError()
+ 
++    def get_share_access_ip(self, context, instance):
++        raise NotImplementedError()
++
++    def attach_share(self, context, instance, share_mapping):
++        raise NotImplementedError()
++
++    def detach_share(self, context, instance, share_mapping):
++        raise NotImplementedError()
++
+     def power_update_event(self, instance, target_power_state):
+         """Update power, vm and task states of the specified instance.
+ 
+diff --git a/nova/virt/ironic/__init__.py b/nova/virt/ironic/__init__.py
+index e37d322..a6f3004 100644
+--- a/nova/virt/ironic/__init__.py
++++ b/nova/virt/ironic/__init__.py
+@@ -14,5 +14,7 @@
+ # under the License.
+ 
+ from nova.virt.ironic import driver
++from nova.virt.ironic import dpu_driver
+ 
+ IronicDriver = driver.IronicDriver
++DPUIronicDriver = dpu_driver.DPUIronicDriver
+diff --git a/nova/virt/ironic/dpu_api.py b/nova/virt/ironic/dpu_api.py
+new file mode 100644
+index 0000000..86a8feb
+--- /dev/null
++++ b/nova/virt/ironic/dpu_api.py
+@@ -0,0 +1,180 @@
++# Copyright 2023 Huawei Technology corp.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#   http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import json
++import requests
++import time
++
++from oslo_config import cfg
++from oslo_log import log as logging
++
++LOG = logging.getLogger(__name__)
++
++class APIClient(object):
++    def __init__(self, api_url):
++        self.api_url = api_url.rstrip('/')
++        self.api_version = "v2.1"
++
++        # Only keep alive a maximum of 2 connections to the API. More will be
++        # opened if they are needed, but they will be closed immediately after
++        # use.
++        adapter = requests.adapters.HTTPAdapter(pool_connections=2,
++                                                pool_maxsize=2)
++        self.session = requests.Session()
++        self.session.mount(self.api_url, adapter)
++
++        self.encoder = json.JSONEncoder()
++        self._init_auth_conf()
++
++    def _init_auth_conf(self):
++        group = cfg.OptGroup('keystone_authtoken')
++        opts = [
++            cfg.StrOpt('username', default=''),
++            cfg.StrOpt('project_domain_name', default=''),
++            cfg.StrOpt('user_domain_name', default=''),
++            cfg.StrOpt('project_name', default=''),
++            cfg.StrOpt('password', default=''),
++            cfg.StrOpt('auth_url', default=''),
++        ]
++        CONF = cfg.CONF
++        try:
++            CONF.register_group(group)
++            CONF.register_opts(opts, group=group)
++            CONF(default_config_files=['/etc/nova/nova.conf'])
++        except cfg.DuplicateOptError:
++            LOG.warning('cfg DuplicateOptError')
++
++        self.token_update_time = 0
++        self.token = ''
++        ka = CONF.keystone_authtoken
++        username = ka.username.lower()
++        project_domain_name = ka.project_domain_name.lower()
++        user_domain_name = ka.user_domain_name.lower()
++        project_name = ka.project_name.lower()
++        password = ka.password
++        self.auth_data = json.dumps({
++            "auth": {
++                "identity": {
++                    "methods": ["password"],
++                    "password": {
++                        "user": {
++                            "name": username,
++                            "domain": {"id": user_domain_name},
++                            "password": password
++                        }
++                    }
++                },
++                "scope": {
++                    "project": {
++                        "name": project_name,
++                        "domain": {"id": project_domain_name}
++                    }
++                }
++            }
++        })
++        self.auth_url = ka.auth_url + "/identity/v3/auth/tokens"
++
++    def _get_token(self):
++        if self.token_update_time < time.time() - 5 * 60:
++            headers = {
++                'Content-Type': 'application/json',
++                'Accept': 'application/json',
++            }
++            response = self.session.request('POST',
++                                            self.auth_url,
++                                            headers=headers,
++                                            data=self.auth_data,
++                                            verify=None,
++                                            cert=None)
++            self.token_update_time = time.time()
++            self.token = response.headers['X-Subject-Token']
++            LOG.debug('get token success')
++        return self.token
++
++    def _request(self, method, path, data=None, headers=None, **kwargs):
++        request_url = '{api_url}{path}'.format(api_url=self.api_url, path=path)
++
++        if data is not None:
++            data = self.encoder.encode(data)
++
++        headers = headers or {}
++        token = self._get_token()
++        headers.update({
++            'Content-Type': 'application/json',
++            'Accept': 'application/json',
++            'X-Auth-Token': token,
++        })
++
++        return self.session.request(method,
++                                    request_url,
++                                    headers=headers,
++                                    data=data,
++                                    verify=None,
++                                    cert=None,
++                                    **kwargs)
++
++    def attach_volume_dpu(self, server_id, data):
++        path = '/{}/dpu/{}/os-volume'.format(self.api_version, server_id)
++        try:
++            response = self._request('POST', path, data=data)
++        except Exception as err:
++            LOG.error('Unhandled error attach_volume_dpu. Error: %s ', err)
++            raise
++
++        # Got valid content
++        return response
++
++    def detach_volume_dpu(self, server_id, volume_id, data):
++        path = '/{}/dpu/{}/os-volume/{}'.format(self.api_version,
++                                                server_id, volume_id)
++        try:
++            response = self._request('POST', path, data=data)
++        except Exception as err:
++            LOG.error('Unhandled error detach_volume_dpu. Error: %s ', err)
++            raise
++
++        # Got valid content
++        return response
++
++    def extend_volume_dpu(self, server_id, data):
++        path = '/{}/dpu/{}/os-volume-extend'.format(self.api_version, server_id)
++        try:
++            response = self._request('POST', path, data=data)
++        except Exception as err:
++            LOG.error('Unhandled error extend_volume_dpu. Error: %s ', err)
++            raise
++
++        # Got valid content
++        return response
++
++    def attach_share_dpu(self, server_id, data):
++        path = '/{}/dpu/{}/os-share'.format(self.api_version, server_id)
++        try:
++            response = self._request('POST', path, data=data)
++        except Exception as err:
++            LOG.error('Unhandled error attach_share_dpu. Error: %s ', err)
++            raise
++
++        return response
++
++    def detach_share_dpu(self, server_id, share_id):
++        path = '/{}/dpu/{}/os-share/{}'.format(self.api_version,
++                                               server_id, share_id)
++        try:
++            response = self._request('DELETE', path)
++        except Exception as err:
++            LOG.error('Unhandled error detach_share_dpu. Error: %s ', err)
++            raise
++
++        return response
+diff --git a/nova/virt/ironic/dpu_driver.py b/nova/virt/ironic/dpu_driver.py
+new file mode 100644
+index 0000000..daeb161
+--- /dev/null
++++ b/nova/virt/ironic/dpu_driver.py
+@@ -0,0 +1,734 @@
++# Copyright 2023 Huawei Technology corp.
++#
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++import json
++import requests
++import time
++
++from oslo_log import log as logging
++from oslo_serialization import jsonutils
++from oslo_service import loopingcall
++from oslo_utils import excutils
++from oslo_utils import netutils
++import six
++
++from nova.compute import vm_states
++import nova.conf
++from nova import exception
++from nova.i18n import _
++from nova.virt.ironic import driver
++from nova.virt.ironic import ironic_states
++from nova.virt.ironic import dpu_api
++import ironicclient as ironic
++
++LOG = logging.getLogger(__name__)
++
++CONF = nova.conf.CONF
++
++_NODE_FIELDS = ('uuid', 'power_state', 'target_power_state', 'provision_state',
++                'target_provision_state', 'last_error', 'maintenance',
++                'properties', 'instance_uuid', 'traits', 'resource_class',
++                'extra')
++
++class DPUIronicDriver(driver.IronicDriver):
++    """Hypervisor driver for Ironic with DPU provisioning."""
++
++    capabilities = {
++        "has_imagecache": False,
++        "supports_evacuate": False,
++        "supports_migrate_to_same_host": True,
++        "supports_attach_interface": True,
++        "supports_extend_volume": True,
++        "supports_multiattach": False,
++        "supports_trusted_certs": False,
++        "supports_pcpus": False,
++        "supports_virtio_fs": True,
++
++        # Image type support flags
++        "supports_image_type_aki": False,
++        "supports_image_type_ami": False,
++        "supports_image_type_ari": False,
++        "supports_image_type_iso": False,
++        "supports_image_type_qcow2": True,
++        "supports_image_type_raw": True,
++        "supports_image_type_vdi": False,
++        "supports_image_type_vhd": False,
++        "supports_image_type_vhdx": False,
++        "supports_image_type_vmdk": False,
++    }
++
++    def _get_node(self, node_id):
++        """Get a node by its UUID.
++
++           add extra field
++        """
++        node = self.ironic_connection.get_node(node_id, fields=_NODE_FIELDS)
++        node.uuid = node.id
++        node.instance_uuid = node.instance_id
++        node.maintenance = node.is_maintenance
++        return node
++
++    def _check_state_validation(self, instance):
++        if instance.task_state == None and \
++                instance.vm_state != vm_states.ACTIVE:
++            msg = ("check state validation failed instance vmstatus {} instance"
++                   " task status {}".format(instance.vm_state,
++                                           instance.task_state))
++            LOG.warning(msg, instance=instance)
++            raise exception.ValidationError(msg)
++        else:
++            LOG.debug(
++                "check state validation succeed instance vmstatus {} instance "
++                "task status {}".format(instance.vm_state, instance.task_state))
++
++    def _plug_vif(self, node, port_id):
++        last_attempt = 5
++        for attempt in range(0, last_attempt + 1):
++            try:
++                self.ironicclient.call("node.vif_attach", node.uuid,
++                                       port_id, retry_on_conflict=False)
++            except ironic.exc.BadRequest as e:
++                # NOTE(danms): If we race with ironic startup, there
++                # will be no ironic-conductor running, which will
++                # give us a failure to do this plug operation. So,
++                # be graceful in that case and wait/retry.
++                # NOTE(mdbooth): This will be fixed in ironic by
++                # change I2c21baae. This will ensure ironic returns a 503 here,
++                # which will cause ironicclient to automatically retry for us.
++                # We can remove this workaround once we are confident that we
++                # are only running against ironic containing this fix.
++                if ('No conductor' in six.text_type(e) and
++                        attempt < last_attempt):
++                    LOG.warning('No ironic conductor is running; '
++                                'waiting...')
++                    time.sleep(10)
++                    continue
++
++                msg = (_("Cannot attach VIF %(vif)s to the node %(node)s "
++                         "due to error: %(err)s") % {
++                             'vif': port_id,
++                             'node': node.uuid, 'err': e})
++                LOG.error(msg)
++                raise exception.VirtualInterfacePlugException(msg)
++            except ironic.exc.Conflict:
++                # NOTE (vsaienko) Return since the VIF is already attached.
++                return
++            except ironic.exc.InternalServerError as e:
++                msg = (_("Cannot attach VIF %(vif)s to the node %(node)s "
++                         "due to error: %(err)s") % {
++                           'vif': port_id,
++                           'node': node.uuid, 'err': e})
++                raise exception.VirtualInterfacePlugException(msg)
++            # Success, so don't retry
++            return
++
++    def _unplug_vifs(self, node, instance, network_info):
++        # NOTE(PhilDay): Accessing network_info will block if the thread
++        # it wraps hasn't finished, so do this ahead of time so that we
++        # don't block while holding the logging lock.
++        network_info_str = str(network_info)
++        LOG.debug("unplug: instance_uuid=%(uuid)s vif=%(network_info)s",
++                  {'uuid': instance.uuid,
++                   'network_info': network_info_str})
++        if not network_info:
++            return
++        for vif in network_info:
++            port_id = six.text_type(vif['id'])
++            LOG.debug("unplug_vif: port_id {} ".format(port_id))
++            try:
++                self.ironicclient.call("node.vif_detach", node.uuid,
++                                       port_id)
++            except ironic.exc.BadRequest:
++                LOG.debug("VIF %(vif)s isn't attached to Ironic node %(node)s",
++                          {'vif': port_id, 'node': node.uuid})
++            except ironic.exc.InternalServerError as e:
++                msg = (_("Cannot unplug VIF %(vif)s to the node %(node)s "
++                         "due to error: %(err)s") % {
++                           'vif': port_id,
++                           'node': node.uuid, 'err': e})
++                raise exception.VirtualInterfaceUnplugException(msg)
++
++    def destroy(self, context, instance, network_info,
++                block_device_info=None, destroy_disks=True):
++        """Destroy the specified instance, if it can be found.
++
++        :param context: The security context.
++        :param instance: The instance object.
++        :param network_info: Instance network information.
++        :param block_device_info: Instance block device
++            information. Ignored by this driver.
++        :param destroy_disks: Indicates if disks should be
++            destroyed. Ignored by this driver.
++        """
++        LOG.debug('DPUIronicDriver destroy called for instance',
++                  instance=instance)
++        try:
++            node = self._validate_instance_and_node(instance)
++        except exception.InstanceNotFound:
++            LOG.warning("Destroy called on non-existing instance %s.",
++                        instance.uuid)
++            # NOTE(deva): if nova.compute.ComputeManager._delete_instance()
++            #             is called on a non-existing instance, the only way
++            #             to delete it is to return from this method
++            #             without raising any exceptions.
++            return
++
++        try:
++            LOG.debug('unplug_vifs first when destroy instance',
++                      instance=instance)
++            self._unplug_vifs(node, instance, network_info)
++
++            if node.provision_state in driver._UNPROVISION_STATES:
++                self._unprovision(instance, node)
++            else:
++                # NOTE(hshiina): if spawn() fails before ironic starts
++                #                provisioning, instance information should be
++                #                removed from ironic node.
++                self._remove_instance_info_from_node(node, instance)
++        finally:
++            # NOTE(mgoddard): We don't need to remove instance info at this
++            # point since we will have already done it. The destroy will only
++            # succeed if this method returns without error, so we will end up
++            # removing the instance info eventually.
++            self._cleanup_deploy(node, instance, None,
++                                 remove_instance_info=False)
++
++        LOG.info('Successfully unprovisioned Ironic node %s',
++                 node.uuid, instance=instance)
++
++    def attach_interface(self, context, instance, image_meta, vif):
++        """Use hotplug to add a network interface to a running instance.
++        The counter action to this is :func:`detach_interface`.
++
++        :param context: The request context.
++        :param nova.objects.instance.Instance instance:
++            The instance which will get an additional network interface.
++        :param nova.objects.ImageMeta image_meta:
++            The metadata of the image of the instance.
++        :param nova.network.model.VIF vif:
++            The object which has the information about the interface to attach.
++        :raise nova.exception.NovaException: If the attach fails.
++        :returns: None
++        """
++        LOG.info('attach_interface vif: {}'.format(vif), instance=instance)
++        if not vif.get('force'):
++            self._check_state_validation(instance)
++        super().attach_interface(context, instance, image_meta, vif)
++
++    def detach_interface(self, context, instance, vif):
++        """Use hotunplug to remove a network interface from a running instance.
++        The counter action to this is :func:`attach_interface`.
++
++        :param context: The request context.
++        :param nova.objects.instance.Instance instance:
++            The instance which gets a network interface removed.
++        :param nova.network.model.VIF vif:
++            The object which has the information about the interface to detach.
++        :raise nova.exception.NovaException: If the detach fails.
++        :returns: None
++        """
++        LOG.info('detach_interface vif: {}'.format(vif), instance=instance)
++        if not vif.get('force'):
++            self._check_state_validation(instance)
++        super().detach_interface(context, instance, vif)
++
++    def _clean_up_volume_target(self, instance, volume_id):
++        try:
++            targets = self.ironicclient.call('node.list_volume_targets',
++                                             instance.node, detail=True)
++            for target in targets:
++                if volume_id == target.volume_id:
++                    volume_target_id = target.uuid
++                    self.ironicclient.call('volume_target.delete',
++                                           volume_target_id)
++                    break
++            else:
++                LOG.warning("Can't find volume target of volume %(volume)s "
++                            "from list_volume_targets. node %(node)s",
++                            {'volume': volume_id,
++                             'node': instance.node},
++                            instance=instance)
++        except ironic.exc.NotFound:
++            LOG.warning("Can't find volume target of volume %(volume)s on "
++                        "node %(node)s",
++                        {'volume': volume_id,
++                         'node': instance.node},
++                        instance=instance)
++        except ironic.exc.ClientException as e:
++            LOG.warning("Error deleting volume target of volume %(volume)s on "
++                        "node %(node)s. reason: %(reason)s",
++                        {'volume': volume_id,
++                         'node': instance.node,
++                         'reason': e},
++                        instance=instance)
++
++    def attach_volume(self, context, connection_info, instance, mountpoint,
++                      disk_bus=None, device_type=None, encryption=None):
++        volume_id = connection_info['volume_id']
++        LOG.info('attach_volume volume_id: %(volume_id)s.',
++                 {'volume_id': volume_id}, instance=instance)
++        self._check_state_validation(instance)
++        if not volume_id:
++            msg = "Failed to attach volume, no volume_id in connection_info."
++            LOG.error(msg, instance=instance)
++            raise exception.VolumeAttachFailed(reason=msg)
++
++        driver_volume_type = connection_info['driver_volume_type']
++        if driver_volume_type != "iscsi":
++            msg = "Invalid driver volume type: {}".format(driver_volume_type)
++            LOG.error(msg, instance=instance)
++            raise exception.VolumeAttachFailed(reason=msg)
++
++        try:
++            target_properties = connection_info['data']
++            self.ironicclient.call('volume_target.create',
++                                   node_uuid=instance.node,
++                                   volume_type=driver_volume_type,
++                                   properties=target_properties,
++                                   boot_index=None,
++                                   volume_id=volume_id)
++        except (ironic.exc.BadRequest, ironic.exc.Conflict):
++            msg = (_("Failed to add volume target information of "
++                     "volume %(volume)s on node %(node)s when "
++                     "attaching volume to the instance")
++                   % {'volume': volume_id,
++                      'node': instance.node})
++            LOG.error(msg, instance=instance)
++            raise exception.VolumeAttachFailed(msg)
++
++        response = self._attach_volume_dpu(
++            instance=instance,
++            connection_info=connection_info
++        )
++        LOG.info('attach_volume response: %(response)s.',
++                 {'response': response}, instance=instance)
++        if response.status_code != requests.codes.OK:
++            self._clean_up_volume_target(instance, volume_id)
++            raise exception.VolumeAttachFailed(volume_id=volume_id,
++                                               reason=response.content)
++        if response.content:
++            dpu_slot_info = json.loads(response.content)
++            LOG.debug('attach_volume response dpu_slot_info %s', dpu_slot_info)
++            connection_info['data']['dpu_slot_info'] = dpu_slot_info
++        else:
++            LOG.warning('attach_volume response content none')
++
++    def detach_volume(self, context, connection_info, instance, mountpoint,
++                      encryption=None):
++        volume_id = connection_info['volume_id']
++        LOG.info('detach_volume volume_id: %(volume_id)s.',
++                 {'volume_id': volume_id}, instance=instance)
++        self._check_state_validation(instance)
++
++        if not volume_id:
++            msg = "Failed to detach volume, no volume_id in connection_info."
++            LOG.error(msg, instance=instance)
++            raise exception.VolumeDetachFailed(reason=msg)
++
++        driver_volume_type = connection_info['driver_volume_type']
++        if driver_volume_type != "iscsi":
++            msg = "Invalid driver volume type: {}".format(driver_volume_type)
++            LOG.error(msg, instance=instance)
++            raise exception.VolumeDetachFailed(reason=msg)
++
++        response = self._detach_volumes_dpu(
++            instance=instance,
++            volume_id=volume_id,
++            connection_info=connection_info
++        )
++        LOG.info('detach_volume response: %(response)s.',
++                 {'response': response}, instance=instance)
++        if response.status_code != requests.codes.OK:
++            raise exception.VolumeDetachFailed(volume_id=volume_id,
++                                               reason=response.content)
++
++        self._clean_up_volume_target(instance, volume_id)
++
++    def extend_volume(self, connection_info, instance, requested_size):
++        volume_id = connection_info['volume_id']
++        LOG.info('extend_volume volume_id: %(volume_id)s.',
++                 {'volume_id': volume_id}, instance=instance)
++
++        if not volume_id:
++            msg = "Failed to extend volume, no volume_id in connection_info."
++            LOG.error(msg, instance=instance)
++            raise exception.VolumeExtendFailed(reason=msg)
++
++        driver_volume_type = connection_info['driver_volume_type']
++        if driver_volume_type != "iscsi":
++            msg = "Invalid driver volume type: {}".format(driver_volume_type)
++            LOG.error(msg, instance=instance)
++            raise exception.VolumeExtendFailed(reason=msg)
++
++        connection_info['requested_size'] = requested_size
++        response = self._extend_volume_dpu(
++            instance=instance,
++            connection_info=connection_info
++        )
++        LOG.info('extend_volume response: %(response)s.',
++                 {'response': response}, instance=instance)
++        if response.status_code != requests.codes.OK:
++            raise exception.VolumeExtendFailed(volume_id=volume_id,
++                                               reason=response.content)
++
++    def _get_dpu_manager_url(self, instance):
++        node = self._get_node(instance.node)
++        dpu_ip = node.extra.get('dpu_ip')
++        if not netutils.is_valid_ipv4(dpu_ip):
++            raise exception.ValidationError("Invalid dpu manager ip address")
++        manager_url = "http://%(dpu_ip)s:8774" % {'dpu_ip': dpu_ip}
++        LOG.debug('dpu manager url: %(manager_url)s.',
++                  {'manager_url': manager_url})
++        return manager_url
++
++    def _attach_volume_dpu(self, instance, connection_info):
++        manager_url = self._get_dpu_manager_url(instance)
++        apiclient = dpu_api.APIClient(manager_url)
++        data = {
++            "connection_info": connection_info,
++        }
++        response = apiclient.attach_volume_dpu(instance.uuid, data)
++        return response
++
++    def _detach_volumes_dpu(self, instance, volume_id, connection_info):
++        manager_url = self._get_dpu_manager_url(instance)
++        apiclient = dpu_api.APIClient(manager_url)
++        data = {
++            "connection_info": connection_info,
++        }
++        response = apiclient.detach_volume_dpu(instance.uuid, volume_id, data)
++        return response
++
++    def _extend_volume_dpu(self, instance, connection_info):
++        manager_url = self._get_dpu_manager_url(instance)
++        apiclient = dpu_api.APIClient(manager_url)
++        data = {
++            "connection_info": connection_info
++        }
++        response = apiclient.extend_volume_dpu(instance.uuid, data)
++        return response
++
++    def get_share_access_ip(self, context, instance):
++        network_segment = CONF.ironic.manila_access_to
++        LOG.debug('Get share access network segment : %s', network_segment, instance=instance)
++        return network_segment
++
++    def attach_share(self, context, instance, share_mapping):
++        LOG.info('attach_share share_mapping id : %s, share_id: %s.',
++                 share_mapping.id, share_mapping.share_id, instance=instance)
++        self._check_state_validation(instance)
++
++        share_proto = share_mapping.share_proto
++        if share_proto != "NFS":
++            msg = "Unsupported share protocol: {}".format(share_proto)
++            LOG.error(msg, instance=instance)
++            raise exception.ShareProtocolNotSupported(
++                share_id=share_mapping.share_id, protocol=share_proto)
++
++        response = self._attach_share_dpu(instance, share_mapping.share_id)
++        LOG.info('attach_share response: %(response)s.',
++                 {'response': response}, instance=instance)
++        if response.status_code != requests.codes.OK:
++            raise exception.ShareAttachError(share_id=share_mapping.share_id,
++                                             server_id=instance.uuid,
++                                             reason=response.content)
++
++    def _attach_share_dpu(self, instance, share_id):
++        manager_url = self._get_dpu_manager_url(instance)
++        apiclient = dpu_api.APIClient(manager_url)
++        data = {
++            'shareAttachment': {
++                'share_id': share_id,
++            }
++        }
++        response = apiclient.attach_share_dpu(instance.uuid, data)
++        return response
++
++    def detach_share(self, context, instance, share_mapping):
++        LOG.info('detach_share share_mapping id : %s, share_id: %s.',
++                 share_mapping.id, share_mapping.share_id, instance=instance)
++        self._check_state_validation(instance)
++
++        share_proto = share_mapping.share_proto
++        if share_proto != "NFS":
++            msg = "Unsupported share protocol: {}".format(share_proto)
++            LOG.error(msg, instance=instance)
++            raise exception.ShareProtocolNotSupported(
++                share_id=share_mapping.share_id, protocol=share_proto)
++
++        response = self._detach_share_dpu(instance, share_mapping.share_id)
++        LOG.info('detach_share response: %(response)s.',
++                 {'response': response}, instance=instance)
++        if response.status_code != requests.codes.OK:
++            raise exception.ShareDetachError(share_id=share_mapping.share_id,
++                                             server_id=instance.uuid,
++                                             reason=response.content)
++
++    def _detach_share_dpu(self, instance, share_id):
++        manager_url = self._get_dpu_manager_url(instance)
++        apiclient = dpu_api.APIClient(manager_url)
++        response = apiclient.detach_share_dpu(instance.uuid, share_id)
++        return response
++
++    def get_host_ip_addr(self):
++        LOG.info('get_host_ip_addr')
++        return CONF.my_ip
++
++    def migrate_disk_and_power_off(self, context, instance, dest,
++                                   flavor, network_info,
++                                   block_device_info=None,
++                                   timeout=0, retry_interval=0):
++        """Transfers the disk of a running instance in multiple phases, turning
++        off the instance before the end.
++
++        :param nova.objects.instance.Instance instance:
++            The instance whose disk should be migrated.
++        :param str dest:
++            The IP address of the destination host.
++        :param nova.objects.flavor.Flavor flavor:
++            The flavor of the instance whose disk get migrated.
++        :param nova.network.model.NetworkInfo network_info:
++            The network information of the given `instance`.
++        :param dict block_device_info:
++            Information about the block devices.
++        :param int timeout:
++            The time in seconds to wait for the guest OS to shutdown.
++        :param int retry_interval:
++            How often to signal guest while waiting for it to shutdown.
++
++        :return: A list of disk information dicts in JSON format.
++        :rtype: str
++        """
++        LOG.info('Migrate disk and power off', instance=instance)
++
++        self.destroy(context, instance, network_info, block_device_info)
++
++        disk_info = []
++        return jsonutils.dumps(disk_info)
++
++    def finish_migration(self, context, migration, instance, disk_info,
++                         network_info, image_meta, resize_instance,
++                         block_device_info=None, power_on=True):
++        """Completes a resize/migration.
++
++        :param context: the context for the migration/resize
++        :param migration: the migrate/resize information
++        :param instance: nova.objects.instance.Instance being migrated/resized
++        :param disk_info: the newly transferred disk information
++        :param network_info: instance network information
++        :param nova.objects.ImageMeta image_meta:
++            The metadata of the image of the instance.
++        :param resize_instance: True if the instance is being resized,
++                                False otherwise
++        :param block_device_info: instance volume block device info
++        :param power_on: True if the instance should be powered on, False
++                         otherwise
++        """
++        LOG.info('Finish migration', instance=instance)
++
++        node_uuid = instance.get('node')
++        LOG.info('node_uuid: {} '.format(node_uuid))
++        if not node_uuid:
++            raise ironic.exc.BadRequest(
++                _("Ironic node uuid not supplied to "
++                  "driver for instance %s.") % instance.uuid)
++
++        node = self._get_node(node_uuid)
++        LOG.debug('finish_migration '
++                  'node.instance_uuid : {}'.format(node.instance_uuid))
++        flavor = instance.flavor
++
++        self._add_instance_info_to_node(node, instance, image_meta, flavor,
++                                        block_device_info=block_device_info)
++
++        try:
++            self._add_volume_target_info(context, instance, block_device_info)
++        except Exception:
++            with excutils.save_and_reraise_exception():
++                LOG.error("Error preparing migrate for instance "
++                          "on baremetal node %(node)s.",
++                          {'node': node_uuid},
++                          instance=instance)
++                self._cleanup_deploy(node, instance)  # do not _unplug_vifs
++
++        # do not handle flavor.ephemeral_gb
++
++        # validate we are ready to do the deploy
++        validate_chk = self.ironicclient.call("node.validate", node_uuid)
++        if (not validate_chk.deploy.get('result') or
++                not validate_chk.power.get('result') or
++                not validate_chk.storage.get('result')):
++            # something is wrong. undo what we have done
++            self._cleanup_deploy(node, instance)  # do not _unplug_vifs
++            raise exception.ValidationError(_(
++                "Ironic node: %(id)s failed to validate."
++                " (deploy: %(deploy)s, power: %(power)s,"
++                " storage: %(storage)s)")
++                % {'id': node.uuid,
++                   'deploy': validate_chk.deploy,
++                   'power': validate_chk.power,
++                   'storage': validate_chk.storage})
++
++        # prepare for the deploy
++        try:
++            self._plug_vifs(node, instance, network_info)
++            self._start_firewall(instance, network_info)
++        except Exception:
++            with excutils.save_and_reraise_exception():
++                LOG.error("Error preparing deploy for instance "
++                          "%(instance)s on baremetal node %(node)s.",
++                          {'instance': instance.uuid,
++                           'node': node_uuid})
++                self._cleanup_deploy(node, instance, network_info)
++
++        # no Config drive
++
++        # trigger the node deploy
++        try:
++            self.ironicclient.call("node.set_provision_state", node_uuid,
++                                   ironic_states.ACTIVE,
++                                   configdrive=None)
++        except Exception as e:
++            with excutils.save_and_reraise_exception():
++                LOG.error("Failed to request Ironic to provision instance "
++                          "%(inst)s: %(reason)s",
++                          {'inst': instance.uuid,
++                           'reason': six.text_type(e)})
++                self._cleanup_deploy(node, instance, network_info)
++
++        LOG.info('finish_migration _wait_for_active ', instance=instance)
++        timer = loopingcall.FixedIntervalLoopingCall(self._wait_for_active,
++                                                     instance)
++        try:
++            timer.start(interval=CONF.ironic.api_retry_interval).wait()
++            LOG.info('Successfully provisioned Ironic node %s',
++                     node.uuid, instance=instance)
++        except Exception:
++            with excutils.save_and_reraise_exception():
++                LOG.error("Error deploying instance %(instance)s on "
++                          "baremetal node %(node)s.",
++                          {'instance': instance.uuid,
++                           'node': node_uuid})
++
++        LOG.info('finish_migration finished successfully', instance=instance)
++
++    def confirm_migration(self, context, migration, instance, network_info):
++        """Confirms a resize/migration, destroying the source VM.
++
++        :param instance: nova.objects.instance.Instance
++        """
++        LOG.info('Confirm migration', instance=instance)
++
++    def finish_revert_migration(self, context, instance, network_info,
++                                migration, block_device_info=None,
++                                power_on=True):
++        """Finish reverting a resize/migration.
++
++        :param context: the context for the finish_revert_migration
++        :param instance: nova.objects.instance.Instance being migrated/resized
++        :param network_info: instance network information
++        :param migration: nova.objects.Migration for the migration
++        :param block_device_info: instance volume block device info
++        :param power_on: True if the instance should be powered on, False
++                         otherwise
++        """
++        LOG.info('Finish revert migration', instance=instance)
++
++        node_uuid = instance.get('node')
++        LOG.info('node_uuid: {} '.format(node_uuid))
++        if not node_uuid:
++            raise ironic.exc.BadRequest(
++                _("Ironic node uuid not supplied to "
++                  "driver for instance %s.") % instance.uuid)
++
++        node = self._get_node(node_uuid)
++        LOG.debug('finish_revert_migration '
++                  'node.instance_uuid : {}'.format(node.instance_uuid))
++        flavor = instance.flavor
++
++        self._add_instance_info_to_node(node, instance, instance.image_meta,
++                                        flavor,
++                                        block_device_info=block_device_info)
++
++        try:
++            self._add_volume_target_info(context, instance, block_device_info)
++        except Exception:
++            with excutils.save_and_reraise_exception():
++                LOG.error("Error preparing revert migration for instance "
++                          "on baremetal node %(node)s.",
++                          {'node': node_uuid},
++                          instance=instance)
++                self._cleanup_deploy(node, instance)  # do not _unplug_vifs
++
++        # do not handle flavor.ephemeral_gb
++
++        # validate we are ready to do the deploy
++        validate_chk = self.ironicclient.call("node.validate", node_uuid)
++        if (not validate_chk.deploy.get('result') or
++                not validate_chk.power.get('result') or
++                not validate_chk.storage.get('result')):
++            # something is wrong. undo what we have done
++            self._cleanup_deploy(node, instance)  # do not _unplug_vifs
++            raise exception.ValidationError(_(
++                "Ironic node: %(id)s failed to validate."
++                " (deploy: %(deploy)s, power: %(power)s,"
++                " storage: %(storage)s)")
++                % {'id': node.uuid,
++                   'deploy': validate_chk.deploy,
++                   'power': validate_chk.power,
++                   'storage': validate_chk.storage})
++
++        # prepare for the deploy
++        try:
++            self._plug_vifs(node, instance, network_info)
++            self._start_firewall(instance, network_info)
++        except Exception:
++            with excutils.save_and_reraise_exception():
++                LOG.error("Error preparing deploy for instance "
++                          "%(instance)s on baremetal node %(node)s.",
++                          {'instance': instance.uuid,
++                           'node': node_uuid})
++                self._cleanup_deploy(node, instance, network_info)
++
++        # no Config drive
++
++        # trigger the node deploy
++        try:
++            self.ironicclient.call("node.set_provision_state", node_uuid,
++                                   ironic_states.ACTIVE,
++                                   configdrive=None)
++        except Exception as e:
++            with excutils.save_and_reraise_exception():
++                LOG.error("Failed to request Ironic to provision instance "
++                          "%(inst)s: %(reason)s",
++                          {'inst': instance.uuid,
++                           'reason': six.text_type(e)})
++                self._cleanup_deploy(node, instance, network_info)
++
++        LOG.info('finish_revert_migration _wait_for_active ', instance=instance)
++        timer = loopingcall.FixedIntervalLoopingCall(self._wait_for_active,
++                                                     instance)
++        try:
++            timer.start(interval=CONF.ironic.api_retry_interval).wait()
++            LOG.info('Successfully provisioned Ironic node %s',
++                     node.uuid, instance=instance)
++        except Exception:
++            with excutils.save_and_reraise_exception():
++                LOG.error("Error deploying instance %(instance)s on "
++                          "baremetal node %(node)s.",
++                          {'instance': instance.uuid,
++                           'node': node_uuid})
++
++        LOG.info('finish_revert_migration finished successfully',
++                 instance=instance)
+diff --git a/nova/virt/ironic/driver.py b/nova/virt/ironic/driver.py
+index 21e62e6..0e7ec05 100644
+--- a/nova/virt/ironic/driver.py
++++ b/nova/virt/ironic/driver.py
+@@ -2108,7 +2108,10 @@ class IronicDriver(virt_driver.ComputeDriver):
+             props['host'] = instance.hostname
+         # Eventually it would be nice to be able to do multipath, but for now
+         # we should at least set the value to False.
+-        props['multipath'] = False
++        props['multipath'] = CONF.ironic.volume_use_multipath
++        LOG.debug('get_volume_connector: %s', props)
++        LOG.debug('my_block_storage_ip: %s', CONF.my_block_storage_ip)
++        LOG.debug('host: %s', CONF.host)
+         return props
+ 
+     def _get_volume_connector_ip(self, instance, node, values):

@@ -1,0 +1,13 @@
+diff --git a/openstackclient/network/v2/port.py b/openstackclient/network/v2/port.py
+index 4d7e518..db1d1ec 100644
+--- a/openstackclient/network/v2/port.py
++++ b/openstackclient/network/v2/port.py
+@@ -244,7 +244,7 @@ def _add_updatable_args(parser):
+         '--vnic-type',
+         metavar='<vnic-type>',
+         choices=['direct', 'direct-physical', 'macvtap',
+-                 'normal', 'baremetal', 'virtio-forwarder'],
++                 'normal', 'baremetal', 'virtio-forwarder', 'vdpa'],
+         help=_("VNIC type for this port (direct | direct-physical | "
+                "macvtap | normal | baremetal | virtio-forwarder, "
+                "default: normal)")

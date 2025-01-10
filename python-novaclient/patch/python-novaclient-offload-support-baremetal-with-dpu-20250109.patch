@@ -1,0 +1,74 @@
+diff --git a/novaclient/v2/client.py b/novaclient/v2/client.py
+index cec9f2f..d4a410d 100644
+--- a/novaclient/v2/client.py
++++ b/novaclient/v2/client.py
+@@ -41,6 +41,7 @@ from novaclient.v2 import server_groups
+ from novaclient.v2 import server_migrations
+ from novaclient.v2 import servers
+ from novaclient.v2 import services
++from novaclient.v2 import shares
+ from novaclient.v2 import usage
+ from novaclient.v2 import versions
+ from novaclient.v2 import volumes
+@@ -146,6 +147,7 @@ class Client(object):
+         # extensions
+         self.agents = agents.AgentsManager(self)
+         self.volumes = volumes.VolumeManager(self)
++        self.shares = shares.ShareManager(self)
+         self.keypairs = keypairs.KeypairManager(self)
+         self.neutron = networks.NeutronManager(self)
+         self.quota_classes = quota_classes.QuotaClassSetManager(self)
+diff --git a/novaclient/v2/shares.py b/novaclient/v2/shares.py
+new file mode 100644
+index 0000000..523fa0a
+--- /dev/null
++++ b/novaclient/v2/shares.py
+@@ -0,0 +1,48 @@
++# Copyright 2011 Denali Systems, Inc.
++# All Rights Reserved.
++#
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++from novaclient import base
++
++
++class Share(base.Resource):
++    NAME_ATTR = 'display_name'
++
++    def __repr__(self):
++        return "<Share: %s>" % self.id
++
++
++class ShareManager(base.Manager):
++    resource_class = Share
++
++    def create_server_share(self, server_id, share_id):
++        if server_id is None:
++            raise TypeError("server_id is required argument.")
++        if share_id is None:
++            raise TypeError("share_id is required argument.")
++
++        body = {
++            'share': {
++                'share_id': share_id
++            }
++        }
++        return self._create("/servers/%s/shares" % server_id, body, "share")
++
++    def delete_server_share(self, server_id, share_id):
++        if server_id is None:
++            raise TypeError("server_id is required argument.")
++        if share_id is None:
++            raise TypeError("share_id is required argument.")
++
++        return self._delete("/servers/%s/shares/%s" % (server_id, share_id,))

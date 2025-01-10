@@ -1,0 +1,17 @@
+diff --git a/neutron_lib/api/definitions/portbindings.py b/neutron_lib/api/definitions/portbindings.py
+index 7394ef7..367cfb0 100644
+--- a/neutron_lib/api/definitions/portbindings.py
++++ b/neutron_lib/api/definitions/portbindings.py
+@@ -115,9 +115,11 @@ VNIC_BAREMETAL = 'baremetal'
+ VNIC_DIRECT_PHYSICAL = 'direct-physical'
+ VNIC_VIRTIO_FORWARDER = 'virtio-forwarder'
+ VNIC_SMARTNIC = 'smart-nic'
++VNIC_VHOST_VDPA = 'vdpa'
+ 
+ VNIC_TYPES = [VNIC_NORMAL, VNIC_DIRECT, VNIC_MACVTAP, VNIC_BAREMETAL,
+-              VNIC_DIRECT_PHYSICAL, VNIC_VIRTIO_FORWARDER, VNIC_SMARTNIC]
++              VNIC_DIRECT_PHYSICAL, VNIC_VIRTIO_FORWARDER, VNIC_SMARTNIC,
++              VNIC_VHOST_VDPA]
+ 
+ # VIF_DETAILS_CONNECTIVITY: Indicates what kind of connectivity the network
+ #                           back-end provides: L2, L3 or not specified.

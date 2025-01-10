@@ -1,0 +1,94 @@
+diff --git a/openstackclient/compute/v2/server.py b/openstackclient/compute/v2/server.py
+index d3bd1c7..8d9d645 100644
+--- a/openstackclient/compute/v2/server.py
++++ b/openstackclient/compute/v2/server.py
+@@ -170,6 +170,13 @@ def _prep_server_detail(compute_client, image_client, server, refresh=True):
+                     info.pop('os-extended-volumes:volumes_attached'))
+             }
+         )
++    if 'os-extended-shares:shares_attached' in info:
++        info.update(
++            {
++                'shares_attached': utils.format_list_of_dicts(
++                    info.pop('os-extended-shares:shares_attached'))
++            }
++        )
+     if 'security_groups' in info:
+         info.update(
+             {
+@@ -453,6 +460,37 @@ class AddServerSecurityGroup(command.Command):
+         server.add_security_group(security_group['id'])
+ 
+ 
++class AddServerShare(command.Command):
++    _description = _("Add share to server. ")
++
++    def get_parser(self, prog_name):
++        parser = super(AddServerShare, self).get_parser(prog_name)
++        parser.add_argument(
++            'server',
++            metavar='<server>',
++            help=_('Server (name or ID)'),
++        )
++        parser.add_argument(
++            'share',
++            metavar='<share>',
++            help=_('Share to add (share ID)'),
++        )
++        return parser
++
++    def take_action(self, parsed_args):
++        compute_client = self.app.client_manager.compute
++
++        server = utils.find_resource(
++            compute_client.servers,
++            parsed_args.server,
++        )
++
++        compute_client.shares.create_server_share(
++            server.id,
++            parsed_args.share,
++        )
++
++
+ class AddServerVolume(command.Command):
+     _description = _(
+         "Add volume to server. "
+@@ -2109,6 +2147,37 @@ class RemoveServerSecurityGroup(command.Command):
+         server.remove_security_group(security_group['id'])
+ 
+ 
++class RemoveServerShare(command.Command):
++    _description = _("Remove share from server. ")
++
++    def get_parser(self, prog_name):
++        parser = super(RemoveServerShare, self).get_parser(prog_name)
++        parser.add_argument(
++            'server',
++            metavar='<server>',
++            help=_('Server (name or ID)'),
++        )
++        parser.add_argument(
++            'share',
++            metavar='<share>',
++            help=_('Share to remove (Share ID)'),
++        )
++        return parser
++
++    def take_action(self, parsed_args):
++        compute_client = self.app.client_manager.compute
++
++        server = utils.find_resource(
++            compute_client.servers,
++            parsed_args.server,
++        )
++
++        compute_client.shares.delete_server_share(
++            server.id,
++            parsed_args.share,
++        )
++
++
+ class RemoveServerVolume(command.Command):
+     _description = _(
+         "Remove volume from server. "
