@@ -1,9 +1,9 @@
 diff --git a/ironic/common/dpu_api.py b/ironic/common/dpu_api.py
 new file mode 100644
-index 0000000..1f584ec
+index 0000000..0c798e7
 --- /dev/null
 +++ b/ironic/common/dpu_api.py
-@@ -0,0 +1,213 @@
+@@ -0,0 +1,215 @@
 +# Copyright 2023 Huawei Technology corp.
 +#
 +# Licensed under the Apache License, Version 2.0 (the "License");
@@ -194,6 +194,7 @@ index 0000000..1f584ec
 +            LOG.error('Unhandled error attach_share_dpu. Error: %s ', err)
 +            raise
 +
++        # Got valid content
 +        return response
 +
 +    def detach_share_dpu(self, server_id, share_id):
@@ -205,6 +206,7 @@ index 0000000..1f584ec
 +            LOG.error('Unhandled error detach_share_dpu. Error: %s ', err)
 +            raise
 +
++        # Got valid content
 +        return response
 +
 +    def hello(self):
@@ -282,10 +284,10 @@ index 1e7a83c..b84ba42 100644
      def supported_raid_interfaces(self):
 diff --git a/ironic/drivers/modules/dpu.py b/ironic/drivers/modules/dpu.py
 new file mode 100644
-index 0000000..bd5f6a8
+index 0000000..f997dab
 --- /dev/null
 +++ b/ironic/drivers/modules/dpu.py
-@@ -0,0 +1,329 @@
+@@ -0,0 +1,330 @@
 +# Copyright 2023 Huawei Technology corp.
 +#
 +# Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -611,11 +613,11 @@ index 0000000..bd5f6a8
 +        response = apiclient.attach_share_dpu(server_id, data)
 +        return response
 +
++
 +    def _detach_all_share_dpu(self, server_id, manager_url):
 +        apiclient = dpu_api.APIClient(manager_url)
 +        response = apiclient.detach_share_dpu(server_id, 'detach_all')
 +        return response
-\ No newline at end of file
 diff --git a/ironic/drivers/modules/network/dpu.py b/ironic/drivers/modules/network/dpu.py
 new file mode 100644
 index 0000000..c362bbc
