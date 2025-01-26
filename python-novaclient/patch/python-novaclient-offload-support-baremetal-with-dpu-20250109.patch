@@ -20,10 +20,10 @@ index cec9f2f..d4a410d 100644
          self.quota_classes = quota_classes.QuotaClassSetManager(self)
 diff --git a/novaclient/v2/shares.py b/novaclient/v2/shares.py
 new file mode 100644
-index 0000000..523fa0a
+index 0000000..99687e1
 --- /dev/null
 +++ b/novaclient/v2/shares.py
-@@ -0,0 +1,48 @@
+@@ -0,0 +1,71 @@
 +# Copyright 2011 Denali Systems, Inc.
 +# All Rights Reserved.
 +#
@@ -39,10 +39,17 @@ index 0000000..523fa0a
 +#    License for the specific language governing permissions and limitations
 +#    under the License.
 +
++"""
++Share interface
++"""
 +from novaclient import base
 +
 +
 +class Share(base.Resource):
++    """
++    A share is an extra block level storage to the OpenStack
++    instances.
++    """
 +    NAME_ATTR = 'display_name'
 +
 +    def __repr__(self):
@@ -50,9 +57,18 @@ index 0000000..523fa0a
 +
 +
 +class ShareManager(base.Manager):
++    """
++    Manage :class:`Share` resources. This is really about share attachments.
++    """
 +    resource_class = Share
 +
 +    def create_server_share(self, server_id, share_id):
++        """
++        Attach a share identified by the share ID to the given server ID
++
++        :param server_id: The ID of the server
++        :param share_id: The ID of the share to attach.
++        """
 +        if server_id is None:
 +            raise TypeError("server_id is required argument.")
 +        if share_id is None:
@@ -66,6 +82,13 @@ index 0000000..523fa0a
 +        return self._create("/servers/%s/shares" % server_id, body, "share")
 +
 +    def delete_server_share(self, server_id, share_id):
++        """
++        Detach a share identified by the share ID from the given server
++
++        :param server_id: The ID of the server
++        :param share_id: The ID of the share to detach
++        :returns: An instance of novaclient.base.TupleWithMeta
++        """
 +        if server_id is None:
 +            raise TypeError("server_id is required argument.")
 +        if share_id is None:

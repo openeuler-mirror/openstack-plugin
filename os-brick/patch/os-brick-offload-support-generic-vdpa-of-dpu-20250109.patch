@@ -30,10 +30,10 @@ index 963ee6a..a0b202f 100644
  # Mapping for the S390X platform
 diff --git a/os_brick/initiator/connectors/vdpa.py b/os_brick/initiator/connectors/vdpa.py
 new file mode 100644
-index 0000000..7c31350
+index 0000000..61b1ef3
 --- /dev/null
 +++ b/os_brick/initiator/connectors/vdpa.py
-@@ -0,0 +1,341 @@
+@@ -0,0 +1,344 @@
 +# Copyright 2024 Huawei Technology corp.
 +#
 +#    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -342,6 +342,7 @@ index 0000000..7c31350
 +    def _extend_blk_volume(self, connection_info, instance, requested_size):
 +        volume_id = connection_info.get('volume_id')
 +        bdev_name = volume_id
++        # 获取function_id
 +        vdpa_volume_info = connection_info['data'].get('vdpa_volume_info')
 +        dbdf = vdpa_volume_info.get('pci')
 +        function_id = dbdf
@@ -372,15 +373,17 @@ index 0000000..7c31350
 +            self.spdk_driver.scsi_bdev_resize(self, dbdf, scsi_tgt_num,
 +                                              requested_size)
 +        else:
++            # iscsi kernel
 +            if driver_volume_type == 'iscsi':
 +                self._ob_extend_volume(connection_info)
++            # rbd
 +            self.spdk_driver.bdev_resize(bdev_name, requested_size, None)
 diff --git a/os_brick/spdk_lib.py b/os_brick/spdk_lib.py
 new file mode 100644
-index 0000000..1d8a56e
+index 0000000..3e7f0c7
 --- /dev/null
 +++ b/os_brick/spdk_lib.py
-@@ -0,0 +1,350 @@
+@@ -0,0 +1,351 @@
 +# Copyright 2024 Huawei Technology corp.
 +#
 +#    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -574,7 +577,8 @@ index 0000000..1d8a56e
 +        """
 +        Resize the bdev to the requested_size
 +        """
-+        new_size_in_mb = requested_size
++        # requested_size is in bytes
++        new_size_in_mb = requested_size // (1024 * 1024)
 +        if driver_volume_type == 'rbd':
 +            cmd = [self.rpc_path, 'bdev_rbd_resize', bdev_name, str(new_size_in_mb)]
 +            _run_cmd_by_root(cmd)

@@ -2770,10 +2770,10 @@ index c03548d..3fdc4fe 100644
          # Legacy non-os-vif codepath
 diff --git a/nova/virt/libvirt/volume/vdpa.py b/nova/virt/libvirt/volume/vdpa.py
 new file mode 100644
-index 0000000..5622187
+index 0000000..d4de4de
 --- /dev/null
 +++ b/nova/virt/libvirt/volume/vdpa.py
-@@ -0,0 +1,121 @@
+@@ -0,0 +1,122 @@
 +# Copyright 2024 Huawei Technology corp.
 +#
 +#    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -2873,6 +2873,7 @@ index 0000000..5622187
 +            # only kvm support managed mode
 +            conf.managed = 'no'
 +
++            # 配置Boot_order
 +            conf.boot_order = disk_info.get('boot_index')
 +            LOG.info('get disk_info = %s', disk_info)
 +
