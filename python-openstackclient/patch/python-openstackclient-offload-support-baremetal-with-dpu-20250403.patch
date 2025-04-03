@@ -1,5 +1,5 @@
 diff --git a/openstackclient/compute/v2/server.py b/openstackclient/compute/v2/server.py
-index d3bd1c7..b3425e7 100644
+index d3bd1c7..3a6902d 100644
 --- a/openstackclient/compute/v2/server.py
 +++ b/openstackclient/compute/v2/server.py
 @@ -170,6 +170,13 @@ def _prep_server_detail(compute_client, image_client, server, refresh=True):
@@ -54,7 +54,7 @@ index d3bd1c7..b3425e7 100644
  class AddServerVolume(command.Command):
      _description = _(
          "Add volume to server. "
-@@ -2109,6 +2147,43 @@ class RemoveServerSecurityGroup(command.Command):
+@@ -2109,6 +2147,36 @@ class RemoveServerSecurityGroup(command.Command):
          server.remove_security_group(security_group['id'])
  
  
@@ -77,18 +77,11 @@ index d3bd1c7..b3425e7 100644
 +
 +    def take_action(self, parsed_args):
 +        compute_client = self.app.client_manager.compute
-+        # manila_client = self.app.client_manager.manila
-+        # LOG.debug("-----------share: %s", dir(self.app.client_manager))
 +
 +        server = utils.find_resource(
 +            compute_client.servers,
 +            parsed_args.server,
 +        )
-+        # share = utils.find_resource(
-+        #     manila_client.shares,
-+        #     parsed_args.share,
-+        # )
-+        # LOG.debug("-----------share: %s", share)
 +        compute_client.shares.delete_server_share(
 +            server.id,
 +            parsed_args.share,

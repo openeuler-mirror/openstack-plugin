@@ -36,10 +36,10 @@ index 763db39..6da7861 100644
          'PUT': [server_tags_controller, 'update_all'],
 diff --git a/nova/api/openstack/compute/server_shares.py b/nova/api/openstack/compute/server_shares.py
 new file mode 100644
-index 0000000..090cef8
+index 0000000..eb7fdc6
 --- /dev/null
 +++ b/nova/api/openstack/compute/server_shares.py
-@@ -0,0 +1,166 @@
+@@ -0,0 +1,155 @@
 +#    Licensed under the Apache License, Version 2.0 (the "License"); you may
 +#    not use this file except in compliance with the License. You may obtain
 +#    a copy of the License at
@@ -59,7 +59,6 @@ index 0000000..090cef8
 +from oslo_utils import uuidutils
 +
 +from nova.api.openstack import common
-+# from nova.api.openstack.compute.schemas import server_shares as schema
 +from nova.api.openstack.compute.views import server_shares
 +from nova.api.openstack import wsgi
 +from nova.api import validation
@@ -108,19 +107,13 @@ index 0000000..090cef8
 +                    target={'project_id': im.project_id})
 +
 +        with nova_context.target_cell(context, im.cell_mapping) as cctxt:
-+            try:
-+                instance = self._get_instance_from_server_uuid(
++            instance = self._get_instance_from_server_uuid(
++                cctxt, server_id
++            )
++
++            db_shares = objects.ShareMappingList.get_by_instance_uuid(
 +                    cctxt, server_id
-+                )
-+
-+                db_shares = objects.ShareMappingList.get_by_instance_uuid(
-+                        cctxt, server_id
-+                )
-+
-+            except (exception.ForbiddenSharesNotSupported) as e:
-+                raise webob.exc.HTTPForbidden(explanation=e.format_message())
-+            except (exception.ForbiddenSharesNotConfiguredCorrectly) as e:
-+                raise webob.exc.HTTPConflict(explanation=e.format_message())
++            )
 +
 +        return self._view_builder._list_view(db_shares)
 +
@@ -179,10 +172,6 @@ index 0000000..090cef8
 +                view = self._view_builder._show_view(cctxt, share)
 +            except (exception.ShareNotFound) as e:
 +                raise webob.exc.HTTPNotFound(explanation=e.format_message())
-+            except (exception.ForbiddenSharesNotSupported) as e:
-+                raise webob.exc.HTTPForbidden(explanation=e.format_message())
-+            except (exception.ForbiddenSharesNotConfiguredCorrectly) as e:
-+                raise webob.exc.HTTPConflict(explanation=e.format_message())
 +
 +        return view
 +
@@ -348,7 +337,7 @@ index 4fa0cc2..355c5cd 100644
  def target_host_cell(fn):
      """Target a host-based function to a cell.
 diff --git a/nova/compute/manager.py b/nova/compute/manager.py
-index 6e5d72f..007bdf4 100644
+index 6e5d72f..1ac51aa 100644
 --- a/nova/compute/manager.py
 +++ b/nova/compute/manager.py
 @@ -43,7 +43,9 @@ import eventlet.semaphore
@@ -357,7 +346,7 @@ index 6e5d72f..007bdf4 100644
  from keystoneauth1 import exceptions as keystone_exception
 +from openstack import exceptions as sdk_exc
  import os_traits
-+from oslo_db import exception as db_exc  #
++from oslo_db import exception as db_exc
  from oslo_log import log as logging
  import oslo_messaging as messaging
  from oslo_serialization import jsonutils
@@ -476,12 +465,12 @@ index 6e5d72f..007bdf4 100644
 +                                         share_mapping.access_type,
 +                                         share_mapping.access_to)
 +                except Exception as exc:
-+                    LOG.warning("Deny access %s error, due to %",
++                    LOG.warning("Deny access %s error, due to %s",
 +                                share_mapping.share_id, exc)
 +                    if raise_exc:
 +                        raise
 +                finally:
-+                    LOG.debug("deleta share_mapping %s", share_mapping.share_id)
++                    LOG.debug("delete share_mapping %s", share_mapping.share_id)
 +                    share_mapping.delete()
 +
 +            LOG.debug("Do cleanup shares done", instance=instance)
@@ -574,14 +563,14 @@ index 6e5d72f..007bdf4 100644
 +            still_used = Is_share_usage(context, share_id)
 +            if still_used == True:
 +                return
-+            
++
 +            # 热插了改状态，不能继续热插。 现在应该是db创建那边报错，因为有约束，也能失败。
 +            manila_share_data = self.manila_api.get(context, share_id)
 +
 +            share_mapping = objects.ShareMapping(context)
 +            share_mapping.uuid = uuidutils.generate_uuid()
 +            share_mapping.instance_uuid = instance.uuid
-+            share_mapping.share_id = share_id  # manila_share_data.id
++            share_mapping.share_id = share_id
 +            share_mapping.status = fields.ShareMappingStatus.ATTACHING
 +            share_mapping.export_location = manila_share_data.export_location
 +            share_mapping.share_proto = manila_share_data.share_proto
@@ -646,7 +635,7 @@ index 6e5d72f..007bdf4 100644
 +                                     share_mapping.access_type,
 +                                     share_mapping.access_to)
 +
-+                LOG.debug("deleta share_mapping %s", share_mapping.share_id)
++                LOG.debug("delete share_mapping %s", share_mapping.share_id)
 +                share_mapping.delete()
 +
 +
@@ -671,7 +660,7 @@ index 6e5d72f..007bdf4 100644
 +            except (exception.ShareNotFound, exception.ShareAccessNotFound):
 +                # Ignore the error if for any reason there is nothing to
 +                # remove from manila, so we can still detach the share.
-+                share_mapping.delete()   # todo 只有这种异常情况需要delete吗？
++                share_mapping.delete()
 +
 +
 +        _detach_share(context, instance, share_id)
@@ -1034,7 +1023,7 @@ index 027a04f..851de67 100644
      __tablename__ = 'security_group_instance_association'
      __table_args__ = (
 diff --git a/nova/exception.py b/nova/exception.py
-index d178034..c7ca11d 100644
+index d178034..8ba005b 100644
 --- a/nova/exception.py
 +++ b/nova/exception.py
 @@ -148,6 +148,10 @@ class CinderConnectionFailed(NovaException):
@@ -1048,25 +1037,7 @@ index d178034..c7ca11d 100644
  class UnsupportedCinderAPIVersion(NovaException):
      msg_fmt = _('Nova does not support Cinder API version %(version)s')
  
-@@ -164,6 +168,17 @@ class Forbidden(NovaException):
-     code = 403
- 
- 
-+# class ForbiddenSharesNotSupported(NotSupported):
-+#     msg_fmt = _("Feature not supported until computes have not been updated.")
-+#
-+#
-+# class ForbiddenSharesNotConfiguredCorrectly(NotSupported):
-+#     msg_fmt = _("Feature not supported because either compute or instance "
-+#                 "are not configured correctly.")
-+#
-+#
-+# class ForbiddenWithShare(NotSupported):
-+#     msg_fmt = _("Feature not supported with instances that have shares.")
- class AdminRequired(Forbidden):
-     msg_fmt = _("User does not have admin privileges")
- 
-@@ -277,6 +292,11 @@ class VolumeDetachFailed(Invalid):
+@@ -277,6 +281,11 @@ class VolumeDetachFailed(Invalid):
                  "Reason: %(reason)s")
  
  
@@ -1078,7 +1049,7 @@ index d178034..c7ca11d 100644
  class MultiattachNotSupportedByVirtDriver(NovaException):
      # This exception indicates the compute hosting the instance does not
      # support multiattach volumes. This should generally be considered a
-@@ -656,6 +676,86 @@ class AgentBuildExists(NovaException):
+@@ -656,6 +665,86 @@ class AgentBuildExists(NovaException):
                  "architecture %(architecture)s exists.")
  
  
@@ -1244,10 +1215,10 @@ index 366a970..ff331a2 100644
  
 diff --git a/nova/objects/share_mapping.py b/nova/objects/share_mapping.py
 new file mode 100644
-index 0000000..fb9cd1d
+index 0000000..2948281
 --- /dev/null
 +++ b/nova/objects/share_mapping.py
-@@ -0,0 +1,199 @@
+@@ -0,0 +1,197 @@
 +#    Licensed under the Apache License, Version 2.0 (the "License"); you may
 +#    not use this file except in compliance with the License. You may obtain
 +#    a copy of the License at
@@ -1265,12 +1236,10 @@ index 0000000..fb9cd1d
 +from oslo_utils import versionutils
 +
 +import nova.conf
-+# from nova.db.main import api as db
 +from nova.db import api as db
 +from nova import exception
 +from nova.objects import base
 +from nova.objects import fields
-+# from nova.share import manila as manila_api
 +
 +CONF = nova.conf.CONF
 +LOG = logging.getLogger(__name__)
@@ -1545,7 +1514,7 @@ index 0000000..5649111
 +    return server_shares_policies
 diff --git a/nova/share/manila.py b/nova/share/manila.py
 new file mode 100644
-index 0000000..e52db3e
+index 0000000..b1c12e4
 --- /dev/null
 +++ b/nova/share/manila.py
 @@ -0,0 +1,393 @@
@@ -1658,7 +1627,7 @@ index 0000000..e52db3e
 +            state=manila_access.state,
 +            access_type=manila_access.access_type,
 +            access_to=manila_access.access_to,
-+            access_key= getattr(manila_access, 'access_key', None)
++            access_key=getattr(manila_access, 'access_key', None)
 +        )
 +
 +    @classmethod
@@ -1894,7 +1863,7 @@ index 0000000..e52db3e
 +            access = json.loads(response.content).get("access")
 +            LOG.debug('access_list: %s', access)
 +        else:
-+            LOG.error("manila_list_access content None share_id: %s", share_id)
++            LOG.error("manila_allow_access content None share_id: %s", share_id)
 +            raise exception.ShareAccessGrantError(share_id=share_id)
 +
 +        access = Access.from_dict(access)
@@ -1945,10 +1914,10 @@ index 0000000..e52db3e
 \ No newline at end of file
 diff --git a/nova/share/manila_api.py b/nova/share/manila_api.py
 new file mode 100644
-index 0000000..76e56cf
+index 0000000..3549181
 --- /dev/null
 +++ b/nova/share/manila_api.py
-@@ -0,0 +1,317 @@
+@@ -0,0 +1,222 @@
 +# Copyright 2023 Huawei Technology corp.
 +#
 +# Licensed under the Apache License, Version 2.0 (the "License");
@@ -2108,51 +2077,6 @@ index 0000000..76e56cf
 +                                    cert=None,
 +                                    **kwargs)
 +
-+    # {
-+    #     "share": {
-+    #         "links": [
-+    #             {
-+    #                 "href": "http://172.18.198.54:8786/v2/16e1ab15c35a457e9c2b2aa189f544e1/shares/011d21e2-fbc3-4e4a-9993-9ea223f73264",
-+    #                 "rel": "self"
-+    #             },
-+    #             {
-+    #                 "href": "http://172.18.198.54:8786/16e1ab15c35a457e9c2b2aa189f544e1/shares/011d21e2-fbc3-4e4a-9993-9ea223f73264",
-+    #                 "rel": "bookmark"
-+    #             }
-+    #         ],
-+    #         "availability_zone": "nova",
-+    #         "share_network_id": "713df749-aac0-4a54-af52-10f6c991e80c",
-+    #         "export_locations": [],
-+    #         "share_server_id": "e268f4aa-d571-43dd-9ab3-f49ad06ffaef",
-+    #         "share_group_id": null,
-+    #         "snapshot_id": null,
-+    #         "id": "011d21e2-fbc3-4e4a-9993-9ea223f73264",
-+    #         "size": 1,
-+    #         "share_type": "25747776-08e5-494f-ab40-a64b9d20d8f7",
-+    #         "share_type_name": "default",
-+    #         "export_location": null,
-+    #         "project_id": "16e1ab15c35a457e9c2b2aa189f544e1",
-+    #         "metadata": {
-+    #             "project": "my_app",
-+    #             "aim": "doc"
-+    #         },
-+    #         "status": "available",
-+    #         "progress": "100%",
-+    #         "description": "My custom share London",
-+    #         "host": "manila2@generic1#GENERIC1",
-+    #         "user_id": "66ffd308757e44b9a8bec381322b0b88",
-+    #         "access_rules_status": "active",
-+    #         "has_replicas": false,
-+    #         "replication_type": null,
-+    #         "task_state": null,
-+    #         "is_public": true,
-+    #         "snapshot_support": true,
-+    #         "name": "share_London",
-+    #         "created_at": "2015-09-18T10:25:24.000000",
-+    #         "share_proto": "NFS",
-+    #         "volume_type": "default"
-+    #     }
-+    # }
 +    def manila_get_share(self, share_id):
 +        self._get_token()
 +        path = '/{}/{}/shares/{}'.format(self.api_version, self.project_id,
@@ -2166,31 +2090,13 @@ index 0000000..76e56cf
 +        # Got valid content
 +        return response
 +
-+    # {
-+    #     "export_locations": [
-+    #         {
-+    #             "path": "10.254.0.3:/shares/share-e1c2d35e-fe67-4028-ad7a-45f668732b1d",
-+    #             "share_instance_id": "e1c2d35e-fe67-4028-ad7a-45f668732b1d",
-+    #             "is_admin_only": false,
-+    #             "id": "b6bd76ce-12a2-42a9-a30a-8a43b503867d",
-+    #             "preferred": false
-+    #         },
-+    #         {
-+    #             "path": "10.0.0.3:/shares/share-e1c2d35e-fe67-4028-ad7a-45f668732b1d",
-+    #             "share_instance_id": "e1c2d35e-fe67-4028-ad7a-45f668732b1d",
-+    #             "is_admin_only": true,
-+    #             "id": "6921e862-88bc-49a5-a2df-efeed9acd583",
-+    #             "preferred": false
-+    #         }
-+    #     ]
-+    # }
 +    def manila_export_locations(self, share_id):
 +        self._get_token()
 +        path = '/{}/{}/shares/{}/export_locations'.format(self.api_version,
 +                                                          self.project_id,
 +                                                          share_id)
 +        try:
-+            response = self._request('GET', path, )
++            response = self._request('GET', path)
 +        except Exception as err:
 +            LOG.error('Unhandled error manila_export_locations. Error: %s ', err)
 +            raise
@@ -2198,38 +2104,6 @@ index 0000000..76e56cf
 +        # Got valid content
 +        return response
 +
-+    # {
-+    #     "access_list": [
-+    #         {
-+    #             "access_level": "rw",
-+    #             "state": "error",
-+    #             "id": "507bf114-36f2-4f56-8cf4-857985ca87c1",
-+    #             "access_type": "cert",
-+    #             "access_to": "example.com",
-+    #             "access_key": null,
-+    #             "created_at": "2018-07-17T02:01:04.000000",
-+    #             "updated_at": "2018-07-17T02:01:04.000000",
-+    #             "metadata": {
-+    #                 "key1": "value1",
-+    #                 "key2": "value2"
-+    #             }
-+    #         },
-+    #         {
-+    #             "access_level": "rw",
-+    #             "state": "active",
-+    #             "id": "a25b2df3-90bd-4add-afa6-5f0dbbd50452",
-+    #             "access_type": "ip",
-+    #             "access_to": "0.0.0.0/0",
-+    #             "access_key": null,
-+    #             "created_at": "2018-07-16T01:03:21.000000",
-+    #             "updated_at": "2018-07-16T01:03:21.000000",
-+    #             "metadata": {
-+    #                 "key3": "value3",
-+    #                 "key4": "value4"
-+    #             }
-+    #         }
-+    #     ]
-+    # }
 +    def manila_list_access(self, share_id):
 +        self._get_token()
 +        path = '/{}/{}/share-access-rules?share_id={}'.format(self.api_version, self.project_id, share_id)

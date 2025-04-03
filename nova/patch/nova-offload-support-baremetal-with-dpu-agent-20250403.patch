@@ -775,7 +775,7 @@ index 027a04f..851de67 100644
      __tablename__ = 'security_group_instance_association'
      __table_args__ = (
 diff --git a/nova/exception.py b/nova/exception.py
-index d178034..1230a07 100644
+index d178034..ebd2633 100644
 --- a/nova/exception.py
 +++ b/nova/exception.py
 @@ -148,6 +148,10 @@ class CinderConnectionFailed(NovaException):
@@ -789,25 +789,7 @@ index d178034..1230a07 100644
  class UnsupportedCinderAPIVersion(NovaException):
      msg_fmt = _('Nova does not support Cinder API version %(version)s')
  
-@@ -164,6 +168,17 @@ class Forbidden(NovaException):
-     code = 403
- 
- 
-+# class ForbiddenSharesNotSupported(NotSupported):
-+#     msg_fmt = _("Feature not supported until computes have not been updated.")
-+#
-+#
-+# class ForbiddenSharesNotConfiguredCorrectly(NotSupported):
-+#     msg_fmt = _("Feature not supported because either compute or instance "
-+#                 "are not configured correctly.")
-+#
-+#
-+# class ForbiddenWithShare(NotSupported):
-+#     msg_fmt = _("Feature not supported with instances that have shares.")
- class AdminRequired(Forbidden):
-     msg_fmt = _("User does not have admin privileges")
- 
-@@ -277,6 +292,11 @@ class VolumeDetachFailed(Invalid):
+@@ -277,6 +281,11 @@ class VolumeDetachFailed(Invalid):
                  "Reason: %(reason)s")
  
  
@@ -819,7 +801,7 @@ index d178034..1230a07 100644
  class MultiattachNotSupportedByVirtDriver(NovaException):
      # This exception indicates the compute hosting the instance does not
      # support multiattach volumes. This should generally be considered a
-@@ -656,6 +676,86 @@ class AgentBuildExists(NovaException):
+@@ -656,6 +665,86 @@ class AgentBuildExists(NovaException):
                  "architecture %(architecture)s exists.")
  
  
@@ -906,7 +888,7 @@ index d178034..1230a07 100644
  class VolumeAttachmentNotFound(NotFound):
      msg_fmt = _("Volume attachment %(attachment_id)s could not be found.")
  
-@@ -2553,3 +2653,13 @@ class GetPMEMNamespaceFailed(NovaException):
+@@ -2553,3 +2642,8 @@ class GetPMEMNamespaceFailed(NovaException):
  class VPMEMCleanupFailed(NovaException):
      msg_fmt = _("Failed to clean up the vpmem backend device %(dev)s: "
                  "%(error)s")
@@ -914,11 +896,6 @@ index d178034..1230a07 100644
 +
 +class ProcessExecuteException(Invalid):
 +    msg_fmt = _("run cmd %(cmd)s failed. "
-+                "Reason: %(reason)s")
-+
-+
-+class VolumeExtendFailed(Invalid):
-+    msg_fmt = _("Volume %(volume_id)s could not be extended. "
 +                "Reason: %(reason)s")
 diff --git a/nova/objects/__init__.py b/nova/objects/__init__.py
 index 621c2d2..e118a59 100644
@@ -999,10 +976,10 @@ index 366a970..ff331a2 100644
  
 diff --git a/nova/objects/share_mapping.py b/nova/objects/share_mapping.py
 new file mode 100644
-index 0000000..fb9cd1d
+index 0000000..2948281
 --- /dev/null
 +++ b/nova/objects/share_mapping.py
-@@ -0,0 +1,199 @@
+@@ -0,0 +1,197 @@
 +#    Licensed under the Apache License, Version 2.0 (the "License"); you may
 +#    not use this file except in compliance with the License. You may obtain
 +#    a copy of the License at
@@ -1020,12 +997,10 @@ index 0000000..fb9cd1d
 +from oslo_utils import versionutils
 +
 +import nova.conf
-+# from nova.db.main import api as db
 +from nova.db import api as db
 +from nova import exception
 +from nova.objects import base
 +from nova.objects import fields
-+# from nova.share import manila as manila_api
 +
 +CONF = nova.conf.CONF
 +LOG = logging.getLogger(__name__)
@@ -1351,10 +1326,10 @@ index e37d322..a6f3004 100644
 +DPUIronicDriver = dpu_driver.DPUIronicDriver
 diff --git a/nova/virt/ironic/dpu_driver.py b/nova/virt/ironic/dpu_driver.py
 new file mode 100644
-index 0000000..8c6ab0d
+index 0000000..53da7af
 --- /dev/null
 +++ b/nova/virt/ironic/dpu_driver.py
-@@ -0,0 +1,861 @@
+@@ -0,0 +1,876 @@
 +# Copyright 2023 Huawei Technology corp.
 +#
 +#    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -1559,7 +1534,7 @@ index 0000000..8c6ab0d
 +                else:
 +                    LOG.error('unsupport volume type %s', type)
 +
-+            if need_os_ready: # 永远echo好像也没啥问题
++            if need_os_ready: # 如果永远echo，VF服务器有问题
 +                LOG.info('recover volume done echo storage ready')
 +                self.spdk_driver.os_ready()
 +            _run_cmd_by_root(['sync'])
@@ -1568,11 +1543,11 @@ index 0000000..8c6ab0d
 +        return _do_recover_volume(context, instance)
 +
 +    def _recover_share(self, context, instance):
-+        LOG.debug('_recover_share begine', instance=instance)
++        LOG.debug('_recover_share begin', instance=instance)
 +
 +        @utils.synchronized(instance.uuid)
 +        def _do_recover_share(context, instance):
-+            LOG.debug('_do_recover_share begine', instance=instance)
++            LOG.debug('_do_recover_share begin', instance=instance)
 +
 +            # objects.ShareMappingList.get_by_instance_uuid   拿到所有sm
 +            share_mapping_list = objects.ShareMappingList.get_by_instance_uuid(
@@ -2005,20 +1980,35 @@ index 0000000..8c6ab0d
 +                      encryption=None):
 +        LOG.info('dpu driver detach_volume volume_id %s',
 +                 connection_info['volume_id'])
-+        if not isinstance(self.spdk_driver, spdk_lib.SCSIVolumeDriver):
-+            self.detach_blk_volume(context,
-+                                   connection_info,
-+                                   instance,
-+                                   mountpoint,
-+                                   encryption=None)
-+        else:
-+            self.detach_scsi_volume(context,
-+                                   connection_info,
-+                                   instance,
-+                                   mountpoint,
-+                                   encryption=None)
-+        self._disconnect_volume(connection_info, instance)
-+        _run_cmd_by_root(['sync'])
++        storage_unready = connection_info.get('storage_unready')
++        LOG.info('flag storage_unready: {}'.format(storage_unready))
++        restart_ssam = connection_info.get('restart_ssam')
++        LOG.info('flag restart_ssam: {}'.format(restart_ssam))
++        if storage_unready:
++            LOG.info('detach_volume echo storage unready')
++            self.spdk_driver.os_unready()
++        try:
++            if not isinstance(self.spdk_driver, spdk_lib.SCSIVolumeDriver):
++                self.detach_blk_volume(context,
++                                       connection_info,
++                                       instance,
++                                       mountpoint,
++                                       encryption=None)
++            else:
++                self.detach_scsi_volume(context,
++                                       connection_info,
++                                       instance,
++                                       mountpoint,
++                                       encryption=None)
++            self._disconnect_volume(connection_info, instance)
++            _run_cmd_by_root(['sync'])
++        except Exception as exc:
++            raise exc
++        finally:
++            if restart_ssam:
++                LOG.info('detach_volume restart spdk')
++                self.spdk_driver.restart()
++
 +
 +    def extend_volume(self, context, connection_info, instance, requested_size):
 +        LOG.info('driver extend volume '
@@ -2167,7 +2157,7 @@ index 0000000..8c6ab0d
 +                'Not enough PF devices available for allocation'
 +            )
 +        function_id = pf_info['index']
-+        bdf_id = pf_info['host_dbdf']
++        bdf_id = pf_info['dbdf']
 +        target = '/mnt/share-' + share_mapping.uuid
 +
 +        # mount share
@@ -2232,10 +2222,10 @@ index 21e62e6..98653d7 100644
  _CONSOLE_STATE_CHECKING_INTERVAL = 1
 diff --git a/nova/virt/ironic/spdk_lib.py b/nova/virt/ironic/spdk_lib.py
 new file mode 100644
-index 0000000..6d5b166
+index 0000000..66cf8f5
 --- /dev/null
 +++ b/nova/virt/ironic/spdk_lib.py
-@@ -0,0 +1,362 @@
+@@ -0,0 +1,371 @@
 +# Copyright 2024 Huawei Technology corp.
 +#
 +#    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -2284,6 +2274,7 @@ index 0000000..6d5b166
 +    # rootwrap中的名字，实际以rootwrap中配置的绝对路径运行。
 +    spdk_rpc_path = 'spdk-hw_dpu_rpc'
 +    rpc_path = 'spdk-rpc'
++    echo_unready = 'echo_unready'
 +    qos_bytes_map = dict(total_bytes_sec='--rw_mbytes_per_sec',
 +                         read_bytes_sec='--r_mbytes_per_sec',
 +                         write_bytes_sec='--w_mbytes_per_sec')
@@ -2300,6 +2291,14 @@ index 0000000..6d5b166
 +
 +    def os_ready(self):
 +        cmd = [self.spdk_rpc_path, 'os_ready']
++        _run_cmd_by_root(cmd)
++
++    def os_unready(self):
++        cmd = [self.echo_unready]
++        _run_cmd_by_root(cmd)
++
++    def restart(self):
++        cmd = ['systemctl', 'restart', 'ssam']
 +        _run_cmd_by_root(cmd)
 +
 +    def bdev_create(self, connection_info):
