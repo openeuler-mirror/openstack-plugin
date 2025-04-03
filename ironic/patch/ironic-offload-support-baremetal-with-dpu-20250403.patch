@@ -284,10 +284,10 @@ index 1e7a83c..b84ba42 100644
      def supported_raid_interfaces(self):
 diff --git a/ironic/drivers/modules/dpu.py b/ironic/drivers/modules/dpu.py
 new file mode 100644
-index 0000000..f997dab
+index 0000000..762e40f
 --- /dev/null
 +++ b/ironic/drivers/modules/dpu.py
-@@ -0,0 +1,330 @@
+@@ -0,0 +1,349 @@
 +# Copyright 2023 Huawei Technology corp.
 +#
 +# Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -319,6 +319,7 @@ index 0000000..f997dab
 +LOG = log.getLogger(__name__)
 +
 +CHECK_DPU_POWERON_WAIT_TIME_S = 90
++CHECK_DPU_POWERON_WAIT_TIME_STANDBY_S = 60
 +CHECK_DPU_RETRY_TIME = 60
 +CHECK_DPU_RETRY_INTERVAL_S = 5
 +
@@ -376,6 +377,7 @@ index 0000000..f997dab
 +        return manager_url
 +
 +    def _check_dpu(self, task, manager_url):
++        dpu_power_no_standby = task.node.extra.get('dpu_power_no_standby')
 +        node_power_state = task.driver.power.get_power_state(task)
 +        if node_power_state == states.POWER_OFF:
 +            LOG.info('dpu node power state '
@@ -383,7 +385,11 @@ index 0000000..f997dab
 +            manager_utils.node_power_action(task, states.POWER_ON)
 +            LOG.info("dpu power on wait "
 +                     "{} seconds".format(CHECK_DPU_POWERON_WAIT_TIME_S))
-+            time.sleep(CHECK_DPU_POWERON_WAIT_TIME_S)
++            if dpu_power_no_standby:
++                time.sleep(CHECK_DPU_POWERON_WAIT_TIME_S)
++            else:
++                # vf服务器下电之后操作ovs可能有问题。上电之后马上操作也可能有问题。等一会再去操作
++                time.sleep(CHECK_DPU_POWERON_WAIT_TIME_STANDBY_S)
 +
 +        LOG.debug("dpu power on begin check")
 +        apiclient = None
@@ -446,6 +452,7 @@ index 0000000..f997dab
 +        task.driver.network.remove_provisioning_network(task)
 +        task.driver.network.configure_tenant_networks(task)
 +        task.driver.boot.prepare_instance(task)
++
 +        return None
 +
 +    @task_manager.require_exclusive_lock
@@ -458,34 +465,47 @@ index 0000000..f997dab
 +        :returns: deploy state DELETED.
 +        """
 +        LOG.info('dpu deploy tear_down node:{} '.format(task.node.uuid))
++
++        manage_power = task.node.extra.get('manage_power')
++        dpu_power_no_standby = task.node.extra.get('dpu_power_no_standby')  # 默认不配按standby处理
++        LOG.info('dpu deploy tear_down manage_power {}'.format(manage_power))
++        LOG.info('dpu deploy tear_down dpu_power_no_standby {}'.format(dpu_power_no_standby))
++        if not dpu_power_no_standby and manage_power:
++            manager_utils.node_power_action(task, states.POWER_OFF)
++            time.sleep(15)  # 等待强制下电完成
++
++        self._detach_all_share(task)
++
 +        volume_targets = task.volume_targets
 +        if volume_targets:
 +            manager_url = self._get_dpu_manager_url(task)
-+            self._check_dpu(task, manager_url)
++            if dpu_power_no_standby:
++                self._check_dpu(task, manager_url)
 +            server_id = task.node.instance_uuid
 +            for i in range(len(volume_targets) - 1, -1, -1):
 +                volume_target = volume_targets[i]
 +                volume_id = volume_target.volume_id
++                connection_info = {
++                    'data': volume_target.properties,
++                    'volume_id': volume_id
++                }
++                if not dpu_power_no_standby and i == len(volume_targets) - 1:
++                    # 拔第一个盘前，echo storage unready
++                    connection_info['storage_unready'] = True
++                if not dpu_power_no_standby and i == 0:
++                    # 拔最后一个盘后，restart ssam
++                    connection_info['restart_ssam'] = True
 +                response = self._detach_volume_dpu(
 +                    server_id=server_id,
 +                    volume_id=volume_id,
-+                    connection_info={
-+                        'data': volume_target.properties,
-+                        'volume_id': volume_id
-+                    },
++                    connection_info=connection_info,
 +                    manager_url=manager_url
 +                )
 +                if response.status_code != requests.codes.OK:
-+                    raise exception.StorageError(
-+                        "Storage error when tear down instance %(server_id)s; "
-+                        "volume_id %(volume_id)s; res_msg: %(res_msg)s" %
-+                        {'server_id': task.node.instance_uuid,
-+                         'volume_id': volume_id,
-+                         'res_msg': response.content})
++                    LOG.warning('Storage error when tear down, instance = %s, volume_id = %s, res_msg = %s.',
++                                task.node.instance_uuid, volume_id, response.content)
 +        else:
 +            LOG.warning('dpu deploy tear_down with no volume_targets')
-+
-+        self._detach_all_share(task)
 +
 +        task.driver.storage.detach_volumes(task)
 +        deploy_utils.tear_down_storage_configuration(task)
@@ -495,9 +515,8 @@ index 0000000..f997dab
 +        LOG.debug('dpu deploy tear_down remove_provisioning_network')
 +        task.driver.network.remove_provisioning_network(task)
 +
-+        manage_power = task.node.extra.get('manage_power')
-+        LOG.info('dpu deploy tear_down manage_power {}'.format(manage_power))
-+        if manage_power:
++
++        if dpu_power_no_standby and manage_power:
 +            time.sleep(15)  # 不要前面操作结束就立即下电，等15s
 +            manager_utils.node_power_action(task, states.POWER_OFF)
 +
@@ -620,10 +639,10 @@ index 0000000..f997dab
 +        return response
 diff --git a/ironic/drivers/modules/network/dpu.py b/ironic/drivers/modules/network/dpu.py
 new file mode 100644
-index 0000000..c362bbc
+index 0000000..493ff85
 --- /dev/null
 +++ b/ironic/drivers/modules/network/dpu.py
-@@ -0,0 +1,285 @@
+@@ -0,0 +1,291 @@
 +# Copyright 2023 Huawei Technology corp.
 +#
 +#    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -656,6 +675,7 @@ index 0000000..c362bbc
 +
 +NIC_NAME_LEN = 14
 +CHECK_DPU_POWERON_WAIT_TIME_S = 90
++CHECK_DPU_POWERON_WAIT_TIME_STANDBY_S = 60
 +CHECK_DPU_RETRY_TIME = 60
 +CHECK_DPU_RETRY_INTERVAL_S = 5
 +
@@ -691,6 +711,7 @@ index 0000000..c362bbc
 +        return manager_url
 +
 +    def _check_dpu(self, task, manager_url):
++        dpu_power_no_standby = task.node.extra.get('dpu_power_no_standby')
 +        node_power_state = task.driver.power.get_power_state(task)
 +        if node_power_state == states.POWER_OFF:
 +            LOG.info('dpu node power state '
@@ -698,7 +719,11 @@ index 0000000..c362bbc
 +            manager_utils.node_power_action(task, states.POWER_ON)
 +            LOG.info("dpu power on wait "
 +                     "{} seconds".format(CHECK_DPU_POWERON_WAIT_TIME_S))
-+            time.sleep(CHECK_DPU_POWERON_WAIT_TIME_S)
++            if dpu_power_no_standby:
++                time.sleep(CHECK_DPU_POWERON_WAIT_TIME_S)
++            else:
++                # vf服务器下电之后操作ovs可能有问题。上电之后马上操作也可能有问题。等一会再去操作
++                time.sleep(CHECK_DPU_POWERON_WAIT_TIME_STANDBY_S)
 +
 +        LOG.debug("dpu power on begin check")
 +        apiclient = None
