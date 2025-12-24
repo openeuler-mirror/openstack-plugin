@@ -1,10 +1,17 @@
 diff --git a/nova/api/openstack/compute/dpu.py b/nova/api/openstack/compute/dpu.py
 new file mode 100644
-index 0000000..9e42138
+index 0000000..54f0008
 --- /dev/null
 +++ b/nova/api/openstack/compute/dpu.py
-@@ -0,0 +1,219 @@
+@@ -0,0 +1,226 @@
 +# Copyright 2023 Huawei Technology corp.
++#
++# This file contains code segments derived from nova/api/openstack/compute/
++# volumes.py
++# Original copyright notice:
++#
++# Copyright 2011 Justin Santa Barbara
++# All Rights Reserved.
 +#
 +#    Licensed under the Apache License, Version 2.0 (the "License"); you may
 +#    not use this file except in compliance with the License. You may obtain

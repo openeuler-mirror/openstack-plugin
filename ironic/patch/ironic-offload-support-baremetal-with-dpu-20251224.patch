@@ -1,10 +1,16 @@
 diff --git a/ironic/common/dpu_api.py b/ironic/common/dpu_api.py
 new file mode 100644
-index 0000000..0c798e7
+index 0000000..7231fff
 --- /dev/null
 +++ b/ironic/common/dpu_api.py
-@@ -0,0 +1,215 @@
+@@ -0,0 +1,221 @@
 +# Copyright 2023 Huawei Technology corp.
++# 
++# This file contains code segments derived from ironic_python_agent/
++# ironic_api_client.py
++# Original copyright notice:
++#
++# Copyright 2013 Rackspace, Inc.
 +#
 +# Licensed under the Apache License, Version 2.0 (the "License");
 +# you may not use this file except in compliance with the License.
@@ -284,11 +290,18 @@ index 1e7a83c..b84ba42 100644
      def supported_raid_interfaces(self):
 diff --git a/ironic/drivers/modules/dpu.py b/ironic/drivers/modules/dpu.py
 new file mode 100644
-index 0000000..762e40f
+index 0000000..e4ad147
 --- /dev/null
 +++ b/ironic/drivers/modules/dpu.py
-@@ -0,0 +1,349 @@
+@@ -0,0 +1,356 @@
 +# Copyright 2023 Huawei Technology corp.
++#
++# This file contains code segments derived from ironic/drivers/modules/
++# iscsi_deploy.py
++# Original copyright notice:
++#
++# Copyright 2013 Hewlett-Packard Development Company, L.P.
++# All Rights Reserved.
 +#
 +# Licensed under the Apache License, Version 2.0 (the "License"); you may
 +# not use this file except in compliance with the License. You may obtain
@@ -639,11 +652,14 @@ index 0000000..762e40f
 +        return response
 diff --git a/ironic/drivers/modules/network/dpu.py b/ironic/drivers/modules/network/dpu.py
 new file mode 100644
-index 0000000..493ff85
+index 0000000..f7c4a86
 --- /dev/null
 +++ b/ironic/drivers/modules/network/dpu.py
-@@ -0,0 +1,291 @@
+@@ -0,0 +1,294 @@
 +# Copyright 2023 Huawei Technology corp.
++#
++# This file contains code segments derived from ironic/drivers/modules/
++# network/noop.py
 +#
 +#    Licensed under the Apache License, Version 2.0 (the "License"); you may
 +#    not use this file except in compliance with the License. You may obtain

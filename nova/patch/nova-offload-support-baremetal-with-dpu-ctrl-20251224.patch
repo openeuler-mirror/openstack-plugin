@@ -1914,11 +1914,17 @@ index 0000000..b1c12e4
 \ No newline at end of file
 diff --git a/nova/share/manila_api.py b/nova/share/manila_api.py
 new file mode 100644
-index 0000000..3549181
+index 0000000..d904e16
 --- /dev/null
 +++ b/nova/share/manila_api.py
-@@ -0,0 +1,222 @@
+@@ -0,0 +1,228 @@
 +# Copyright 2023 Huawei Technology corp.
++#
++# This file contains code segments derived from ironic_python_agent/
++# ironic_api_client.py
++# Original copyright notice:
++#
++# Copyright 2013 Rackspace, Inc.
 +#
 +# Licensed under the Apache License, Version 2.0 (the "License");
 +# you may not use this file except in compliance with the License.
@@ -2209,11 +2215,17 @@ index e37d322..a6f3004 100644
 +DPUIronicDriver = dpu_driver.DPUIronicDriver
 diff --git a/nova/virt/ironic/dpu_api.py b/nova/virt/ironic/dpu_api.py
 new file mode 100644
-index 0000000..5b5ce6e
+index 0000000..b1126af
 --- /dev/null
 +++ b/nova/virt/ironic/dpu_api.py
-@@ -0,0 +1,182 @@
+@@ -0,0 +1,188 @@
 +# Copyright 2023 Huawei Technology corp.
++#
++# This file contains code segments derived from ironic_python_agent/
++# ironic_api_client.py
++# Original copyright notice:
++#
++# Copyright 2013 Rackspace, Inc.
 +#
 +# Licensed under the Apache License, Version 2.0 (the "License");
 +# you may not use this file except in compliance with the License.
@@ -2397,11 +2409,18 @@ index 0000000..5b5ce6e
 +        return response
 diff --git a/nova/virt/ironic/dpu_driver.py b/nova/virt/ironic/dpu_driver.py
 new file mode 100644
-index 0000000..4d8ebc9
+index 0000000..6da3c32
 --- /dev/null
 +++ b/nova/virt/ironic/dpu_driver.py
-@@ -0,0 +1,749 @@
+@@ -0,0 +1,756 @@
 +# Copyright 2023 Huawei Technology corp.
++#
++# This file contains code segments derived from nova/virt/ironic/driver.py
++# Original copyright notice:
++#
++# Copyright 2014 Red Hat, Inc.
++# Copyright 2013 Hewlett-Packard Development Company, L.P.
++# All Rights Reserved.
 +#
 +#    Licensed under the Apache License, Version 2.0 (the "License"); you may
 +#    not use this file except in compliance with the License. You may obtain
