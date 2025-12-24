@@ -2770,11 +2770,14 @@ index c03548d..3fdc4fe 100644
          # Legacy non-os-vif codepath
 diff --git a/nova/virt/libvirt/volume/vdpa.py b/nova/virt/libvirt/volume/vdpa.py
 new file mode 100644
-index 0000000..d4de4de
+index 0000000..296045d
 --- /dev/null
 +++ b/nova/virt/libvirt/volume/vdpa.py
-@@ -0,0 +1,122 @@
+@@ -0,0 +1,125 @@
 +# Copyright 2024 Huawei Technology corp.
++# 
++# This file contains code segments derived form nova/virt/libvirt/volume/
++# iscsi.py
 +#
 +#    Licensed under the Apache License, Version 2.0 (the "License"); you may
 +#    not use this file except in compliance with the License. You may obtain
